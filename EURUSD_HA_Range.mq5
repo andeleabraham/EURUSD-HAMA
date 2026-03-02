@@ -30,14 +30,14 @@ input double MinSL_USD        = 1.50;   // Minimum SL per 0.01 lot (15 pips) —
 input double MaxSL_USD        = 2.50;   // Maximum SL per 0.01 lot (25 pips) — won't go wider
 input double RRRatio          = 1.8;    // Reward:Risk ratio (1.8 = for every $1 risk, target $1.80)
 // Lock/trail are now proportional to the dynamic SL, not fixed per tier
-input double LockPct          = 0.45;   // Lock profit at 45% of TP — engage trailing stop
-input double TrailPct         = 0.20;   // Trail gap = 20% of TP — gives room to breathe
-// Mid-range time-exit: close if stalling below this profit after MidRangeMaxBars
-input double MidRangeStallUSD = 0.25;   // Close stalled trade if below this after stall period (per 0.01 lot)
-input int    MidRangeMaxBars  = 16;     // Tier 1 max hold before stall-exit check (bars, 16 = 4h)
+input double LockPct          = 0.75;   // Lock profit at 75% of TP — only secure near-target profits
+input double TrailPct         = 0.30;   // Trail gap = 30% of TP — generous room to fluctuate
+// Mid-range time-exit: close if stalling in LOSS after MidRangeMaxBars
+input double MidRangeStallUSD = 0.00;   // Stall exit disabled — trust the SL/TP
+input int    MidRangeMaxBars  = 16;     // Bars before mid-range stall check (only if MidRangeStallUSD > 0)
 
 input group "=== TIME FILTERS ==="
-input int    MaxHoldBars      = 32;     // Max 15M bars to hold = 8 hours, then exit
+input int    MaxHoldBars      = 48;     // Max 15M bars to hold = 12 hours — give trades room to develop
 input int    SidewaysBars     = 8;      // Bars to check for compressed/sideways range
 input double SidewaysPips     = 15;     // If range < this many pips over SidewaysBars = sideways
 
@@ -143,7 +143,6 @@ bool   g_NYSeeded     = false;
 
 bool   g_TradeOpen    = false;
 bool   g_ProfitLocked = false;
-bool   g_BreakevenSet = false;   // true once profit reached 40% of lock — protect entry
 double g_PeakProfit   = 0;
 double g_CurrentLot   = 0.01;
 int    g_TotalBias    = 0;
@@ -433,7 +432,7 @@ void OnTick()
                   Print("FRIDAY CLOSE: closing before weekend | P&L=$", DoubleToString(pnl, 2));
                   trade.PositionClose(posInfo.Ticket());
                   RecordTradeResult(pnl);
-                  g_TradeOpen = false; g_ProfitLocked = false; g_BreakevenSet = false;
+                  g_TradeOpen = false; g_ProfitLocked = false;
                   g_PeakProfit = 0; g_OpenBarCount = 0; g_Signal = "WAITING";
                }
             }
@@ -695,7 +694,6 @@ void ResetDailyRanges()
    }
 
    g_ProfitLocked      = false;
-   g_BreakevenSet      = false;
    g_PeakProfit        = 0;
    g_HABullSetup       = false;
    g_HABearSetup       = false;
@@ -2403,7 +2401,6 @@ void TryEntry()
       SetScaledThresholds(lot);
       g_TradeOpen     = true;
       g_ProfitLocked  = false;
-      g_BreakevenSet  = false;
       g_PeakProfit    = 0;
       g_OpenBarCount  = 0;
       g_TradeOpenTime = TimeCurrent();
@@ -2471,7 +2468,6 @@ void ManageOpenTrade()
       Print("Position closed by broker (SL/TP) | P&L=$", DoubleToString(closedPnL, 2));
       g_TradeOpen    = false;
       g_ProfitLocked = false;
-      g_BreakevenSet = false;
       g_PeakProfit   = 0;
       g_OpenBarCount = 0;
       g_Signal       = "WAITING";
@@ -2488,14 +2484,15 @@ void ManageOpenTrade()
             " limit=$", DoubleToString(hardLossLimit,2));
       trade.PositionClose(posInfo.Ticket());
       RecordTradeResult(profit);
-      g_TradeOpen = false; g_ProfitLocked = false; g_BreakevenSet = false;
+      g_TradeOpen = false; g_ProfitLocked = false;
       g_PeakProfit = 0; g_OpenBarCount = 0; g_Signal = "WAITING";
       return;
    }
 
-   // === MID-RANGE STALL EXIT ===
-   // If trade is near mid and not profiting after MidRangeMaxBars, cut it
-   if(g_IsNearMid && !g_ProfitLocked) {
+   // === MID-RANGE STALL EXIT (optional — disabled by default) ===
+   // Only fires when MidRangeStallUSD > 0 (user explicitly enables).
+   // Philosophy: trust the analysis. If confidence allowed the trade, give it time.
+   if(MidRangeStallUSD > 0 && g_IsNearMid && !g_ProfitLocked) {
       if(g_OpenBarCount >= MidRangeMaxBars) {
          double midStallLimit = MidRangeStallUSD * g_CurrentLot / 0.01;
          if(profit < midStallLimit) {
@@ -2503,70 +2500,29 @@ void ManageOpenTrade()
                   DoubleToString(profit,2), " (below $", DoubleToString(midStallLimit,2), ")");
             trade.PositionClose(posInfo.Ticket());
             RecordTradeResult(profit);
-            g_TradeOpen = false; g_ProfitLocked = false; g_BreakevenSet = false;
+            g_TradeOpen = false; g_ProfitLocked = false;
             g_PeakProfit = 0; g_OpenBarCount = 0; g_Signal = "WAITING";
             return;
          }
       }
    }
 
-   // === BREAKEVEN RATCHET ===
-   // Once profit reaches 40% of lock level, protect entry — never let it become a full loss
-   if(!g_BreakevenSet && profit >= g_ScaledLockUSD * 0.40) {
-      g_BreakevenSet = true;
-      Print("BREAKEVEN SET: profit reached $", DoubleToString(profit,2),
-            " (40% of lock $", DoubleToString(g_ScaledLockUSD,2), ")");
-   }
-   if(g_BreakevenSet && !g_ProfitLocked && profit <= 0.05 * (g_CurrentLot / 0.01)) {
-      Print("BREAKEVEN EXIT: trade returned to entry | peak was $", DoubleToString(g_PeakProfit,2));
-      trade.PositionClose(posInfo.Ticket());
-      RecordTradeResult(profit);
-      g_TradeOpen = false; g_ProfitLocked = false; g_BreakevenSet = false;
-      g_PeakProfit = 0; g_OpenBarCount = 0; g_Signal = "WAITING";
-      return;
-   }
-
    // === MAX HOLD TIME EXIT ===
-   // Graduated hold time by confidence — smoother than binary cutoff
-   int maxBars = MaxHoldBars;
-   if(g_Confidence >= 80)      maxBars = (int)(MaxHoldBars * 1.50);  // highest conviction: 150%
-   else if(g_Confidence >= 65) maxBars = MaxHoldBars;                 // full hold time
-   else if(g_Confidence >= 50) maxBars = (int)(MaxHoldBars * 0.75);  // moderate: 75%
-   else if(g_Confidence >= 40) maxBars = (int)(MaxHoldBars * 0.60);  // low: 60%
-   else                        maxBars = (int)(MaxHoldBars * 0.50);  // very low: 50%
-
-   if(g_OpenBarCount >= maxBars) {
-      if(!g_ProfitLocked) {
-         Print("MAX HOLD exit after ", g_OpenBarCount, "/", maxBars,
-               " bars | profit=$", DoubleToString(profit,2),
+   // ONLY exits trades that are in LOSS after max hold — profitable trades keep running.
+   // If the confidence allowed the entry, trust it to reach TP or SL.
+   // This is a pure safety net for trades stuck in drawdown, not a profit-clipper.
+   if(g_OpenBarCount >= MaxHoldBars) {
+      if(profit < 0) {
+         Print("MAX HOLD exit after ", g_OpenBarCount, "/", MaxHoldBars,
+               " bars (IN LOSS) | profit=$", DoubleToString(profit,2),
                " conf:", DoubleToString(g_Confidence,1), "%");
          trade.PositionClose(posInfo.Ticket());
          RecordTradeResult(profit);
-         g_TradeOpen = false; g_ProfitLocked = false; g_BreakevenSet = false;
+         g_TradeOpen = false; g_ProfitLocked = false;
          g_PeakProfit = 0; g_OpenBarCount = 0; g_Signal = "WAITING";
          return;
       }
-   }
-
-   // === SIDEWAYS: tighten trail once locked ===
-   if(g_ProfitLocked && IsSideways()) {
-      double sidewaysTrail = 0.15 * (g_CurrentLot / 0.01);
-      if(g_Confidence >= 80) sidewaysTrail = 0.30 * (g_CurrentLot / 0.01);  // high conf: less tight
-      if(g_ScaledTrailUSD > sidewaysTrail) {
-         g_ScaledTrailUSD = sidewaysTrail;
-         Print("SIDEWAYS tightened trail to $", DoubleToString(g_ScaledTrailUSD,2));
-      }
-   }
-
-   // === HIGH-CONFIDENCE TRAIL WIDENING ===
-   // When profit exceeds 2× lock, let the trade breathe
-   if(g_Confidence >= 75 && g_ProfitLocked && profit >= g_ScaledLockUSD * 2.0) {
-      double wideTrail = g_DynamicTP_USD * TrailPct * 1.5 * (g_CurrentLot / 0.01);
-      if(g_ScaledTrailUSD < wideTrail) {
-         g_ScaledTrailUSD = wideTrail;
-         Print("Trail widened to $", DoubleToString(g_ScaledTrailUSD,2),
-               " (profit=$", DoubleToString(profit,2), " conf:", DoubleToString(g_Confidence,1), "%)");
-      }
+      // Profitable but past max hold: keep running — SL/TP or trailing will close it
    }
 
    // === STANDARD PROFIT LOCK ===
@@ -2583,7 +2539,7 @@ void ManageOpenTrade()
             " trail=$", DoubleToString(g_ScaledTrailUSD,2));
       trade.PositionClose(posInfo.Ticket());
       RecordTradeResult(profit);
-      g_TradeOpen = false; g_ProfitLocked = false; g_BreakevenSet = false;
+      g_TradeOpen = false; g_ProfitLocked = false;
       g_PeakProfit = 0; g_OpenBarCount = 0; g_Signal = "WAITING";
    }
 }
@@ -2952,22 +2908,16 @@ void UpdateDashboard()
       if(g_NearLevel != "")
          DashLine("14d_lvl", "Cnfl    : " + g_NearLevel,                        cx, cy, row, lh, corner, clrGold,       9); row++;
 
-      // Confidence-aware hold bar display (graduated)
-      int maxBars = MaxHoldBars;
-      if(g_Confidence >= 80)      maxBars = (int)(MaxHoldBars * 1.50);
-      else if(g_Confidence >= 65) maxBars = MaxHoldBars;
-      else if(g_Confidence >= 50) maxBars = (int)(MaxHoldBars * 0.75);
-      else if(g_Confidence >= 40) maxBars = (int)(MaxHoldBars * 0.60);
-      else                        maxBars = (int)(MaxHoldBars * 0.50);
-      DashLine("14c_bars", "Hold    : " + IntegerToString(g_OpenBarCount) + "/" + IntegerToString(maxBars) + " bars",
+      // Hold bar display — simple max hold (no graduated cutoffs)
+      DashLine("14c_bars", "Hold    : " + IntegerToString(g_OpenBarCount) + "/" + IntegerToString(MaxHoldBars) + " bars",
                                                                                  cx, cy, row, lh, corner, clrWhite,      9); row++;
       double hardLoss  = MaxLossUSD * g_CurrentLot / 0.01;
       DashLine("14e_cap",  "MaxLoss : -$" + DoubleToString(hardLoss,2) + " cap",
                                                                                  cx, cy, row, lh, corner, clrTomato,     9); row++;
       string lockStr = g_ProfitLocked
                        ? "LOCKED  peak:$" + DoubleToString(g_PeakProfit, 2)
-                       : (g_BreakevenSet ? "BE SET  lock@$" : "Watch  lock@$") + DoubleToString(g_ScaledLockUSD, 2);
-      color  lColor  = g_ProfitLocked ? clrLime : (g_BreakevenSet ? clrCyan : clrOrange);
+                       : "Watch  lock@$" + DoubleToString(g_ScaledLockUSD, 2);
+      color  lColor  = g_ProfitLocked ? clrLime : clrOrange;
       DashLine("15_lock", "Lock    : " + lockStr,                               cx, cy, row, lh, corner, lColor,        9); row++;
    }
 

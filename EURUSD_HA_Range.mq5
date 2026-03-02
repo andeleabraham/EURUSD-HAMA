@@ -101,7 +101,9 @@ double g_AsianHigh  = 0, g_AsianLow  = 0, g_AsianOpen  = 0;
 double g_LondonHigh = 0, g_LondonLow = 0, g_LondonOpen = 0;
 double g_TodayHigh  = 0, g_TodayLow  = 0, g_TodayOpen  = 0;
 double g_RangeHigh  = 0, g_RangeLow  = 0, g_RangeMid = 0;
+double g_PrevDayHigh= 0, g_PrevDayLow = 0;  // yesterday only (fixed reference)
 double g_CIHigh     = 0, g_CILow     = 0, g_ATR      = 0;
+int    g_InitTickCount = 0;  // count ticks since attach; D1[0] not trusted until threshold
 
 // Session seeded flags — true only after a successful CopyHigh call
 // (NOT set by UpdateLiveSessionBar so the retry keeps firing until real data arrives)
@@ -257,6 +259,10 @@ void OnDeinit(const int reason)
 //+------------------------------------------------------------------+
 void OnTick()
 {
+   // Track ticks since attach — D1[0] data may be stale on first few ticks
+   // while the terminal syncs history. We wait 20 ticks before trusting it.
+   if(g_InitTickCount < 100) g_InitTickCount++;
+
    // Always manage open trade on every tick
    if(g_TradeOpen) ManageOpenTrade();
 
@@ -330,6 +336,9 @@ void OnTick()
       if(hasTrendSig || hasMeanRev) TryEntry();
    }
 
+   // Keep range fresh every tick (g_TodayHigh/Low grows on each tick)
+   SetActiveRange();
+
    UpdateDashboard();
 }
 
@@ -341,24 +350,68 @@ void OnTick()
 //| Also captures the session open (first bar open in the window).  |
 //| Returns true if data was successfully read.                      |
 //+------------------------------------------------------------------+
+//+------------------------------------------------------------------+
+//| Get the open price of the session that starts at sessionStart.   |
+//| Strategy: walk from M15 → M30 → H1 → H4 until a bar whose open |
+//| time matches sessionStart exactly is found. This avoids the      |
+//| CopyOpen datetime-range buffer dependency (only has bars since   |
+//| chart was loaded). H1 bars open at the exact session-start hour  |
+//| so iBarShift→iOpen on H1 is always reliable.                    |
+//+------------------------------------------------------------------+
+double GetSessionOpen(datetime sessionStart)
+{
+   // Try each TF from smallest to largest — stop as soon as a valid bar is found
+   // whose open time == sessionStart (i.e. the bar was born exactly at session open)
+   ENUM_TIMEFRAMES tfs[] = {PERIOD_M15, PERIOD_M30, PERIOD_H1, PERIOD_H4};
+   for(int t = 0; t < ArraySize(tfs); t++)
+   {
+      // iBarShift with exact=false: returns the bar whose open <= sessionStart
+      int shift = iBarShift(_Symbol, tfs[t], sessionStart, false);
+      if(shift < 0) continue;
+      datetime barTime = iTime(_Symbol, tfs[t], shift);
+      if(barTime == sessionStart)          // bar opens exactly at session boundary
+      {
+         double op = iOpen(_Symbol, tfs[t], shift);
+         if(op > 0) {
+            Print("GetSessionOpen: ", TimeToString(sessionStart),
+                  " found on ", EnumToString(tfs[t]),
+                  " bar[", shift, "] open=", DoubleToString(op, 5));
+            return op;
+         }
+      }
+   }
+   // Fallback: accept the nearest bar's open even if not exactly on the boundary
+   int shift = iBarShift(_Symbol, PERIOD_H1, sessionStart, false);
+   if(shift >= 0) {
+      double op = iOpen(_Symbol, PERIOD_H1, shift);
+      if(op > 0) {
+         Print("GetSessionOpen fallback: ", TimeToString(sessionStart),
+               " nearest H1 bar[", shift, "] open=", DoubleToString(op, 5));
+         return op;
+      }
+   }
+   return 0;
+}
+
 bool SeedSessionHL(datetime fromTime, datetime toTime, double &hi, double &lo, double &op)
 {
    if(fromTime >= toTime) return false;
 
-   double arrH[], arrL[], arrO[];
-   // CopyXxx with datetime range: asks terminal DB, not chart buffer
+   // --- Session open: use H1/M30/M15 bar at fromTime — always reliable ---
+   // This avoids the CopyOpen datetime-range approach which only returns bars
+   // that are already in the chart buffer (i.e. since the bot started).
+   if(op == 0)
+      op = GetSessionOpen(fromTime);
+
+   // --- Session H/L: CopyHigh/CopyLow still fine for range (just need extremes) ---
+   double arrH[], arrL[];
    int copied = CopyHigh(_Symbol, PERIOD_M15, fromTime, toTime, arrH);
    if(copied <= 0) {
       Print("SeedSessionHL: CopyHigh returned ", copied,
             " from ", TimeToString(fromTime), " to ", TimeToString(toTime));
-      return false;
+      return (op > 0);   // open succeeded even if H/L failed — return true so seeded flag is set
    }
-   CopyLow (_Symbol, PERIOD_M15, fromTime, toTime, arrL);
-   CopyOpen(_Symbol, PERIOD_M15, fromTime, toTime, arrO);
-
-   // CopyXxx with datetime range returns bars oldest→newest (index 0 = earliest)
-   // arrO[0] is the open of the very first bar of this session = session open price
-   if(ArraySize(arrO) > 0 && arrO[0] > 0 && op == 0) op = arrO[0];
+   CopyLow(_Symbol, PERIOD_M15, fromTime, toTime, arrL);
 
    for(int i = 0; i < copied; i++) {
       if(arrH[i] > 0 && (hi == 0 || arrH[i] > hi)) hi = arrH[i];
@@ -467,12 +520,12 @@ void UpdateSessionRanges()
    if(g_TodayLow  == 0 || lo < g_TodayLow)  g_TodayLow  = lo;
 
    if(h >= AsianStartHour && h < AsianEndHour) {
-      if(g_AsianOpen == 0) g_AsianOpen = iOpen(_Symbol, PERIOD_M15, 1);
+      // g_AsianOpen NOT set here — only GetSessionOpen/SeedSessionHL sets it
       if(g_AsianHigh == 0 || hi > g_AsianHigh) g_AsianHigh = hi;
       if(g_AsianLow  == 0 || lo < g_AsianLow)  g_AsianLow  = lo;
    }
    if(h >= LondonStartHour && h < LondonEndHour) {
-      if(g_LondonOpen == 0) g_LondonOpen = iOpen(_Symbol, PERIOD_M15, 1);
+      // g_LondonOpen NOT set here — only GetSessionOpen/SeedSessionHL sets it
       if(g_LondonHigh == 0 || hi > g_LondonHigh) g_LondonHigh = hi;
       if(g_LondonLow  == 0 || lo < g_LondonLow)  g_LondonLow  = lo;
    }
@@ -533,20 +586,36 @@ void SetActiveRange()
       return;
    }
 
-   // --- Primary: prior D1 bar (yesterday's complete range) ---
-   double prevDayH = iHigh (_Symbol, PERIOD_D1, 1);
-   double prevDayL = iLow  (_Symbol, PERIOD_D1, 1);
-
+   // --- Previous day: fixed anchor, read from D1[1] ---
+   double prevDayH = iHigh(_Symbol, PERIOD_D1, 1);
+   double prevDayL = iLow (_Symbol, PERIOD_D1, 1);
    if(prevDayH > 0 && prevDayL > 0) {
-      g_RangeHigh = prevDayH;
-      g_RangeLow  = prevDayL;
-      g_RangeMid  = (g_RangeHigh + g_RangeLow) / 2.0;
+      g_PrevDayHigh = prevDayH;
+      g_PrevDayLow  = prevDayL;
    }
-   else if(g_TodayHigh > 0) {
-      // Fallback: use what we have today
-      g_RangeHigh = g_TodayHigh;
-      g_RangeLow  = g_TodayLow;
-      g_RangeMid  = (g_RangeHigh + g_RangeLow) / 2.0;
+
+   // --- Today's live range: D1[0] is the current day's bar — grows every tick.
+   // BUT on attach the terminal may not have synced D1 history yet, so D1[0]
+   // could return a partial bar. Wait 20 ticks (~15-30 seconds) before trusting it.
+   double todayH = 0, todayL = 0;
+   if(g_InitTickCount >= 20) {
+      todayH = iHigh(_Symbol, PERIOD_D1, 0);
+      todayL = iLow (_Symbol, PERIOD_D1, 0);
+      if(todayH > 0) g_TodayHigh = todayH;
+      if(todayL > 0) g_TodayLow  = todayL;
+   }
+
+   // --- Active range: today is primary; expand floor/ceiling with prev day so
+   // the zone boundaries never shrink below what yesterday established.
+   double hi = (todayH > 0) ? todayH : g_PrevDayHigh;
+   double lo = (todayL > 0) ? todayL : g_PrevDayLow;
+   if(g_PrevDayHigh > hi) hi = g_PrevDayHigh;
+   if(g_PrevDayLow  < lo) lo = g_PrevDayLow;
+
+   if(hi > 0 && lo > 0) {
+      g_RangeHigh = hi;
+      g_RangeLow  = lo;
+      g_RangeMid  = (hi + lo) / 2.0;
    }
    // g_AsianHigh/g_LondonHigh are still tracked and shown on dashboard
    // but no longer override the primary range
@@ -900,7 +969,10 @@ void EvaluateHAPattern()
       double mrvBodyMid2 = (haO2m + haC2m) / 2.0;
 
       // --- ARM: bar[1] at extreme zone, correct HA direction, Bollinger gate ---
-      if(!g_MRVArmed && g_MRVConfirmOpen == 0) {
+      // mrvPos sanity: must be within [-0.10, 1.10] — if price is way outside the
+      // range the range is stale; do not arm. Valid extreme is [0, ExtremePct].
+      bool mrvInBounds = (mrvPos >= -0.10 && mrvPos <= 1.10);
+      if(!g_MRVArmed && g_MRVConfirmOpen == 0 && mrvInBounds) {
          if(mrvPos <= ExtremePct && dir1 == 1 &&
             (g_BollingerMid1 <= 0 || mrvBodyMid1 <= g_BollingerMid1)) {
             g_MRVArmed = true; g_MRVDir = 1; g_MRVConfirmOpen = 0;
@@ -1557,9 +1629,13 @@ void UpdateDashboard()
    string rhStr = (g_RangeHigh > 0) ? DoubleToString(g_RangeHigh, 5) : "N/A";
    string rlStr = (g_RangeLow  > 0) ? DoubleToString(g_RangeLow,  5) : "N/A";
    string rmStr = (g_RangeMid  > 0) ? DoubleToString(g_RangeMid,  5) : "N/A";
-   DashLine("05_rh",     "PrevDay H: " + rhStr,                                 cx, cy, row, lh, corner, clrYellow,     9); row++;
-   DashLine("06_rl",     "PrevDay L: " + rlStr,                                 cx, cy, row, lh, corner, clrYellow,     9); row++;
-   DashLine("07_rm",     "PrevDay M: " + rmStr,                                 cx, cy, row, lh, corner, clrYellow,     9); row++;
+   DashLine("05_rh",     "Range   H: " + rhStr,                                 cx, cy, row, lh, corner, clrAqua,       9); row++;
+   DashLine("06_rl",     "Range   L: " + rlStr,                                 cx, cy, row, lh, corner, clrAqua,       9); row++;
+   DashLine("07_rm",     "Range   M: " + rmStr,                                 cx, cy, row, lh, corner, clrAqua,       9); row++;
+   // Yesterday's fixed reference (does not expand intraday)
+   string pdHStr = (g_PrevDayHigh > 0) ? "Prev H:" + DoubleToString(g_PrevDayHigh, 5) +
+                                         "  L:"    + DoubleToString(g_PrevDayLow,  5) : "PrevDay: N/A";
+   DashLine("07a_pd",    pdHStr,                                                 cx, cy, row, lh, corner, clrYellow,     8); row++;
    string bollStr = (g_BollingerMid1 > 0) ? DoubleToString(g_BollingerMid1, 5) : "N/A";
    DashLine("07b_boll",  "Boll Mid : " + bollStr,                               cx, cy, row, lh, corner, clrAqua,       9); row++;
    row++;

@@ -82,7 +82,9 @@ input bool   UseSwingStructure   = true;   // Detect H1 swing highs/lows for BOS
 input bool   UseOrderBlocks      = true;   // Detect H1 institutional order blocks
 input bool   UseVolumeAnalysis   = true;   // Tick volume confirmation & divergence
 input bool   UseLiquiditySweep   = true;   // Detect stop-hunt sweeps at key levels
-input bool   UseFairValueGaps    = true;   // Detect and display M15/H1 Fair Value Gaps
+input bool            UseFairValueGaps = true;      // Detect and display Fair Value Gaps
+input ENUM_TIMEFRAMES FVGTimeframe     = PERIOD_H1;  // Timeframe for FVG detection (H1 recommended)
+input double          FVGMinGapPips    = 10.0;       // Minimum gap size in pips to qualify (3-pip M15 gaps = noise)
 input double MinConfidence       = 35.0;   // Minimum confidence % to take a trade (0-100)
 
 input group "=== RANGE ZONE FILTERS ==="
@@ -1147,13 +1149,12 @@ void DetectOrderBlocks()
 }
 
 //+------------------------------------------------------------------+
-//| FAIR VALUE GAP (FVG) DETECTION — M15                              |
-//| An FVG is a 3-candle pattern where the middle candle's body      |
-//| creates a gap between candle 1's wick and candle 3's wick.       |
-//| Bullish FVG: bar3.high < bar1.low (gap up = demand zone)        |
-//| Bearish FVG: bar3.low  > bar1.high (gap down = supply zone)     |
-//| Price tends to return to fill these gaps — key institutional     |
-//| reference points for entries and targets.                        |
+//| FAIR VALUE GAP (FVG) DETECTION                                    |
+//| Detects on FVGTimeframe (default H1) with FVGMinGapPips minimum. |
+//| M15 gaps of 3-5 pips are noise; H1 gaps of 10+ pips represent    |
+//| genuine institutional order flow imbalances worth trading into.   |
+//| Bullish FVG: bar3.low > bar1.high (gap up = unfilled demand)     |
+//| Bearish FVG: bar3.high < bar1.low (gap down = unfilled supply)   |
 //+------------------------------------------------------------------+
 void DetectFairValueGaps()
 {
@@ -1167,42 +1168,41 @@ void DetectFairValueGaps()
       // Bearish FVG filled when price rises into the gap
       if(g_FVGs[f].dir == -1 && bid >= g_FVGs[f].low && bid <= g_FVGs[f].high)
          g_FVGs[f].filled = true;
-      // Expire FVGs older than 48 hours
-      if(TimeCurrent() - g_FVGs[f].created > 48 * 3600)
+      // Expire FVGs: H1/H4 gaps persist longer than M15 gaps
+      int expiryHours = (FVGTimeframe >= PERIOD_H4) ? 5*24 : (FVGTimeframe >= PERIOD_H1) ? 5*24 : 48;
+      if(TimeCurrent() - g_FVGs[f].created > expiryHours * 3600)
          g_FVGs[f].filled = true;
    }
 
-   // Scan last 30 M15 bars for new FVGs (only check confirmed bars 1+)
-   int scanBars = 30;
-   double minGapPips = 3.0;  // minimum gap size to be significant
-   double minGap = minGapPips * _Point * 10;
+   // Determine scan depth: cover ~3 days of bars on the chosen timeframe
+   int tfMins   = PeriodSeconds(FVGTimeframe) / 60;
+   int scanBars = MathMin((3 * 24 * 60) / MathMax(tfMins, 1), 200);  // ~3 days, cap at 200 bars
+   double minGap = FVGMinGapPips * _Point * 10;
 
    for(int i = 2; i < scanBars; i++)
    {
       // 3-candle pattern: bar i+1 (oldest), bar i (middle), bar i-1 (newest)
-      double bar1_high = iHigh(_Symbol, PERIOD_M15, i + 1);  // oldest
-      double bar1_low  = iLow (_Symbol, PERIOD_M15, i + 1);
-      double bar3_high = iHigh(_Symbol, PERIOD_M15, i - 1);  // newest
-      double bar3_low  = iLow (_Symbol, PERIOD_M15, i - 1);
+      double bar1_high = iHigh(_Symbol, FVGTimeframe, i + 1);
+      double bar1_low  = iLow (_Symbol, FVGTimeframe, i + 1);
+      double bar3_high = iHigh(_Symbol, FVGTimeframe, i - 1);
+      double bar3_low  = iLow (_Symbol, FVGTimeframe, i - 1);
 
-      // Bullish FVG: bar3's low > bar1's high (gap between them = demand)
+      // Bullish FVG: bar3's low > bar1's high (gap between them = unfilled demand)
       if(bar3_low > bar1_high + minGap) {
          double gapHigh = bar3_low;
          double gapLow  = bar1_high;
-         datetime gapTime = iTime(_Symbol, PERIOD_M15, i);
-         if(!FVGExists(gapHigh, gapLow, 1)) {
+         datetime gapTime = iTime(_Symbol, FVGTimeframe, i);
+         if(!FVGExists(gapHigh, gapLow, 1))
             AddFVG(gapHigh, gapLow, 1, gapTime);
-         }
       }
 
-      // Bearish FVG: bar3's high < bar1's low (gap between them = supply)
+      // Bearish FVG: bar3's high < bar1's low (gap between them = unfilled supply)
       if(bar3_high < bar1_low - minGap) {
          double gapHigh = bar1_low;
          double gapLow  = bar3_high;
-         datetime gapTime = iTime(_Symbol, PERIOD_M15, i);
-         if(!FVGExists(gapHigh, gapLow, -1)) {
+         datetime gapTime = iTime(_Symbol, FVGTimeframe, i);
+         if(!FVGExists(gapHigh, gapLow, -1))
             AddFVG(gapHigh, gapLow, -1, gapTime);
-         }
       }
    }
 

@@ -97,11 +97,16 @@ input int    DashboardX       = 10;
 input int    DashboardY       = 20;
 
 //=== GLOBALS ===
-double g_AsianHigh  = 0, g_AsianLow  = 0;
-double g_LondonHigh = 0, g_LondonLow = 0;
-double g_TodayHigh  = 0, g_TodayLow  = 0;
+double g_AsianHigh  = 0, g_AsianLow  = 0, g_AsianOpen  = 0;
+double g_LondonHigh = 0, g_LondonLow = 0, g_LondonOpen = 0;
+double g_TodayHigh  = 0, g_TodayLow  = 0, g_TodayOpen  = 0;
 double g_RangeHigh  = 0, g_RangeLow  = 0, g_RangeMid = 0;
 double g_CIHigh     = 0, g_CILow     = 0, g_ATR      = 0;
+
+// Session seeded flags — true only after a successful CopyHigh call
+// (NOT set by UpdateLiveSessionBar so the retry keeps firing until real data arrives)
+bool   g_AsianSeeded  = false;
+bool   g_LondonSeeded = false;
 
 bool   g_TradeOpen    = false;
 bool   g_ProfitLocked = false;
@@ -245,25 +250,26 @@ void OnTick()
    if(g_TradeOpen) ManageOpenTrade();
 
    // --- Retry session seeding if data wasn't ready on OnInit ---
-   // CopyHigh/CopyLow may return 0 bars on the very first attach tick;
-   // re-run until each session has real data (stops retrying once populated).
+   // Key: use !g_AsianSeeded / !g_LondonSeeded flags (NOT g_AsianHigh==0),
+   // because UpdateLiveSessionBar sets H/L from bar[0] alone on every tick,
+   // which would falsely block the retry from firing on tick 2+.
    MqlDateTime nowDt;
    TimeToStruct(TimeCurrent(), nowDt);
    datetime dayStart0 = (datetime)(TimeCurrent() - (nowDt.hour*3600 + nowDt.min*60 + nowDt.sec));
-   if(g_AsianHigh == 0) {
+   if(!g_AsianSeeded) {
       datetime aStart = dayStart0 + (datetime)(AsianStartHour * 3600);
       datetime aEnd   = dayStart0 + (datetime)(AsianEndHour   * 3600);
       if(TimeCurrent() > aStart) {
          datetime aTo = (TimeCurrent() < aEnd) ? TimeCurrent() : aEnd;
-         SeedSessionHL(aStart, aTo, g_AsianHigh, g_AsianLow);
+         g_AsianSeeded = SeedSessionHL(aStart, aTo, g_AsianHigh, g_AsianLow, g_AsianOpen);
       }
    }
-   if(g_LondonHigh == 0) {
+   if(!g_LondonSeeded) {
       datetime lStart = dayStart0 + (datetime)(LondonStartHour * 3600);
       datetime lEnd   = dayStart0 + (datetime)(LondonEndHour   * 3600);
       if(TimeCurrent() > lStart) {
          datetime lTo = (TimeCurrent() < lEnd) ? TimeCurrent() : lEnd;
-         SeedSessionHL(lStart, lTo, g_LondonHigh, g_LondonLow);
+         g_LondonSeeded = SeedSessionHL(lStart, lTo, g_LondonHigh, g_LondonLow, g_LondonOpen);
       }
    }
 
@@ -318,26 +324,33 @@ void OnTick()
 //| Uses CopyHigh/CopyLow with datetime-range signature — this asks  |
 //| the terminal database directly and returns data immediately,     |
 //| even on first attach, regardless of chart zoom or buffer state.  |
+//| Also captures the session open (first bar open in the window).  |
+//| Returns true if data was successfully read.                      |
 //+------------------------------------------------------------------+
-void SeedSessionHL(datetime fromTime, datetime toTime, double &hi, double &lo)
+bool SeedSessionHL(datetime fromTime, datetime toTime, double &hi, double &lo, double &op)
 {
-   if(fromTime >= toTime) return;
+   if(fromTime >= toTime) return false;
 
-   double arrH[], arrL[];
-   // CopyHigh/CopyLow(symbol, tf, from, to, array) — datetime-range form
-   // Returns the number of bars copied; negative = data unavailable
+   double arrH[], arrL[], arrO[];
+   // CopyXxx with datetime range: asks terminal DB, not chart buffer
    int copied = CopyHigh(_Symbol, PERIOD_M15, fromTime, toTime, arrH);
    if(copied <= 0) {
       Print("SeedSessionHL: CopyHigh returned ", copied,
             " from ", TimeToString(fromTime), " to ", TimeToString(toTime));
-      return;
+      return false;
    }
-   CopyLow(_Symbol, PERIOD_M15, fromTime, toTime, arrL);
+   CopyLow (_Symbol, PERIOD_M15, fromTime, toTime, arrL);
+   CopyOpen(_Symbol, PERIOD_M15, fromTime, toTime, arrO);
+
+   // CopyXxx with datetime range returns bars oldest→newest (index 0 = earliest)
+   // arrO[0] is the open of the very first bar of this session = session open price
+   if(ArraySize(arrO) > 0 && arrO[0] > 0 && op == 0) op = arrO[0];
 
    for(int i = 0; i < copied; i++) {
       if(arrH[i] > 0 && (hi == 0 || arrH[i] > hi)) hi = arrH[i];
       if(arrL[i] > 0 && (lo == 0 || arrL[i] < lo)) lo = arrL[i];
    }
+   return true;
 }
 
 //+------------------------------------------------------------------+
@@ -357,14 +370,14 @@ void SeedRangesFromHistory()
       g_RangeMid = (g_RangeHigh + g_RangeLow) / 2.0;
 
    // --- Today overall: midnight → now ---
-   SeedSessionHL(dayStart, TimeCurrent(), g_TodayHigh, g_TodayLow);
+   SeedSessionHL(dayStart, TimeCurrent(), g_TodayHigh, g_TodayLow, g_TodayOpen);
 
    // --- Asian session: only if we are past or inside Asian hours ---
    datetime asianStart = dayStart + (datetime)(AsianStartHour  * 3600);
    datetime asianEnd   = dayStart + (datetime)(AsianEndHour    * 3600);
    if(TimeCurrent() > asianStart) {
       datetime asianTo = (TimeCurrent() < asianEnd) ? TimeCurrent() : asianEnd;
-      SeedSessionHL(asianStart, asianTo, g_AsianHigh, g_AsianLow);
+      g_AsianSeeded = SeedSessionHL(asianStart, asianTo, g_AsianHigh, g_AsianLow, g_AsianOpen);
    }
 
    // --- London session: only if we are past or inside London hours ---
@@ -372,7 +385,7 @@ void SeedRangesFromHistory()
    datetime londonEnd   = dayStart + (datetime)(LondonEndHour   * 3600);
    if(TimeCurrent() > londonStart) {
       datetime londonTo = (TimeCurrent() < londonEnd) ? TimeCurrent() : londonEnd;
-      SeedSessionHL(londonStart, londonTo, g_LondonHigh, g_LondonLow);
+      g_LondonSeeded = SeedSessionHL(londonStart, londonTo, g_LondonHigh, g_LondonLow, g_LondonOpen);
    }
 
    // Fallback: if today has no data at all, g_RangeHigh/Low from D1 already set above
@@ -393,9 +406,9 @@ void ResetDailyRanges()
    double prevH = g_TodayHigh;
    double prevL = g_TodayLow;
 
-   g_AsianHigh = 0; g_AsianLow  = 0;
-   g_LondonHigh= 0; g_LondonLow = 0;
-   g_TodayHigh = 0; g_TodayLow  = 0;
+   g_AsianHigh = 0; g_AsianLow  = 0; g_AsianOpen  = 0; g_AsianSeeded  = false;
+   g_LondonHigh= 0; g_LondonLow = 0; g_LondonOpen = 0; g_LondonSeeded = false;
+   g_TodayHigh = 0; g_TodayLow  = 0; g_TodayOpen  = 0;
 
    // Use yesterday as initial range (Asian session fallback)
    if(prevH > 0 && prevL > 0) {
@@ -440,10 +453,12 @@ void UpdateSessionRanges()
    if(g_TodayLow  == 0 || lo < g_TodayLow)  g_TodayLow  = lo;
 
    if(h >= AsianStartHour && h < AsianEndHour) {
+      if(g_AsianOpen == 0) g_AsianOpen = iOpen(_Symbol, PERIOD_M15, 1);
       if(g_AsianHigh == 0 || hi > g_AsianHigh) g_AsianHigh = hi;
       if(g_AsianLow  == 0 || lo < g_AsianLow)  g_AsianLow  = lo;
    }
    if(h >= LondonStartHour && h < LondonEndHour) {
+      if(g_LondonOpen == 0) g_LondonOpen = iOpen(_Symbol, PERIOD_M15, 1);
       if(g_LondonHigh == 0 || hi > g_LondonHigh) g_LondonHigh = hi;
       if(g_LondonLow  == 0 || lo < g_LondonLow)  g_LondonLow  = lo;
    }
@@ -457,6 +472,7 @@ void UpdateLiveSessionBar()
 {
    double liveHi = iHigh(_Symbol, PERIOD_M15, 0);
    double liveLo = iLow (_Symbol, PERIOD_M15, 0);
+   double liveOp = iOpen(_Symbol, PERIOD_M15, 0);
    datetime liveT = iTime(_Symbol, PERIOD_M15, 0);
 
    MqlDateTime ldt;
@@ -467,10 +483,12 @@ void UpdateLiveSessionBar()
    if(g_TodayLow  == 0 || liveLo < g_TodayLow)  g_TodayLow  = liveLo;
 
    if(h >= AsianStartHour && h < AsianEndHour) {
+      if(g_AsianOpen == 0) g_AsianOpen = liveOp;
       if(g_AsianHigh == 0 || liveHi > g_AsianHigh) g_AsianHigh = liveHi;
       if(g_AsianLow  == 0 || liveLo  < g_AsianLow)  g_AsianLow  = liveLo;
    }
    if(h >= LondonStartHour && h < LondonEndHour) {
+      if(g_LondonOpen == 0) g_LondonOpen = liveOp;
       if(g_LondonHigh == 0 || liveHi > g_LondonHigh) g_LondonHigh = liveHi;
       if(g_LondonLow  == 0 || liveLo  < g_LondonLow)  g_LondonLow  = liveLo;
    }
@@ -1452,10 +1470,24 @@ void UpdateDashboard()
       row++;
    }
 
-   string asianStr  = (g_AsianHigh  > 0) ? DoubleToString(g_AsianHigh, 5)  + "/" + DoubleToString(g_AsianLow,  5) : "Forming";
-   string londonStr = (g_LondonHigh > 0) ? DoubleToString(g_LondonHigh, 5) + "/" + DoubleToString(g_LondonLow, 5) : "Forming";
-   DashLine("11_asian",  "Asian   : " + asianStr,                               cx, cy, row, lh, corner, clrSilver,     9); row++;
-   DashLine("12_london", "London  : " + londonStr,                              cx, cy, row, lh, corner, clrSilver,     9); row++;
+   // Asian session O/H/L
+   if(g_AsianSeeded || g_AsianHigh > 0) {
+      DashLine("11a_asian",  "Asian   : O:" + DoubleToString(g_AsianOpen, 5),  cx, cy, row, lh, corner, clrSilver, 9); row++;
+      DashLine("11b_asian",  "          H:" + DoubleToString(g_AsianHigh, 5) +
+                             "  L:" + DoubleToString(g_AsianLow,  5),           cx, cy, row, lh, corner, clrSilver, 9); row++;
+   } else {
+      DashLine("11a_asian",  "Asian   : Forming...",                           cx, cy, row, lh, corner, clrGray,   9); row++;
+      DashLine("11b_asian",  "",                                                cx, cy, row, lh, corner, clrGray,   9); row++;
+   }
+   // London session O/H/L
+   if(g_LondonSeeded || g_LondonHigh > 0) {
+      DashLine("12a_london", "London  : O:" + DoubleToString(g_LondonOpen, 5), cx, cy, row, lh, corner, clrSilver, 9); row++;
+      DashLine("12b_london", "          H:" + DoubleToString(g_LondonHigh, 5) +
+                             "  L:" + DoubleToString(g_LondonLow,  5),          cx, cy, row, lh, corner, clrSilver, 9); row++;
+   } else {
+      DashLine("12a_london", "London  : Forming...",                           cx, cy, row, lh, corner, clrGray,   9); row++;
+      DashLine("12b_london", "",                                                cx, cy, row, lh, corner, clrGray,   9); row++;
+   }
    row++;
 
    int    liveConsecDash = LiveHAConsecTotal();

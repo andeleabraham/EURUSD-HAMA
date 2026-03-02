@@ -91,12 +91,22 @@ input string NewsNote         = "";
 input int    NewsImpactEUR    = 0;
 input int    NewsImpactUSD    = 0;
 
+input group "=== FOREIGN TRADE AWARENESS ==="
+input bool   RespectForeignTrades = true;   // Block new entries if a non-bot trade exists on this symbol
+
 input group "=== DASHBOARD POSITION ==="
 input int    DashboardCorner  = 0;
 input int    DashboardX       = 10;
 input int    DashboardY       = 20;
 
 //=== GLOBALS ===
+
+// Foreign trade tracking (non-bot positions on this account)
+int    g_ForeignCountSymbol = 0;    // foreign trades on THIS symbol (EURUSD)
+int    g_ForeignCountTotal  = 0;    // foreign trades on ALL symbols
+double g_ForeignLotsSymbol  = 0.0;  // total lots of foreign trades on this symbol
+string g_ForeignSummary     = "";   // human-readable summary for dashboard
+
 double g_AsianHigh  = 0, g_AsianLow  = 0, g_AsianOpen  = 0;
 double g_LondonHigh = 0, g_LondonLow = 0, g_LondonOpen = 0;
 double g_NYHigh     = 0, g_NYLow     = 0, g_NYOpen     = 0;
@@ -231,6 +241,59 @@ void RestoreExistingTrade()
 }
 
 //+------------------------------------------------------------------+
+//| SCAN FOREIGN TRADES                                              |
+//| Counts open positions NOT placed by this bot (magic != 202502).  |
+//| Separates same-symbol vs total-account foreign trades.           |
+//+------------------------------------------------------------------+
+void ScanForeignTrades()
+{
+   int    countSym   = 0;
+   int    countAll   = 0;
+   double lotsSym    = 0.0;
+   string details    = "";
+
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      if(!posInfo.SelectByIndex(i)) continue;
+
+      // Skip our own bot's trades
+      if(posInfo.Magic() == 202502) continue;
+
+      // This is a foreign trade (manual, other EA, etc.)
+      countAll++;
+      string sym   = posInfo.Symbol();
+      double lot   = posInfo.Volume();
+      long   magic = posInfo.Magic();
+      double pnl   = posInfo.Commission() + posInfo.Swap() + posInfo.Profit();
+      string dir   = (posInfo.PositionType() == POSITION_TYPE_BUY) ? "BUY" : "SELL";
+
+      if(sym == _Symbol)
+      {
+         countSym++;
+         lotsSym += lot;
+         if(details != "") details += "; ";
+         details += dir + " " + DoubleToString(lot, 2) + "lot";
+         if(magic != 0)
+            details += " (EA:" + IntegerToString(magic) + ")";
+         else
+            details += " (manual)";
+         details += " P&L:$" + DoubleToString(pnl, 2);
+      }
+   }
+
+   // Log when foreign trades appear or disappear
+   if(countSym > 0 && g_ForeignCountSymbol == 0)
+      Print("FOREIGN TRADE DETECTED on ", _Symbol, ": ", details);
+   if(countSym == 0 && g_ForeignCountSymbol > 0)
+      Print("FOREIGN TRADE CLOSED — ", _Symbol, " clear, bot can trade again");
+
+   g_ForeignCountSymbol = countSym;
+   g_ForeignCountTotal  = countAll;
+   g_ForeignLotsSymbol  = lotsSym;
+   g_ForeignSummary     = details;
+}
+
+//+------------------------------------------------------------------+
 int OnInit()
 {
    trade.SetExpertMagicNumber(202502);
@@ -266,6 +329,9 @@ void OnTick()
    // Track ticks since attach — D1[0] data may be stale on first few ticks
    // while the terminal syncs history. We wait 20 ticks before trusting it.
    if(g_InitTickCount < 100) g_InitTickCount++;
+
+   // Scan for foreign (non-bot) trades every tick
+   ScanForeignTrades();
 
    // Always manage open trade on every tick
    if(g_TradeOpen) ManageOpenTrade();
@@ -1228,6 +1294,14 @@ void TryEntry()
 {
    if(g_TradeOpen) return;
 
+   // === FOREIGN TRADE GUARD ===
+   // If a non-bot trade exists on this symbol, respect the one-trade rule
+   if(RespectForeignTrades && g_ForeignCountSymbol > 0) {
+      Print("ENTRY BLOCKED: ", g_ForeignCountSymbol, " foreign trade(s) open on ", _Symbol,
+            " (", DoubleToString(g_ForeignLotsSymbol,2), " lots) — one-trade rule");
+      return;
+   }
+
    // Check both trend signals AND mean reversion setup
    bool isTrendSignal = (g_Signal == "BUY INCOMING" || g_Signal == "SELL INCOMING");
    int  meanRevDir    = MeanReversionSetup();
@@ -1749,6 +1823,26 @@ void UpdateDashboard()
                            (liveConsecDash >= 3)                ? clrYellow : clrWhite;
    DashLine("13_consec", "HA Consec: " + consecStr + liveExtra,
                                                                                  cx, cy, row, lh, corner, consecClr,    9); row++;
+
+   // --- Foreign trade awareness ---
+   if(g_ForeignCountSymbol > 0) {
+      string fStr = IntegerToString(g_ForeignCountSymbol) + " foreign on " + _Symbol
+                    + " (" + DoubleToString(g_ForeignLotsSymbol, 2) + " lots)";
+      DashLine("13c_fgn",  "FOREIGN : " + fStr,                                 cx, cy, row, lh, corner, clrOrangeRed, 9); row++;
+      DashLine("13d_fgnd", "  " + g_ForeignSummary,                             cx, cy, row, lh, corner, clrOrange,    8); row++;
+      if(RespectForeignTrades)
+         DashLine("13e_fgnw", "  >> Bot PAUSED (one-trade rule)",               cx, cy, row, lh, corner, clrRed,       8); row++;
+   } else if(g_ForeignCountTotal > 0) {
+      string fAllStr = IntegerToString(g_ForeignCountTotal) + " foreign on other pairs";
+      DashLine("13c_fgn",  "Foreign : " + fAllStr,                              cx, cy, row, lh, corner, clrGray,      8); row++;
+      DashLine("13d_fgnd", "",                                                   cx, cy, row, lh, corner, clrGray,      8); row++;
+      DashLine("13e_fgnw", "",                                                   cx, cy, row, lh, corner, clrGray,      8); row++;
+   } else {
+      DashLine("13c_fgn",  "Foreign : none",                                    cx, cy, row, lh, corner, clrGray,      8); row++;
+      DashLine("13d_fgnd", "",                                                   cx, cy, row, lh, corner, clrGray,      8); row++;
+      DashLine("13e_fgnw", "",                                                   cx, cy, row, lh, corner, clrGray,      8); row++;
+   }
+   row++;
 
    color  tColor   = g_TradeOpen ? clrLime : clrGray;
    DashLine("14_trade",  "Trade   : " + (g_TradeOpen ? "OPEN" : "NONE"),        cx, cy, row, lh, corner, tColor,        9); row++;

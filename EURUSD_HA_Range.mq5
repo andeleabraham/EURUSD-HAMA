@@ -1470,8 +1470,27 @@ double CalcConfidence(int tradeDir, string zone, bool isMeanRev, bool isSideways
    else if(zone == "UPPER_THIRD" && tradeDir == 1)   conf += 3.0;   // buy from high (risky)
    else if(zone == "MID_ZONE")   conf += 1.0;   // mid = limited runway
 
-   // --- 4. CONFLUENCE — near a Fib/Pivot level (0-10) ---
-   if(nearLevel != "")  conf += 10.0;
+   // --- 4. CONFLUENCE — near a Fib/Pivot level, TYPE scores differently per direction ---
+   // Support levels (S1, S2, Fib 61.8%, 76.4%) favour BUY; resist BUY headwind if selling from support
+   // Resistance levels (R1, R2, Fib 23.6%, 38.2%) favour SELL; penalise BUY at resistance
+   // PP and Fib 50% are neutral
+   if(nearLevel != "") {
+      bool isSupport    = (StringFind(nearLevel, "S1") >= 0 || StringFind(nearLevel, "S2") >= 0 ||
+                           StringFind(nearLevel, "61.8") >= 0 || StringFind(nearLevel, "76.4") >= 0);
+      bool isResistance = (StringFind(nearLevel, "R1") >= 0 || StringFind(nearLevel, "R2") >= 0 ||
+                           StringFind(nearLevel, "23.6") >= 0 || StringFind(nearLevel, "38.2") >= 0);
+      bool isNeutral    = (!isSupport && !isResistance);   // PP, Fib 50%
+
+      if(isNeutral) {
+         conf += 6.0;   // mild boost for both directions
+      } else if(isSupport) {
+         if(tradeDir == 1)  conf += 12.0;  // buying at support = strong confirmation
+         else               conf +=  2.0;  // selling at support = fighting against the level
+      } else {  // isResistance
+         if(tradeDir == -1) conf += 12.0;  // selling at resistance = strong confirmation
+         else               conf +=  2.0;  // buying at resistance = fighting against the level
+      }
+   }
 
    // --- 5. BIAS ALIGNMENT (0-5, can go negative) ---
    if(tradeDir == 1  && g_TotalBias >= 2)   conf += 5.0;   // strong bull bias + buy
@@ -1516,12 +1535,30 @@ double CalcConfidence(int tradeDir, string zone, bool isMeanRev, bool isSideways
       if(g_CHoCH && structAligned) conf += 3.0;
    }
 
-   // --- 9. VOLUME CONFIRMATION (0-5) ---
+   // --- 9. VOLUME CONFIRMATION (directional) ---
+   // High volume in the TRADE direction = institutional participation = gold.
+   // High volume AGAINST the trade direction = potential exhaustion move = warning.
    if(UseVolumeAnalysis) {
-      if(g_VolumeState == "HIGH")           conf += 5.0;
-      else if(g_VolumeState == "ABOVE_AVG") conf += 3.0;
-      else if(g_VolumeState == "LOW")       conf -= 3.0;  // dead volume
-      if(g_VolDivergence)                   conf -= 3.0;  // weakening
+      // Determine price direction on the last completed bar
+      double barClose = iClose(_Symbol, PERIOD_M15, 1);
+      double barOpen  = iOpen (_Symbol, PERIOD_M15, 1);
+      int barPriceDir = (barClose > barOpen + _Point * 3) ? 1
+                      : (barClose < barOpen - _Point * 3) ? -1 : 0;  // 0 = doji
+
+      bool volWithTrade = (barPriceDir == tradeDir);   // volume bar moved in trade direction
+      bool volAgainst   = (barPriceDir != 0 && barPriceDir != tradeDir);
+
+      if(g_VolumeState == "HIGH") {
+         if(volWithTrade)  conf += 7.0;   // strong directional volume = best scenario
+         else if(volAgainst) conf += 1.0; // high volume against us = possible exhaustion (slight positive — selling climax can precede reversal)
+         else              conf += 3.0;   // high vol neutral bar
+      } else if(g_VolumeState == "ABOVE_AVG") {
+         if(volWithTrade)  conf += 4.0;
+         else              conf += 2.0;
+      } else if(g_VolumeState == "LOW") {
+         conf -= 3.0;   // dead volume = unreliable
+      }
+      if(g_VolDivergence) conf -= 3.0;  // price trending but volume fading = weakening
    }
 
    // --- 10. LIQUIDITY SWEEP (0-10) ---
@@ -1532,19 +1569,39 @@ double CalcConfidence(int tradeDir, string zone, bool isMeanRev, bool isSideways
       else                         conf -= 3.0;   // sweep against us = danger
    }
 
-   // --- 11. ORDER BLOCK PROXIMITY (0-5) ---
+   // --- 11. ORDER BLOCK PROXIMITY (directional, with opposing OB penalty) ---
    bool nearOB = false;
    if(UseOrderBlocks) {
       double obTol = 3.0 * _Point * 10;
       double bidNow = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+
+      // Aligned OB: trade in direction of institutional impulse
       if(tradeDir == 1 && g_BullOB_High > 0) {
          if(bidNow >= g_BullOB_Low - obTol && bidNow <= g_BullOB_High + obTol) {
-            conf += 5.0; nearOB = true;
+            conf += 7.0; nearOB = true;   // buying inside bull order block = best setup
          }
       }
       if(tradeDir == -1 && g_BearOB_High > 0) {
          if(bidNow >= g_BearOB_Low - obTol && bidNow <= g_BearOB_High + obTol) {
-            conf += 5.0; nearOB = true;
+            conf += 7.0; nearOB = true;   // selling inside bear order block = best setup
+         }
+      }
+
+      // Opposing OB: trading INTO an institutional supply/demand zone (headwind penalty)
+      if(tradeDir == 1 && g_BearOB_High > 0 && !nearOB) {
+         // Buying but price is approaching a BEAR OB (supply zone above)
+         if(bidNow >= g_BearOB_Low - obTol * 3 && bidNow <= g_BearOB_High + obTol) {
+            conf -= 5.0;  // buying into supply = significant headwind
+            Print("OB HEADWIND: buying into Bear OB supply zone [",
+                  DoubleToString(g_BearOB_Low,5), "-", DoubleToString(g_BearOB_High,5), "]");
+         }
+      }
+      if(tradeDir == -1 && g_BullOB_High > 0 && !nearOB) {
+         // Selling but price is approaching a BULL OB (demand zone below)
+         if(bidNow <= g_BullOB_High + obTol * 3 && bidNow >= g_BullOB_Low - obTol) {
+            conf -= 5.0;  // selling into demand = significant headwind
+            Print("OB HEADWIND: selling into Bull OB demand zone [",
+                  DoubleToString(g_BullOB_Low,5), "-", DoubleToString(g_BullOB_High,5), "]");
          }
       }
    }
@@ -1570,14 +1627,32 @@ double CalcConfidence(int tradeDir, string zone, bool isMeanRev, bool isSideways
    // Store globally for dashboard and entry logic
    g_Confidence = conf;
 
+   // Determine level type label for logging
+   string lvlType = "";
+   if(nearLevel != "") {
+      bool _isSup = (StringFind(nearLevel,"S1")>=0 || StringFind(nearLevel,"S2")>=0 ||
+                     StringFind(nearLevel,"61.8")>=0 || StringFind(nearLevel,"76.4")>=0);
+      bool _isRes = (StringFind(nearLevel,"R1")>=0 || StringFind(nearLevel,"R2")>=0 ||
+                     StringFind(nearLevel,"23.6")>=0 || StringFind(nearLevel,"38.2")>=0);
+      lvlType = _isSup ? "(SUP)" : _isRes ? "(RES)" : "(NEU)";
+   }
+   // Determine volume direction label for logging
+   string volDirStr = "";
+   if(UseVolumeAnalysis && g_VolumeState != "LOW") {
+      double _c = iClose(_Symbol,PERIOD_M15,1); double _o = iOpen(_Symbol,PERIOD_M15,1);
+      int _vd = (_c > _o+_Point*3) ? 1 : (_c < _o-_Point*3) ? -1 : 0;
+      volDirStr = (_vd == tradeDir)  ? "+aligned"
+                : (_vd != 0)        ? "-against" : "=doji";
+   }
+
    Print("CONFIDENCE: ", DoubleToString(conf, 1), "%",
          " HA:", consec,
          " ATR:", DoubleToString(atrPips, 1), "pip",
          " Sess:", (isOverlap ? "OVERLAP" : isLondon ? "LONDON" : isNY ? "NY" : "OTHER"),
          " Zone:", zone,
-         " Cnfl:", (nearLevel == "" ? "none" : nearLevel),
+         " Cnfl:", (nearLevel == "" ? "none" : nearLevel+lvlType),
          " Struct:", g_StructureLabel, (g_BOS ? " BOS" : ""), (g_CHoCH ? " CHoCH" : ""),
-         " Vol:", g_VolumeState, (g_VolDivergence ? " DIV" : ""),
+         " Vol:", g_VolumeState, volDirStr, (g_VolDivergence ? " DIV" : ""),
          " Sweep:", (g_LiquiditySweep ? g_SweepLevel : "none"),
          " OB:", (nearOB ? "YES" : "no"),
          " FVG:", (nearFVG ? (g_NearestFVGDir == 1 ? "BULL" : "BEAR") : "none"),

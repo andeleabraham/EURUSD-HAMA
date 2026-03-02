@@ -21,17 +21,25 @@ input bool   AutoLotSize      = true;
 input double ManualLotSize    = 0.01;
 input double MaxLotSize       = 0.10;   // Hard cap lowered — protects against large early losses
 
-input group "=== RISK & PROFIT (at 0.01 lot baseline) ==="
-input double TakeProfitUSD    = 3.00;   // Full TP target (scaled with lot)
+input group "=== RISK & PROFIT (per 0.01 lot baseline) ==="
 input double StopLossUSD      = 1.75;   // Broker SL price level ($1.75 per 0.01 lot, scaled)
 input double MaxLossUSD       = 1.75;   // Hard max loss before forced close — NEVER exceed (per 0.01 lot)
-input double LockProfitUSD    = 2.00;   // Lock profit at $2 (applies to ALL trade types, no exceptions)
-input double TrailingLockUSD  = 0.30;   // Trail gap once locked (scaled)
-// Mid-range / sideways: same $2 lock, but tighter TP to not overstay
-input double MidRangeTPUSD    = 2.00;   // TP for mid-range/sideways trades — take it at $2 (per 0.01 lot)
+// Tier system: the bot classifies each trade and auto-sets TP/lock/trail
+// Tier 1 (SCALP)  : mid-zone, sideways, weak ATR   → TP $1.50, lock $0.80, trail $0.25
+// Tier 2 (SWING)  : good zone, normal ATR, some confluence → TP $3.00, lock $1.50, trail $0.40
+// Tier 3 (RUNNER) : extreme zone, strong ATR, London/NY, pivot confluence → TP $5.00, lock $2.00, trail $0.60
+input double Tier1TP_USD      = 1.50;   // Scalp TP per 0.01 lot
+input double Tier1Lock_USD    = 0.80;   // Scalp lock threshold
+input double Tier1Trail_USD   = 0.25;   // Scalp trail gap
+input double Tier2TP_USD      = 3.00;   // Swing TP per 0.01 lot
+input double Tier2Lock_USD    = 1.50;   // Swing lock threshold
+input double Tier2Trail_USD   = 0.40;   // Swing trail gap
+input double Tier3TP_USD      = 5.00;   // Runner TP per 0.01 lot
+input double Tier3Lock_USD    = 2.00;   // Runner lock threshold
+input double Tier3Trail_USD   = 0.60;   // Runner trail gap
 // Mid-range time-exit: close if stalling below this profit after MidRangeMaxBars
-input double MidRangeStallUSD = 0.50;   // Close mid-range trade if below this after stall period (per 0.01 lot)
-input int    MidRangeMaxBars  = 16;     // Mid-range max hold before stall-exit check (bars, 16 = 4h)
+input double MidRangeStallUSD = 0.50;   // Close stalled trade if below this after stall period (per 0.01 lot)
+input int    MidRangeMaxBars  = 16;     // Tier 1 max hold before stall-exit check (bars, 16 = 4h)
 
 input group "=== TIME FILTERS ==="
 input int    MaxHoldBars      = 32;     // Max 15M bars to hold = 8 hours, then exit
@@ -159,6 +167,7 @@ bool   g_IsNearMid      = false;   // trade entered near midrange → tighter ta
 bool   g_IsMeanRev      = false;   // trade is a mean reversion setup
 int    g_OpenBarCount   = 0;       // bars elapsed since trade opened
 datetime g_TradeOpenTime = 0;
+int    g_TradeTier      = 2;       // 1=SCALP, 2=SWING, 3=RUNNER (set at entry)
 
 // HA state machine
 bool   g_HABullSetup  = false;
@@ -233,11 +242,14 @@ void RestoreExistingTrade()
       g_IsMeanRev = (StringFind(comment, "MRV") >= 0);
       g_IsNearMid = g_IsMeanRev;   // MRV is always mid-context; trend zone not recoverable
 
-      // Rebuild scaled USD thresholds from current input values
-      double lockBase = LockProfitUSD;
-      double tpBase   = g_IsNearMid ? MidRangeTPUSD : TakeProfitUSD;
-      double slBase   = StopLossUSD;
-      SetScaledThresholds(lot, lockBase, tpBase, slBase);
+      // Recover tier from comment if present (tag ends with _T1/_T2/_T3)
+      int tierIdx = StringFind(comment, "_T3");
+      if(tierIdx >= 0) g_TradeTier = 3;
+      else if(StringFind(comment, "_T1") >= 0) g_TradeTier = 1;
+      else g_TradeTier = 2;  // default to Tier 2 if unknown
+
+      // Rebuild scaled USD thresholds for the recovered tier
+      SetScaledThresholds(lot, g_TradeTier);
 
       // Restore peak profit and lock flag
       g_PeakProfit   = (profit > 0.0) ? profit : 0.0;
@@ -927,6 +939,134 @@ string NearFibPivotLevel(double price)
    return "";
 }
 
+//+------------------------------------------------------------------+
+//| TRADE TIER CLASSIFICATION                                        |
+//| Scores the setup quality using ATR, session, zone, confluence,  |
+//| bias alignment —  returns 1 (SCALP), 2 (SWING), or 3 (RUNNER)   |
+//+------------------------------------------------------------------+
+int CalcTradeTier(int tradeDir, string zone, bool isMeanRev, bool isSideways, string nearLevel)
+{
+   int score = 0;   // accumulate evidence; will map to tier at the end
+
+   // --- 1. ATR STRENGTH ---
+   // H1 ATR for EURUSD typically 5-15 pips quiet, 15-25 pips active, 25+ volatile
+   double atrPips = (g_ATR > 0) ? (g_ATR / _Point / 10.0) : 10.0;
+   if(atrPips >= 20.0)      score += 3;   // strong volatility = room to move
+   else if(atrPips >= 12.0)  score += 2;   // normal
+   else if(atrPips >= 7.0)   score += 1;   // mild
+   // < 7 = dead market, no points
+
+   // --- 2. SESSION --- (London/NY overlap = best, Asian = worst)
+   MqlDateTime dt;
+   TimeToStruct(TimeCurrent(), dt);
+   int h = dt.hour;
+   bool isLondon  = (h >= LondonStartHour  && h < LondonEndHour);
+   bool isNY      = (h >= NewYorkStartHour && h < NewYorkEndHour);
+   bool isOverlap = isLondon && isNY;   // 13:00-16:00 = prime time
+   if(isOverlap)       score += 3;
+   else if(isNY)       score += 2;
+   else if(isLondon)   score += 2;
+   // Asian or off-hours: +0
+
+   // --- 3. ZONE POSITION --- (trade FROM extreme TOWARD mid/opposite = most room)
+   if(zone == "LOWER_THIRD" && tradeDir == 1)   score += 2;  // buy from low  = great
+   if(zone == "UPPER_THIRD" && tradeDir == -1)  score += 2;  // sell from high = great
+   if(zone == "MID_ZONE")                        score -= 1;  // mid = limited runway
+
+   // --- 4. CONFLUENCE --- (near a pivot/fib level)
+   if(nearLevel != "")  score += 2;
+
+   // --- 5. BIAS ALIGNMENT --- (trade direction matches bias)
+   if(tradeDir == 1  && g_TotalBias >= 1)   score += 1;
+   if(tradeDir == -1 && g_TotalBias <= -1)  score += 1;
+   if(tradeDir == 1  && g_TotalBias <= -2)  score -= 1;  // counter-trend penalty
+   if(tradeDir == -1 && g_TotalBias >= 2)   score -= 1;
+
+   // --- 6. RANGE ROOM --- how much of the range can this trade travel?
+   if(g_RangeHigh > 0 && g_RangeLow > 0) {
+      double rangeSize = g_RangeHigh - g_RangeLow;
+      double bid       = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+      double roomForBuy = g_RangeHigh - bid;
+      double roomForSell = bid - g_RangeLow;
+      double room = (tradeDir == 1) ? roomForBuy : roomForSell;
+      double roomPips = room / _Point / 10.0;
+      if(roomPips >= 30.0)      score += 2;   // 30+ pips to next boundary = runner
+      else if(roomPips >= 15.0)  score += 1;   // decent room
+      // < 15 pips room = don't add points
+   }
+
+   // --- 7. MEAN REVERSION BONUS ---
+   // MRV from extreme = bounce plays often travel to mid = good for $2-3
+   if(isMeanRev && zone != "MID_ZONE")  score += 1;
+
+   // --- 8. SIDEWAYS PENALTY ---
+   if(isSideways)  score -= 2;
+
+   // --- MAP SCORE TO TIER ---
+   // score <= 3  : SCALP (tier 1)  — low conviction, take $1-1.50 and go
+   // score 4-7   : SWING (tier 2)  — normal trade, target $2-3
+   // score >= 8  : RUNNER (tier 3) — let it ride to $3-5
+   int tier;
+   if(score >= 8)       tier = 3;
+   else if(score >= 4)  tier = 2;
+   else                 tier = 1;
+
+   Print("TRADE TIER: ", tier, " (score=", score, ")",
+         " ATR:", DoubleToString(atrPips,1), "pip",
+         " Session:", (isOverlap?"OVERLAP":isLondon?"LONDON":isNY?"NY":"OTHER"),
+         " Zone:", zone, " Confluence:", (nearLevel==""?"none":nearLevel),
+         " Bias:", g_TotalBias, " MRV:", isMeanRev, " Sideways:", isSideways);
+
+   return tier;
+}
+
+//+------------------------------------------------------------------+
+//| Find the nearest pivot/fib level in the trade direction          |
+//| Returns the price of the first target level beyond entry price  |
+//| (0 if none found) — used to place TP at structural levels       |
+//+------------------------------------------------------------------+
+double FindNextTargetLevel(double entryPrice, int tradeDir)
+{
+   double best   = 0;
+   double bestDist = 99999;
+   double minDist  = 5.0 * _Point * 10;  // at least 5 pips away
+
+   // Collect all known levels
+   double levels[];
+   int    cnt = 0;
+   ArrayResize(levels, 15);
+
+   if(UseDailyPivot && g_PivotPP > 0) {
+      levels[cnt++] = g_PivotPP;
+      levels[cnt++] = g_PivotR1;
+      levels[cnt++] = g_PivotS1;
+      levels[cnt++] = g_PivotR2;
+      levels[cnt++] = g_PivotS2;
+   }
+   if(g_Fib382 > 0) {
+      levels[cnt++] = g_Fib236;
+      levels[cnt++] = g_Fib382;
+      levels[cnt++] = g_Fib500;
+      levels[cnt++] = g_Fib618;
+      levels[cnt++] = g_Fib764;
+   }
+   // Range extremes
+   if(g_RangeHigh > 0) levels[cnt++] = g_RangeHigh;
+   if(g_RangeLow  > 0) levels[cnt++] = g_RangeLow;
+   if(g_RangeMid  > 0) levels[cnt++] = g_RangeMid;
+
+   for(int i = 0; i < cnt; i++) {
+      double lvl = levels[i];
+      if(lvl <= 0) continue;
+      double dist = 0;
+      if(tradeDir == 1)  dist = lvl - entryPrice;   // buy: target above
+      else                dist = entryPrice - lvl;   // sell: target below
+      if(dist < minDist) continue;   // too close or wrong direction
+      if(dist < bestDist) { bestDist = dist; best = lvl; }
+   }
+   return best;
+}
+
 //--- Draw Fib and Pivot horizontal lines on the chart
 void DrawFibPivotLines()
 {
@@ -1488,37 +1628,12 @@ void TryEntry()
    }
 
    // === BIAS FILTER ===
-   // Bias is informational context, NOT a hard gate on validated entries.
-   // The HA pattern, Bollinger midline, zone filter, and consecutive-candle
-   // check have already approved this trade. Blocking on mild bias (-1/+1)
-   // kills valid counter-trend moves (bull runs in a bear day, and vice versa).
-   //
-   // Only block at STRONG bias (±3): this means BOTH auto market data AND
-   // manual geo/news inputs agree heavily against the direction.
-   // At ±2 or less, let the trade through — the risk management (SL, lock,
-   // trailing) handles the downside.
-   bool canBuy  = (g_TotalBias > -3);   // only block buys at STRONG BEAR (-3)
-   bool canSell = (g_TotalBias <  3);   // only block sells at STRONG BULL (+3)
+   bool canBuy  = (g_TotalBias > -3);
+   bool canSell = (g_TotalBias <  3);
    if(tradeDir == 1  && !canBuy)  { Print("BUY blocked by STRONG BEAR bias (", g_TotalBias, ")");  return; }
    if(tradeDir == -1 && !canSell) { Print("SELL blocked by STRONG BULL bias (", g_TotalBias, ")"); return; }
 
-   // === TARGETS — unified $2 lock for all trade types ===
-   // Mid-zone and sideways: same $2 lock but tighter TP ($2 — take it once we're there)
-   // This stops the bot from overstaying a mid-range trade hoping for $3
-   bool isMidContext = (zone == "MID_ZONE" || isSideways || isMeanRev);
-   double lockBase = LockProfitUSD;      // always $2 — no exceptions
-   double tpBase   = isMidContext ? MidRangeTPUSD : TakeProfitUSD;
-   double slBase   = StopLossUSD;
-
-   double slUSD = slBase * scale;
-   double tpUSD = tpBase * scale;
-
-   double slDist = USDtoPoints(slUSD, lot);
-   double tpDist = USDtoPoints(tpUSD, lot);
-   if(slDist < minStop + _Point * 5) slDist = minStop + _Point * 5;
-   if(tpDist < minStop + _Point * 5) tpDist = minStop + _Point * 5;
-
-   // === FIB / PIVOT CONFLUENCE ===
+   // === FIB / PIVOT CONFLUENCE (check BEFORE tier calc) ===
    g_NearLevel = "";
    if(UseFibPivot) {
       string lvlName = NearFibPivotLevel(price);
@@ -1532,29 +1647,72 @@ void TryEntry()
          Print("Confluence level nearby: ", lvlName);
    }
 
+   // === TRADE TIER CLASSIFICATION ===
+   // Scores the setup and assigns optimal TP/lock/trail
+   bool isMidContext = (zone == "MID_ZONE" || isSideways);
+   int tier = CalcTradeTier(tradeDir, zone, isMeanRev, isSideways, g_NearLevel);
+
+   // === ATR-INFORMED TP BOOST ===
+   // If ATR says there is room beyond the tier TP, extend the broker TP
+   // to the next structural level (pivot, fib, range boundary)
+   double baseTpUSD = (tier == 3) ? Tier3TP_USD :
+                      (tier == 2) ? Tier2TP_USD : Tier1TP_USD;
+   double targetLvl = FindNextTargetLevel(price, tradeDir);
+   if(targetLvl > 0) {
+      double targetDist = MathAbs(targetLvl - price);
+      double targetPips = targetDist / _Point / 10.0;
+      // Convert target distance to USD per 0.01 lot
+      // For EURUSD: 1 pip = $0.10 per 0.01 lot
+      double targetUSD  = targetPips * 0.10;
+      // If the structural target gives more than the tier TP, use it (capped at $6)
+      if(targetUSD > baseTpUSD && targetUSD <= 6.0) {
+         Print("TP EXTENDED to structural level: $", DoubleToString(targetUSD, 2),
+               " (at ", DoubleToString(targetLvl, 5), ", ", DoubleToString(targetPips, 1), " pips)");
+         baseTpUSD = targetUSD;
+      }
+   }
+
+   double slBase   = StopLossUSD;
+   double slUSD    = slBase * scale;
+   double tpUSD    = baseTpUSD * scale;
+
+   double slDist = USDtoPoints(slUSD, lot);
+   double tpDist = USDtoPoints(tpUSD, lot);
+   if(slDist < minStop + _Point * 5) slDist = minStop + _Point * 5;
+   if(tpDist < minStop + _Point * 5) tpDist = minStop + _Point * 5;
+
+   string tierLabel = (tier == 3) ? "RUNNER" : (tier == 2) ? "SWING" : "SCALP";
    string tag = isMeanRev ? (tradeDir==1 ? "MRV_BUY" : "MRV_SELL")
                           : (tradeDir==1 ? "HA_BUY_v5" : "HA_SELL_v5");
    if(HAEntryMode == 1) tag = tag + "_E";
+   tag = tag + "_T" + IntegerToString(tier);  // append tier to comment
 
    // === EXECUTE ===
    bool ok = false;
    if(tradeDir == 1) {
       double sl = NormalizeDouble(ask - slDist, _Digits);
       double tp = NormalizeDouble(ask + tpDist, _Digits);
-      Print("Attempting ", tag, " | Zone:", zone, " Mid:", isMidContext,
-            " Fib/Pivot:", g_NearLevel, " Lot:", lot, " Ask:", ask, " SL:", sl, " TP:", tp);
+      Print("Attempting ", tag, " [", tierLabel, "] | Zone:", zone,
+            " Lot:", lot, " Ask:", ask, " SL:", sl, " TP:", tp,
+            " TP$:", DoubleToString(baseTpUSD, 2));
       ok = trade.Buy(lot, _Symbol, ask, sl, tp, tag);
    } else {
       double sl = NormalizeDouble(bid + slDist, _Digits);
       double tp = NormalizeDouble(bid - tpDist, _Digits);
-      Print("Attempting ", tag, " | Zone:", zone, " Mid:", isMidContext,
-            " Fib/Pivot:", g_NearLevel, " Lot:", lot, " Bid:", bid, " SL:", sl, " TP:", tp);
+      Print("Attempting ", tag, " [", tierLabel, "] | Zone:", zone,
+            " Lot:", lot, " Bid:", bid, " SL:", sl, " TP:", tp,
+            " TP$:", DoubleToString(baseTpUSD, 2));
       ok = trade.Sell(lot, _Symbol, bid, sl, tp, tag);
    }
 
    if(ok) {
-      SetScaledThresholds(lot, lockBase, tpBase, slBase);
+      SetScaledThresholds(lot, tier);
+      // If TP was extended beyond base tier, update scaled TP
+      if(baseTpUSD > ((tier == 3) ? Tier3TP_USD : (tier == 2) ? Tier2TP_USD : Tier1TP_USD)) {
+         g_ScaledTPUSD = baseTpUSD * scale;
+      }
       g_TradeOpen     = true;
+      g_TradeTier     = tier;
       g_ProfitLocked  = false;
       g_PeakProfit    = 0;
       g_OpenBarCount  = 0;
@@ -1568,10 +1726,10 @@ void TryEntry()
       g_MRVConfirmOpen = 0;
       g_DailyTradeCount++;
       if(MaxDailyTrades > 0 && g_DailyTradeCount >= MaxDailyTrades)
-         Print("DAILY TRADE LIMIT reached (", g_DailyTradeCount, "/", MaxDailyTrades, ") — no more entries today");
-      Print(tag, " OPENED | Lock@$", DoubleToString(g_ScaledLockUSD,2),
+         Print("DAILY TRADE LIMIT reached (", g_DailyTradeCount, "/", MaxDailyTrades, ")");
+      Print(tag, " OPENED [", tierLabel, "] Lock@$", DoubleToString(g_ScaledLockUSD,2),
             " TP=$", DoubleToString(g_ScaledTPUSD,2),
-            " MidContext:", isMidContext,
+            " Trail=$", DoubleToString(g_ScaledTrailUSD,2),
             " DayTrade#", g_DailyTradeCount);
    } else {
       Print(tag, " FAILED: ", trade.ResultComment(), " Code:", trade.ResultRetcode());
@@ -1580,24 +1738,35 @@ void TryEntry()
 
 //+------------------------------------------------------------------+
 //| Scale all USD thresholds proportionally to lot size             |
-//| lockBase and tpBase are per-0.01-lot amounts                    |
+//| Uses tier to select TP/Lock/Trail from Tier1/2/3 inputs         |
 //+------------------------------------------------------------------+
-void SetScaledThresholds(double lot, double lockBase, double tpBase, double slBase)
+void SetScaledThresholds(double lot, int tier)
 {
-   double scale      = lot / 0.01;
-   g_ScaledLockUSD   = lockBase * scale;
-   g_ScaledTrailUSD  = TrailingLockUSD * scale;
-   g_ScaledTPUSD     = tpBase   * scale;
-   g_ScaledSLUSD     = slBase   * scale;
+   double scale = lot / 0.01;
+   if(tier == 1) {
+      g_ScaledTPUSD   = Tier1TP_USD   * scale;
+      g_ScaledLockUSD = Tier1Lock_USD * scale;
+      g_ScaledTrailUSD= Tier1Trail_USD * scale;
+   } else if(tier == 3) {
+      g_ScaledTPUSD   = Tier3TP_USD   * scale;
+      g_ScaledLockUSD = Tier3Lock_USD * scale;
+      g_ScaledTrailUSD= Tier3Trail_USD * scale;
+   } else {
+      g_ScaledTPUSD   = Tier2TP_USD   * scale;
+      g_ScaledLockUSD = Tier2Lock_USD * scale;
+      g_ScaledTrailUSD= Tier2Trail_USD * scale;
+   }
+   g_ScaledSLUSD = StopLossUSD * scale;
 }
 
 //+------------------------------------------------------------------+
-//| TRADE MANAGEMENT v5                                              |
+//| TRADE MANAGEMENT v6 — TIER-AWARE                                 |
 //| - Hard $1.75/0.01lot max loss (scaled) — never blow past this   |
-//| - $2 lock for all contexts                                       |
-//| - Mid-range stall exit: close if stalling at low profit too long |
-//| - Max hold time: only exits if NOT meaningfully profitable       |
-//| - Sideways: accelerate lock (same $2 level, tighter trail)       |
+//| - Tier-based lock/trail: T1=$0.80, T2=$1.50, T3=$2.00           |
+//| - Mid-range stall: only Tier 1-2, disabled for Tier 3 runners   |
+//| - Max hold: T1=16, T2=32, T3=48 bars — only exit if not profit |
+//| - Sideways: tighten trail (T3 less aggressive than T1/T2)       |
+//| - Runner trail widening: T3 trail increases when profit > 2xLock|
 //+------------------------------------------------------------------+
 void ManageOpenTrade()
 {
@@ -1643,28 +1812,34 @@ void ManageOpenTrade()
       return;
    }
 
-   // === MID-RANGE / MEAN-REV STALL EXIT ===
-   // If this was a mid-range or mean-rev trade and it's been open MidRangeMaxBars
-   // without reaching the lock level, close it if still near breakeven.
-   // This prevents mid-range trades from turning into losers by overstaying.
-   if(g_IsNearMid && !g_ProfitLocked && g_OpenBarCount >= MidRangeMaxBars) {
-      double midStallLimit = MidRangeStallUSD * g_CurrentLot / 0.01;
-      if(profit < midStallLimit) {
-         Print("MID-RANGE STALL exit: open ", g_OpenBarCount, " bars profit=$",
-               DoubleToString(profit,2), " (below stall threshold $",
-               DoubleToString(midStallLimit,2), ")");
-         trade.PositionClose(posInfo.Ticket());
-         RecordTradeResult(profit);
-         g_TradeOpen = false; g_ProfitLocked = false;
-         g_PeakProfit = 0; g_OpenBarCount = 0; g_Signal = "WAITING";
-         return;
+   // === MID-RANGE / SCALP STALL EXIT ===
+   // Tier 1 (scalp): close if stalling near breakeven after MidRangeMaxBars
+   // Tier 2: stall check at 1.5x MidRangeMaxBars (give swing room)
+   // Tier 3 (runner): NO stall exit — let it run
+   if(g_TradeTier <= 2 && g_IsNearMid && !g_ProfitLocked) {
+      int stallBars = (g_TradeTier == 1) ? MidRangeMaxBars : (int)(MidRangeMaxBars * 1.5);
+      if(g_OpenBarCount >= stallBars) {
+         double midStallLimit = MidRangeStallUSD * g_CurrentLot / 0.01;
+         if(profit < midStallLimit) {
+            Print("STALL exit [T", g_TradeTier, "]: open ", g_OpenBarCount, " bars profit=$",
+                  DoubleToString(profit,2), " (below $", DoubleToString(midStallLimit,2), ")");
+            trade.PositionClose(posInfo.Ticket());
+            RecordTradeResult(profit);
+            g_TradeOpen = false; g_ProfitLocked = false;
+            g_PeakProfit = 0; g_OpenBarCount = 0; g_Signal = "WAITING";
+            return;
+         }
       }
    }
 
    // === MAX HOLD TIME EXIT ===
-   if(g_OpenBarCount >= MaxHoldBars) {
+   // Tier 1: MidRangeMaxBars (16)  |  Tier 2: MaxHoldBars (32)  |  Tier 3: MaxHoldBars * 1.5
+   int maxBars = (g_TradeTier == 1) ? MidRangeMaxBars :
+                 (g_TradeTier == 3) ? (int)(MaxHoldBars * 1.5) : MaxHoldBars;
+   if(g_OpenBarCount >= maxBars) {
       if(profit < g_ScaledLockUSD * 0.5) {
-         Print("MAX HOLD TIME exit after ", g_OpenBarCount, " bars | profit=$", DoubleToString(profit,2));
+         Print("MAX HOLD exit [T", g_TradeTier, "] after ", g_OpenBarCount, "/", maxBars,
+               " bars | profit=$", DoubleToString(profit,2));
          trade.PositionClose(posInfo.Ticket());
          RecordTradeResult(profit);
          g_TradeOpen = false; g_ProfitLocked = false;
@@ -1673,12 +1848,26 @@ void ManageOpenTrade()
       }
    }
 
-   // === SIDEWAYS: tighten trail once locked (don't use $1 lock — still $2) ===
+   // === SIDEWAYS: tighten trail once locked ===
+   // Tier 1/2: tighten aggressively;  Tier 3: only moderate tightening
    if(g_ProfitLocked && IsSideways()) {
-      double sidewaysTrail = 0.15 * (g_CurrentLot / 0.01);
+      double sidewaysTrail = (g_TradeTier == 3) ? 0.30 : 0.15;
+      sidewaysTrail *= (g_CurrentLot / 0.01);
       if(g_ScaledTrailUSD > sidewaysTrail) {
          g_ScaledTrailUSD = sidewaysTrail;
-         Print("SIDEWAYS tightened trail to $", DoubleToString(g_ScaledTrailUSD,2));
+         Print("SIDEWAYS tightened trail [T", g_TradeTier, "] to $",
+               DoubleToString(g_ScaledTrailUSD,2));
+      }
+   }
+
+   // === TIER 3 RUNNER: widen trail once profit exceeds 2x lock ===
+   // Let runners breathe — don't choke a $4 winner with a $0.60 trail
+   if(g_TradeTier == 3 && g_ProfitLocked && profit >= g_ScaledLockUSD * 2.0) {
+      double wideTrail = Tier3Trail_USD * 1.5 * (g_CurrentLot / 0.01);
+      if(g_ScaledTrailUSD < wideTrail) {
+         g_ScaledTrailUSD = wideTrail;
+         Print("RUNNER trail widened to $", DoubleToString(g_ScaledTrailUSD,2),
+               " (profit=$", DoubleToString(profit,2), ")");
       }
    }
 
@@ -1983,9 +2172,22 @@ void UpdateDashboard()
       string modeStr  = g_IsMeanRev ? "MEAN REV" : (g_IsNearMid ? "MID-validated" : "TREND");
       color  modeClr  = g_IsMeanRev ? clrGold : (g_IsNearMid ? clrOrange : clrLime);
       DashLine("14b_mode", "Mode    : " + modeStr,                              cx, cy, row, lh, corner, modeClr,       9); row++;
+
+      // Trade tier display
+      string tierStr = (g_TradeTier == 3) ? "T3 RUNNER" : (g_TradeTier == 2) ? "T2 SWING" : "T1 SCALP";
+      color  tierClr = (g_TradeTier == 3) ? clrGold : (g_TradeTier == 2) ? clrCyan : clrSilver;
+      DashLine("14b2_tier", "Tier    : " + tierStr +
+               "  TP:$" + DoubleToString(g_ScaledTPUSD, 2) +
+               "  Lock:$" + DoubleToString(g_ScaledLockUSD, 2) +
+               "  Trail:$" + DoubleToString(g_ScaledTrailUSD, 2),               cx, cy, row, lh, corner, tierClr,       8); row++;
+
       if(g_NearLevel != "")
          DashLine("14d_lvl", "Cnfl    : " + g_NearLevel,                        cx, cy, row, lh, corner, clrGold,       9); row++;
-      DashLine("14c_bars", "Hold    : " + IntegerToString(g_OpenBarCount) + "/" + IntegerToString(MaxHoldBars) + " bars",
+
+      // Tier-aware hold bar display
+      int maxBars = (g_TradeTier == 1) ? MidRangeMaxBars :
+                    (g_TradeTier == 3) ? (int)(MaxHoldBars * 1.5) : MaxHoldBars;
+      DashLine("14c_bars", "Hold    : " + IntegerToString(g_OpenBarCount) + "/" + IntegerToString(maxBars) + " bars",
                                                                                  cx, cy, row, lh, corner, clrWhite,      9); row++;
       double hardLoss  = MaxLossUSD * g_CurrentLot / 0.01;
       DashLine("14e_cap",  "MaxLoss : -$" + DoubleToString(hardLoss,2) + " cap",

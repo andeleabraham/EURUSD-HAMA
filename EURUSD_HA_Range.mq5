@@ -99,6 +99,7 @@ input int    DashboardY       = 20;
 //=== GLOBALS ===
 double g_AsianHigh  = 0, g_AsianLow  = 0, g_AsianOpen  = 0;
 double g_LondonHigh = 0, g_LondonLow = 0, g_LondonOpen = 0;
+double g_NYHigh     = 0, g_NYLow     = 0, g_NYOpen     = 0;
 double g_TodayHigh  = 0, g_TodayLow  = 0, g_TodayOpen  = 0;
 double g_RangeHigh  = 0, g_RangeLow  = 0, g_RangeMid = 0;
 double g_PrevDayHigh= 0, g_PrevDayLow = 0;  // yesterday only (fixed reference)
@@ -109,6 +110,7 @@ int    g_InitTickCount = 0;  // count ticks since attach; D1[0] not trusted unti
 // (NOT set by UpdateLiveSessionBar so the retry keeps firing until real data arrives)
 bool   g_AsianSeeded  = false;
 bool   g_LondonSeeded = false;
+bool   g_NYSeeded     = false;
 
 bool   g_TradeOpen    = false;
 bool   g_ProfitLocked = false;
@@ -121,11 +123,13 @@ int    g_IntraDayBias   = 0;   // today open vs current price (momentum)
 int    g_GapBias        = 0;   // prev day close vs today open (overnight gap)
 int    g_AsianBias      = 0;   // asian session open vs current price
 int    g_LondonBias     = 0;   // london session open vs current price
+int    g_NYBias         = 0;   // new york session open vs current price
 int    g_MarketAutoBias = 0;   // combined auto bias (intraday + gap)
 double g_IntraDayPct   = 0.0; // raw % for display
 double g_GapPct        = 0.0; // raw % for display
 double g_AsianPct      = 0.0; // raw % for display
 double g_LondonPct     = 0.0; // raw % for display
+double g_NYPct         = 0.0; // raw % for display
 
 // Lot-scaled thresholds — recalculated at trade open
 double g_ScaledLockUSD  = 2.00;
@@ -287,6 +291,14 @@ void OnTick()
       if(TimeCurrent() > lStart) {
          datetime lTo = (TimeCurrent() < lEnd) ? TimeCurrent() : lEnd;
          g_LondonSeeded = SeedSessionHL(lStart, lTo, g_LondonHigh, g_LondonLow, g_LondonOpen);
+      }
+   }
+   if(!g_NYSeeded) {
+      datetime nStart = dayStart0 + (datetime)(NewYorkStartHour * 3600);
+      datetime nEnd   = dayStart0 + (datetime)(NewYorkEndHour   * 3600);
+      if(TimeCurrent() > nStart) {
+         datetime nTo = (TimeCurrent() < nEnd) ? TimeCurrent() : nEnd;
+         g_NYSeeded = SeedSessionHL(nStart, nTo, g_NYHigh, g_NYLow, g_NYOpen);
       }
    }
 
@@ -455,13 +467,22 @@ void SeedRangesFromHistory()
       g_LondonSeeded = SeedSessionHL(londonStart, londonTo, g_LondonHigh, g_LondonLow, g_LondonOpen);
    }
 
+   // --- New York session: only if we are past or inside NY hours ---
+   datetime nyStart = dayStart + (datetime)(NewYorkStartHour * 3600);
+   datetime nyEnd   = dayStart + (datetime)(NewYorkEndHour   * 3600);
+   if(TimeCurrent() > nyStart) {
+      datetime nyTo = (TimeCurrent() < nyEnd) ? TimeCurrent() : nyEnd;
+      g_NYSeeded = SeedSessionHL(nyStart, nyTo, g_NYHigh, g_NYLow, g_NYOpen);
+   }
+
    // Fallback: if today has no data at all, g_RangeHigh/Low from D1 already set above
    SetActiveRange();
    CalcFibPivotLevels();
    Print("SeedRangesFromHistory: PrevDay H=", DoubleToString(g_RangeHigh,5),
          " L=", DoubleToString(g_RangeLow,5),
          " | Asian H=", DoubleToString(g_AsianHigh,5), " L=", DoubleToString(g_AsianLow,5),
-         " | London H=", DoubleToString(g_LondonHigh,5), " L=", DoubleToString(g_LondonLow,5));
+         " | London H=", DoubleToString(g_LondonHigh,5), " L=", DoubleToString(g_LondonLow,5),
+         " | NY H=", DoubleToString(g_NYHigh,5), " L=", DoubleToString(g_NYLow,5));
 }
 
 //+------------------------------------------------------------------+
@@ -475,6 +496,7 @@ void ResetDailyRanges()
 
    g_AsianHigh = 0; g_AsianLow  = 0; g_AsianOpen  = 0; g_AsianSeeded  = false;
    g_LondonHigh= 0; g_LondonLow = 0; g_LondonOpen = 0; g_LondonSeeded = false;
+   g_NYHigh    = 0; g_NYLow     = 0; g_NYOpen     = 0; g_NYSeeded     = false;
    g_TodayHigh = 0; g_TodayLow  = 0; g_TodayOpen  = 0;
 
    // Use yesterday as initial range (Asian session fallback)
@@ -529,6 +551,11 @@ void UpdateSessionRanges()
       if(g_LondonHigh == 0 || hi > g_LondonHigh) g_LondonHigh = hi;
       if(g_LondonLow  == 0 || lo < g_LondonLow)  g_LondonLow  = lo;
    }
+   if(h >= NewYorkStartHour && h < NewYorkEndHour) {
+      // g_NYOpen NOT set here — only GetSessionOpen/SeedSessionHL sets it
+      if(g_NYHigh == 0 || hi > g_NYHigh) g_NYHigh = hi;
+      if(g_NYLow  == 0 || lo < g_NYLow)  g_NYLow  = lo;
+   }
 }
 
 //+------------------------------------------------------------------+
@@ -562,10 +589,11 @@ void UpdateLiveSessionBar()
       if(g_LondonLow  == 0 || liveLo  < g_LondonLow)  g_LondonLow  = liveLo;
    }
    if(h >= NewYorkStartHour && h < NewYorkEndHour) {
-      // NY session overlaps with London — TodayHigh/Low covers it,
-      // but we also track it explicitly for any future NY-specific logic
-      // (no separate NY globals exist yet — data flows into TodayHigh/Low)
+      // g_NYOpen NOT set here — only SeedSessionHL sets it
+      if(g_NYHigh == 0 || liveHi > g_NYHigh) g_NYHigh = liveHi;
+      if(g_NYLow  == 0 || liveLo  < g_NYLow)  g_NYLow  = liveLo;
    }
+   // removed old empty NY block
 }
 
 //+------------------------------------------------------------------+
@@ -595,15 +623,11 @@ void SetActiveRange()
    }
 
    // --- Today's live range: D1[0] is the current day's bar — grows every tick.
-   // BUT on attach the terminal may not have synced D1 history yet, so D1[0]
-   // could return a partial bar. Wait 20 ticks (~15-30 seconds) before trusting it.
-   double todayH = 0, todayL = 0;
-   if(g_InitTickCount >= 20) {
-      todayH = iHigh(_Symbol, PERIOD_D1, 0);
-      todayL = iLow (_Symbol, PERIOD_D1, 0);
-      if(todayH > 0) g_TodayHigh = todayH;
-      if(todayL > 0) g_TodayLow  = todayL;
-   }
+   // iHigh/iLow on D1[0] is the broker's live forming daily bar — always accurate.
+   double todayH = iHigh(_Symbol, PERIOD_D1, 0);
+   double todayL = iLow (_Symbol, PERIOD_D1, 0);
+   if(todayH > 0) g_TodayHigh = todayH;
+   if(todayL > 0) g_TodayLow  = todayL;
 
    // --- Active range: today is primary; expand floor/ceiling with prev day so
    // the zone boundaries never shrink below what yesterday established.
@@ -1086,6 +1110,7 @@ int MeanReversionSetup()
 //|  2. Overnight gap      — prev day close vs today open           |
 //|  3. Asian session dir  — asian open vs current (info only)      |
 //|  4. London session dir — london open vs current (info only)     |
+//|  5. New York session   — NY open vs current (info only)         |
 //| Auto bias drives the total when manual inputs are neutral (0).  |
 //+------------------------------------------------------------------+
 void RecalcBias()
@@ -1132,6 +1157,14 @@ void RecalcBias()
       g_LondonPct = (bid - g_LondonOpen) / g_LondonOpen * 100.0;
       if     (g_LondonPct >=  0.07) g_LondonBias =  1;
       else if(g_LondonPct <= -0.07) g_LondonBias = -1;
+   }
+
+   // --- 5. New York session direction (display only — not in total) ---
+   g_NYPct = 0.0; g_NYBias = 0;
+   if(g_NYOpen > 0 && bid > 0) {
+      g_NYPct = (bid - g_NYOpen) / g_NYOpen * 100.0;
+      if     (g_NYPct >=  0.07) g_NYBias =  1;
+      else if(g_NYPct <= -0.07) g_NYBias = -1;
    }
 
    // --- Combined auto bias (intraday has more weight than gap) ---
@@ -1609,6 +1642,13 @@ void UpdateDashboard()
    string lLbl   = g_LondonBias == 1 ? "BULL" : g_LondonBias == -1 ? "BEAR" : "NEUT";
    DashLine("03d_lb",    "  London   : " + lPct + " → " + lLbl,
                                                                                  cx, cy, row, lh, corner, (g_LondonBias>0?clrLime:g_LondonBias<0?clrRed:clrGray), 8); row++;
+   // New York session bias
+   string nyPct  = (g_NYOpen > 0)
+                   ? (g_NYPct >= 0 ? "+" : "") + DoubleToString(g_NYPct, 2) + "%"
+                   : "n/a";
+   string nyLbl  = g_NYBias == 1 ? "BULL" : g_NYBias == -1 ? "BEAR" : "NEUT";
+   DashLine("03e_nyb",   "  NewYork  : " + nyPct + " → " + nyLbl,
+                                                                                 cx, cy, row, lh, corner, (g_NYBias>0?clrLime:g_NYBias<0?clrRed:clrGray), 8); row++;
    // Manual override indication
    int manualBias = (EURGeoBias - USDGeoBias) + (NewsImpactEUR - NewsImpactUSD);
    if(manualBias != 0) {
@@ -1676,6 +1716,15 @@ void UpdateDashboard()
    } else {
       DashLine("12a_london", "London  : Forming...",                           cx, cy, row, lh, corner, clrGray,   9); row++;
       DashLine("12b_london", "",                                                cx, cy, row, lh, corner, clrGray,   9); row++;
+   }
+   // New York session O/H/L
+   if(g_NYSeeded || g_NYHigh > 0) {
+      DashLine("13a_ny",     "NewYork : O:" + DoubleToString(g_NYOpen, 5),     cx, cy, row, lh, corner, clrSilver, 9); row++;
+      DashLine("13b_ny",     "          H:" + DoubleToString(g_NYHigh, 5) +
+                             "  L:" + DoubleToString(g_NYLow,  5),              cx, cy, row, lh, corner, clrSilver, 9); row++;
+   } else {
+      DashLine("13a_ny",     "NewYork : Waiting...",                           cx, cy, row, lh, corner, clrGray,   9); row++;
+      DashLine("13b_ny",     "",                                                cx, cy, row, lh, corner, clrGray,   9); row++;
    }
    row++;
 

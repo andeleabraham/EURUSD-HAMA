@@ -3045,10 +3045,9 @@ void UpdateDashboard()
       ObjectSetInteger(0, bgName, OBJPROP_YDISTANCE,  bgY);
       ObjectSetInteger(0, bgName, OBJPROP_XSIZE,       bgW);
       ObjectSetInteger(0, bgName, OBJPROP_YSIZE,       bgH);
-      ObjectSetInteger(0, bgName, OBJPROP_BGCOLOR,     C'8,12,28');  // dark navy
+      ObjectSetInteger(0, bgName, OBJPROP_BGCOLOR,     C'8,12,28');   // dark navy fill
       ObjectSetInteger(0, bgName, OBJPROP_BORDER_TYPE, BORDER_FLAT);
       ObjectSetInteger(0, bgName, OBJPROP_COLOR,        C'60,80,120'); // subtle blue-grey border
-      ObjectSetInteger(0, bgName, OBJPROP_TRANSPARENCY, 45);           // 0=opaque 100=invisible; 45≈55% visible
       ObjectSetInteger(0, bgName, OBJPROP_BACK,         false);
       ObjectSetInteger(0, bgName, OBJPROP_ZORDER,       0);            // below all text labels
       ObjectSetInteger(0, bgName, OBJPROP_SELECTABLE,   false);

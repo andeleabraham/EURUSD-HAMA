@@ -2816,6 +2816,31 @@ void UpdateDashboard()
    int lh     = 14;  // pixels per line
    int row    = 0;
 
+   // --- Background panel created FIRST so all labels (created after) render on top ---
+   // MT5 renders foreground objects in creation order: oldest = bottom, newest = top.
+   // By creating the panel before any DashLine calls, it is always beneath the text.
+   {
+      int    bgPad  = 5;
+      int    bgW    = 340;
+      int    bgX    = MathMax(0, cx - bgPad);
+      int    bgY    = MathMax(0, cy - bgPad);
+      string bgName = DASH_PREFIX + "BG_panel";
+      if(ObjectFind(0, bgName) < 0) {
+         ObjectCreate(0, bgName, OBJ_RECTANGLE_LABEL, 0, 0, 0);
+         ObjectSetInteger(0, bgName, OBJPROP_CORNER,     corner);
+         ObjectSetInteger(0, bgName, OBJPROP_XDISTANCE,  bgX);
+         ObjectSetInteger(0, bgName, OBJPROP_YDISTANCE,  bgY);
+         ObjectSetInteger(0, bgName, OBJPROP_XSIZE,       bgW);
+         ObjectSetInteger(0, bgName, OBJPROP_YSIZE,       900);  // generous initial height; corrected at end
+         ObjectSetInteger(0, bgName, OBJPROP_BGCOLOR,     C'8,12,28');
+         ObjectSetInteger(0, bgName, OBJPROP_BORDER_TYPE, BORDER_FLAT);
+         ObjectSetInteger(0, bgName, OBJPROP_COLOR,        C'60,80,120');
+         ObjectSetInteger(0, bgName, OBJPROP_BACK,         false);
+         ObjectSetInteger(0, bgName, OBJPROP_ZORDER,       0);
+         ObjectSetInteger(0, bgName, OBJPROP_SELECTABLE,   false);
+      }
+   }
+
    // ---- helper macro replaced with inline calls ----
    DashLine("00_title",  "[ EURUSD HA RANGE BOT v6 ]",                         cx, cy, row, lh, corner, clrWhite,     10); row++;
    row++;
@@ -3136,27 +3161,19 @@ void UpdateDashboard()
       DashLine("18b_cool", "",                                                   cx, cy, row, lh, corner, clrGray,      8); row++;
    }
 
-   // --- Semi-transparent background panel (drawn last; OBJ_RECTANGLE_LABEL renders behind OBJ_LABEL) ---
+   // --- Update panel position and exact height to match final row count ---
    {
-      int    bgPad = 5;
-      int    bgW   = 340;
-      int    bgH   = row * lh + bgPad * 2;
-      int    bgX   = MathMax(0, cx - bgPad);
-      int    bgY   = MathMax(0, cy - bgPad);
+      int    bgPad  = 5;
+      int    bgW    = 340;
+      int    bgH    = row * lh + bgPad * 2;
+      int    bgX    = MathMax(0, cx - bgPad);
+      int    bgY    = MathMax(0, cy - bgPad);
       string bgName = DASH_PREFIX + "BG_panel";
-      if(ObjectFind(0, bgName) < 0)
-         ObjectCreate(0, bgName, OBJ_RECTANGLE_LABEL, 0, 0, 0);
-      ObjectSetInteger(0, bgName, OBJPROP_CORNER,     corner);
-      ObjectSetInteger(0, bgName, OBJPROP_XDISTANCE,  bgX);
-      ObjectSetInteger(0, bgName, OBJPROP_YDISTANCE,  bgY);
-      ObjectSetInteger(0, bgName, OBJPROP_XSIZE,       bgW);
-      ObjectSetInteger(0, bgName, OBJPROP_YSIZE,       bgH);
-      ObjectSetInteger(0, bgName, OBJPROP_BGCOLOR,     C'8,12,28');   // dark navy fill
-      ObjectSetInteger(0, bgName, OBJPROP_BORDER_TYPE, BORDER_FLAT);
-      ObjectSetInteger(0, bgName, OBJPROP_COLOR,        C'60,80,120'); // subtle blue-grey border
-      ObjectSetInteger(0, bgName, OBJPROP_BACK,         false);        // foreground — covers chart candles (opaque)
-      ObjectSetInteger(0, bgName, OBJPROP_ZORDER,       0);            // text labels at ZORDER=1 render on top
-      ObjectSetInteger(0, bgName, OBJPROP_SELECTABLE,   false);
+      ObjectSetInteger(0, bgName, OBJPROP_CORNER,    corner);
+      ObjectSetInteger(0, bgName, OBJPROP_XDISTANCE, bgX);
+      ObjectSetInteger(0, bgName, OBJPROP_YDISTANCE, bgY);
+      ObjectSetInteger(0, bgName, OBJPROP_XSIZE,      bgW);
+      ObjectSetInteger(0, bgName, OBJPROP_YSIZE,      bgH);
    }
 }
 

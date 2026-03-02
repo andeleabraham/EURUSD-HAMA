@@ -3033,7 +3033,7 @@ void UpdateDashboard()
    // --- Semi-transparent background panel (drawn last; OBJ_RECTANGLE_LABEL renders behind OBJ_LABEL) ---
    {
       int    bgPad = 5;
-      int    bgW   = 258;
+      int    bgW   = 340;
       int    bgH   = row * lh + bgPad * 2;
       int    bgX   = MathMax(0, cx - bgPad);
       int    bgY   = MathMax(0, cy - bgPad);

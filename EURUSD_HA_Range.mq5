@@ -19,11 +19,15 @@ CPositionInfo  posInfo;
 input group "=== LOT SIZING ==="
 input bool   AutoLotSize      = true;
 input double ManualLotSize    = 0.01;
-input double MaxLotSize       = 0.10;   // Hard cap lowered — protects against large early losses
+input double MaxLotSize       = 0.10;   // Hard cap — protects against large early losses
+input double RiskPercent      = 2.0;    // Max risk per trade as % of balance (2% = professional standard)
 
 input group "=== RISK & PROFIT (per 0.01 lot baseline) ==="
-input double StopLossUSD      = 1.75;   // Broker SL price level ($1.75 per 0.01 lot, scaled)
-input double MaxLossUSD       = 1.75;   // Hard max loss before forced close — NEVER exceed (per 0.01 lot)
+input double MaxLossUSD       = 2.50;   // Hard max loss before forced close — matches worst-case tier SL (per 0.01 lot)
+// Tier-based stop loss: wider SL for higher tiers so runners can breathe
+input double Tier1SL_USD      = 1.50;   // Scalp SL per 0.01 lot (15 pips) — tight for quick trades
+input double Tier2SL_USD      = 2.00;   // Swing SL per 0.01 lot (20 pips) — room for pullbacks
+input double Tier3SL_USD      = 2.50;   // Runner SL per 0.01 lot (25 pips) — needs breathing room
 // Tier system: the bot classifies each trade and auto-sets TP/lock/trail
 // Tier 1 (SCALP)  : mid-zone, sideways, weak ATR   → TP $1.50, lock $0.80, trail $0.25
 // Tier 2 (SWING)  : good zone, normal ATR, some confluence → TP $3.00, lock $1.50, trail $0.40
@@ -110,6 +114,7 @@ input bool   RespectForeignTrades = true;   // Block new entries if a non-bot tr
 
 input group "=== OVERTRADING PROTECTION ==="
 input int    MaxDailyTrades     = 3;     // Max trades per day (0 = unlimited)
+input double MaxDailyLossUSD    = 5.0;   // Stop trading after cumulative daily loss exceeds this (0=disabled)
 input int    ConsecLossLimit    = 2;     // After N consecutive SL hits, pause trading
 input int    CooldownBars       = 8;     // Bars to pause after consecutive loss limit hit (8 = 2 hours)
 input int    NoEntryAfterHour   = 21;    // No new entries after this server hour (0-23, 0=disabled)
@@ -1335,11 +1340,19 @@ int CalcTradeTier(int tradeDir, string zone, bool isMeanRev, bool isSideways, st
    // --- MAP SCORE TO TIER ---
    // score <= 3  : SCALP (tier 1)  — low conviction, take $1-1.50 and go
    // score 4-7   : SWING (tier 2)  — normal trade, target $2-3
-   // score >= 8  : RUNNER (tier 3) — let it ride to $3-5
+   // score >= 10 : RUNNER (tier 3) — only the strongest setups get to run
    int tier;
-   if(score >= 8)       tier = 3;
+   if(score >= 10)      tier = 3;   // raised from 8 — T3 must have overwhelming evidence
    else if(score >= 4)  tier = 2;
    else                 tier = 1;
+
+   // --- MRV CAP: mean reversion bounces are NOT breakout runners ---
+   // MRV = bounce from extreme toward mid. It's capped by the range.
+   // These should never be T3 runners targeting $5.
+   if(isMeanRev && tier == 3) {
+      tier = 2;
+      Print("MRV capped at T2: mean reversion bounces don't run to $5");
+   }
 
    Print("TRADE TIER: ", tier, " (score=", score, ")",
          " ATR:", DoubleToString(atrPips,1), "pip",
@@ -1785,11 +1798,14 @@ double CalcLot()
 {
    if(!AutoLotSize) return NormalizeDouble(ManualLotSize, 2);
    double bal = AccountInfoDouble(ACCOUNT_BALANCE);
-   double lot;
-   if(bal <= 20.0)
-      lot = 0.01;
-   else
-      lot = 0.01 + MathFloor((bal - 20.0) / 10.0) * 0.01;
+   // Risk-based position sizing: risk RiskPercent% of balance per trade
+   // Uses the worst-case (largest) tier SL to ensure we never over-risk
+   double riskUSD = bal * RiskPercent / 100.0;
+   double worstSL = MathMax(Tier1SL_USD, MathMax(Tier2SL_USD, Tier3SL_USD));
+   if(worstSL <= 0) worstSL = 1.50;  // safety fallback
+   double lot = (riskUSD / worstSL) * 0.01;
+   lot = MathFloor(lot * 100.0) / 100.0;  // round DOWN to nearest 0.01
+   if(lot < 0.01) lot = 0.01;
    return NormalizeDouble(MathMin(lot, MaxLotSize), 2);
 }
 
@@ -1834,6 +1850,11 @@ void TryEntry()
    // === DAILY TRADE LIMIT ===
    if(MaxDailyTrades > 0 && g_DailyTradeCount >= MaxDailyTrades) {
       return;   // silent — already logged when limit was hit
+   }
+
+   // === DAILY LOSS LIMIT ===
+   if(MaxDailyLossUSD > 0 && g_DailyPnL <= -MaxDailyLossUSD) {
+      return;   // daily loss cap hit — stop trading for today
    }
 
    // === CONSECUTIVE LOSS COOLDOWN ===
@@ -2020,7 +2041,8 @@ void TryEntry()
       }
    }
 
-   double slBase   = StopLossUSD;
+   // Tier-based SL: scalps tight, swings moderate, runners wide
+   double slBase   = (tier == 3) ? Tier3SL_USD : (tier == 2) ? Tier2SL_USD : Tier1SL_USD;
    double slUSD    = slBase * scale;
    double tpUSD    = baseTpUSD * scale;
 
@@ -2091,20 +2113,24 @@ void TryEntry()
 void SetScaledThresholds(double lot, int tier)
 {
    double scale = lot / 0.01;
+   double slBase;
    if(tier == 1) {
       g_ScaledTPUSD   = Tier1TP_USD   * scale;
       g_ScaledLockUSD = Tier1Lock_USD * scale;
       g_ScaledTrailUSD= Tier1Trail_USD * scale;
+      slBase = Tier1SL_USD;
    } else if(tier == 3) {
       g_ScaledTPUSD   = Tier3TP_USD   * scale;
       g_ScaledLockUSD = Tier3Lock_USD * scale;
       g_ScaledTrailUSD= Tier3Trail_USD * scale;
+      slBase = Tier3SL_USD;
    } else {
       g_ScaledTPUSD   = Tier2TP_USD   * scale;
       g_ScaledLockUSD = Tier2Lock_USD * scale;
       g_ScaledTrailUSD= Tier2Trail_USD * scale;
+      slBase = Tier2SL_USD;
    }
-   g_ScaledSLUSD = StopLossUSD * scale;
+   g_ScaledSLUSD = slBase * scale;
 }
 
 //+------------------------------------------------------------------+
@@ -2147,8 +2173,8 @@ void ManageOpenTrade()
    double profit = posInfo.Commission() + posInfo.Swap() + posInfo.Profit();
    if(profit > g_PeakProfit) g_PeakProfit = profit;
 
-   // === HARD LOSS CAP — $1.75 per 0.01 lot, ALWAYS, no exceptions ===
-   // Broker SL is set at $2 as a safety net but we close early at $1.75
+   // === HARD LOSS CAP — MaxLossUSD per 0.01 lot, ALWAYS, no exceptions ===
+   // Broker SL is tier-based but this is the absolute safety net
    double hardLossLimit = -(MaxLossUSD * g_CurrentLot / 0.01);
    if(profit <= hardLossLimit) {
       Print("HARD LOSS CAP triggered: profit=$", DoubleToString(profit,2),
@@ -2410,7 +2436,10 @@ void UpdateDashboard()
       DashLine("03e_man", "  Manual   : " + (manualBias > 0 ? "+" : "") + IntegerToString(manualBias) + " (geo/news override)",
                                                                                  cx, cy, row, lh, corner, clrGold,             8); row++;
    }
-   DashLine("04_lot",    "Lot     : " + DoubleToString(g_CurrentLot, 2),        cx, cy, row, lh, corner, clrWhite,      9); row++;
+   double riskUsd = AccountInfoDouble(ACCOUNT_BALANCE) * RiskPercent / 100.0;
+   DashLine("04_lot",    "Lot     : " + DoubleToString(g_CurrentLot, 2) +
+            " (Risk " + DoubleToString(RiskPercent,1) + "% = $" + DoubleToString(riskUsd,2) + ")",
+                                                                                 cx, cy, row, lh, corner, clrWhite,      9); row++;
 
    // Zone info
    color zoneClr = (g_ZoneLabel == "MID_ZONE") ? clrOrange :
@@ -2605,7 +2634,10 @@ void UpdateDashboard()
    DashLine("18_dstat", "Today   : " + dayStatsStr,                             cx, cy, row, lh, corner, dayClr,        8); row++;
 
    // Cooldown / consecutive loss warning
-   if(g_CooldownUntil > 0 && TimeCurrent() < g_CooldownUntil) {
+   if(MaxDailyLossUSD > 0 && g_DailyPnL <= -MaxDailyLossUSD) {
+      DashLine("18b_cool", "DAILY LOSS CAP HIT: -$" + DoubleToString(MathAbs(g_DailyPnL),2) + " (max -$" + DoubleToString(MaxDailyLossUSD,2) + ") — NO MORE TRADES",
+                                                                                 cx, cy, row, lh, corner, clrRed,       8); row++;
+   } else if(g_CooldownUntil > 0 && TimeCurrent() < g_CooldownUntil) {
       int secsLeft = (int)(g_CooldownUntil - TimeCurrent());
       DashLine("18b_cool", "COOLDOWN: " + IntegerToString(secsLeft/60) + "m " +
                IntegerToString(secsLeft%60) + "s (" + IntegerToString(g_ConsecLosses) + " consec losses)",

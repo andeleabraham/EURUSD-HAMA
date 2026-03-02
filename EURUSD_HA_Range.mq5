@@ -114,6 +114,17 @@ double g_PeakProfit   = 0;
 double g_CurrentLot   = 0.01;
 int    g_TotalBias    = 0;
 
+// Auto market-derived bias components (recalculated every tick)
+int    g_IntraDayBias   = 0;   // today open vs current price (momentum)
+int    g_GapBias        = 0;   // prev day close vs today open (overnight gap)
+int    g_AsianBias      = 0;   // asian session open vs current price
+int    g_LondonBias     = 0;   // london session open vs current price
+int    g_MarketAutoBias = 0;   // combined auto bias (intraday + gap)
+double g_IntraDayPct   = 0.0; // raw % for display
+double g_GapPct        = 0.0; // raw % for display
+double g_AsianPct      = 0.0; // raw % for display
+double g_LondonPct     = 0.0; // raw % for display
+
 // Lot-scaled thresholds — recalculated at trade open
 double g_ScaledLockUSD  = 2.00;
 double g_ScaledTrailUSD = 0.30;
@@ -278,6 +289,9 @@ void OnTick()
 
    // Always keep zone label current so dashboard never shows UNKNOWN
    g_ZoneLabel = ClassifyZone(SymbolInfoDouble(_Symbol, SYMBOL_BID));
+
+   // Recalc bias every tick so dashboard always reflects live price movement
+   RecalcBias();
 
    // New bar processing
    datetime barTime = iTime(_Symbol, PERIOD_M15, 0);
@@ -483,12 +497,14 @@ void UpdateLiveSessionBar()
    if(g_TodayLow  == 0 || liveLo < g_TodayLow)  g_TodayLow  = liveLo;
 
    if(h >= AsianStartHour && h < AsianEndHour) {
-      if(g_AsianOpen == 0) g_AsianOpen = liveOp;
+      // g_AsianOpen is intentionally NOT set here — only SeedSessionHL sets it
+      // from arrO[0] (the open of the very first bar of the Asian session window)
       if(g_AsianHigh == 0 || liveHi > g_AsianHigh) g_AsianHigh = liveHi;
       if(g_AsianLow  == 0 || liveLo  < g_AsianLow)  g_AsianLow  = liveLo;
    }
    if(h >= LondonStartHour && h < LondonEndHour) {
-      if(g_LondonOpen == 0) g_LondonOpen = liveOp;
+      // g_LondonOpen is intentionally NOT set here — only SeedSessionHL sets it
+      // from arrO[0] (the open of the very first bar of the London session window)
       if(g_LondonHigh == 0 || liveHi > g_LondonHigh) g_LondonHigh = liveHi;
       if(g_LondonLow  == 0 || liveLo  < g_LondonLow)  g_LondonLow  = liveLo;
    }
@@ -992,12 +1008,71 @@ int MeanReversionSetup()
 }
 
 //+------------------------------------------------------------------+
-//| Combine bias from geo/news inputs                                |
+//| BIAS ENGINE                                                      |
+//| Combines manual (geo/news) inputs with automatic market signals: |
+//|  1. Intraday momentum  — today open vs current price            |
+//|  2. Overnight gap      — prev day close vs today open           |
+//|  3. Asian session dir  — asian open vs current (info only)      |
+//|  4. London session dir — london open vs current (info only)     |
+//| Auto bias drives the total when manual inputs are neutral (0).  |
 //+------------------------------------------------------------------+
 void RecalcBias()
 {
-   // Positive = bullish EUR/USD, Negative = bearish EUR/USD
-   g_TotalBias = (EURGeoBias - USDGeoBias) + (NewsImpactEUR - NewsImpactUSD);
+   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+
+   // --- 1. Intraday momentum: D1 open vs current price ---
+   // Use iOpen(D1,0) — the broker's authoritative daily open — not the first M15
+   // bar from midnight, which can be hours before/after the actual market open.
+   g_IntraDayPct = 0.0; g_IntraDayBias = 0;
+   double d1Open = iOpen(_Symbol, PERIOD_D1, 0);
+   if(d1Open > 0) g_TodayOpen = d1Open;  // keep g_TodayOpen fresh from D1 source
+   if(d1Open > 0 && bid > 0) {
+      g_IntraDayPct = (bid - d1Open) / d1Open * 100.0;
+      if     (g_IntraDayPct >=  0.30) g_IntraDayBias =  2;  // strong bull day
+      else if(g_IntraDayPct >=  0.10) g_IntraDayBias =  1;  // mild bull
+      else if(g_IntraDayPct <= -0.30) g_IntraDayBias = -2;  // strong bear day
+      else if(g_IntraDayPct <= -0.10) g_IntraDayBias = -1;  // mild bear
+   }
+
+   // --- 2. Overnight / weekend gap: prev D1 close vs today D1 open ---
+   // iClose(D1,1) = last completed day's close (Friday if today is Monday).
+   // iOpen(D1,0)  = today's D1 open as defined by the broker — captures the
+   // full Sunday-open vs Friday-close gap, not just midnight M15.
+   g_GapPct = 0.0; g_GapBias = 0;
+   double prevClose = iClose(_Symbol, PERIOD_D1, 1);
+   if(prevClose > 0 && d1Open > 0) {
+      g_GapPct = (d1Open - prevClose) / prevClose * 100.0;
+      if     (g_GapPct >=  0.08) g_GapBias =  1;  // gap up → bullish opening
+      else if(g_GapPct <= -0.08) g_GapBias = -1;  // gap down → bearish opening
+   }
+
+   // --- 3. Asian session direction (display only — not in total) ---
+   g_AsianPct = 0.0; g_AsianBias = 0;
+   if(g_AsianOpen > 0 && bid > 0) {
+      g_AsianPct = (bid - g_AsianOpen) / g_AsianOpen * 100.0;
+      if     (g_AsianPct >=  0.07) g_AsianBias =  1;
+      else if(g_AsianPct <= -0.07) g_AsianBias = -1;
+   }
+
+   // --- 4. London session direction (display only — not in total) ---
+   g_LondonPct = 0.0; g_LondonBias = 0;
+   if(g_LondonOpen > 0 && bid > 0) {
+      g_LondonPct = (bid - g_LondonOpen) / g_LondonOpen * 100.0;
+      if     (g_LondonPct >=  0.07) g_LondonBias =  1;
+      else if(g_LondonPct <= -0.07) g_LondonBias = -1;
+   }
+
+   // --- Combined auto bias (intraday has more weight than gap) ---
+   g_MarketAutoBias = g_IntraDayBias + g_GapBias;
+
+   // --- Manual inputs ---
+   int manualBias = (EURGeoBias - USDGeoBias) + (NewsImpactEUR - NewsImpactUSD);
+
+   // --- Total: manual + auto, clamped to [-3, +3] ---
+   // When manual = 0, auto drives it. When manual is set, it weights on top.
+   g_TotalBias = manualBias + g_MarketAutoBias;
+   if(g_TotalBias >  3) g_TotalBias =  3;
+   if(g_TotalBias < -3) g_TotalBias = -3;
 }
 
 //+------------------------------------------------------------------+
@@ -1383,10 +1458,11 @@ void DashLine(string suffix, string text,
 void UpdateDashboard()
 {
    string session = GetSession();
-   string biasStr = g_TotalBias >= 2  ? "STRONG BULL" :
-                    g_TotalBias == 1  ? "MILD BULL"   :
-                    g_TotalBias == -1 ? "MILD BEAR"   :
-                    g_TotalBias <= -2 ? "STRONG BEAR"  : "NEUTRAL";
+
+   string biasStr  = g_TotalBias >= 2  ? "STRONG BULL" :
+                     g_TotalBias == 1  ? "MILD BULL"   :
+                     g_TotalBias == -1 ? "MILD BEAR"   :
+                     g_TotalBias <= -2 ? "STRONG BEAR"  : "NEUTRAL";
 
    color sigColor = clrGray;
    if(g_Signal == "BUY INCOMING")   sigColor = clrLime;
@@ -1430,6 +1506,43 @@ void UpdateDashboard()
 
    DashLine("03_bias",   "Bias    : " + biasStr + " (" + IntegerToString(g_TotalBias) + ")",
                                                                                  cx, cy, row, lh, corner, biasColor,     9); row++;
+
+   // --- Auto bias breakdown ---
+   // Intraday
+   string idPct  = (g_TodayOpen > 0)
+                   ? (g_IntraDayPct >= 0 ? "+" : "") + DoubleToString(g_IntraDayPct, 2) + "%"
+                   : "n/a";
+   string idLbl  = g_IntraDayBias >= 2 ? "STRONG BULL" : g_IntraDayBias == 1 ? "BULL" :
+                   g_IntraDayBias <= -2 ? "STRONG BEAR" : g_IntraDayBias == -1 ? "BEAR" : "NEUT";
+   DashLine("03a_id",    "  Intraday : " + idPct + " → " + idLbl,
+                                                                                 cx, cy, row, lh, corner, (g_IntraDayBias>0?clrLime:g_IntraDayBias<0?clrRed:clrGray), 8); row++;
+   // Gap
+   string gapPct = (g_GapPct != 0.0)
+                   ? (g_GapPct >= 0 ? "+" : "") + DoubleToString(g_GapPct, 2) + "% gap"
+                   : "no gap";
+   string gapLbl = g_GapBias == 1 ? "GAP UP" : g_GapBias == -1 ? "GAP DN" : "flat";
+   DashLine("03b_gap",   "  Gap open : " + gapPct + " → " + gapLbl,
+                                                                                 cx, cy, row, lh, corner, (g_GapBias>0?clrLime:g_GapBias<0?clrRed:clrGray), 8); row++;
+   // Asian session bias
+   string aPct   = (g_AsianOpen > 0)
+                   ? (g_AsianPct >= 0 ? "+" : "") + DoubleToString(g_AsianPct, 2) + "%"
+                   : "n/a";
+   string aLbl   = g_AsianBias == 1 ? "BULL" : g_AsianBias == -1 ? "BEAR" : "NEUT";
+   DashLine("03c_ab",    "  Asian    : " + aPct + " → " + aLbl,
+                                                                                 cx, cy, row, lh, corner, (g_AsianBias>0?clrLime:g_AsianBias<0?clrRed:clrGray), 8); row++;
+   // London session bias
+   string lPct   = (g_LondonOpen > 0)
+                   ? (g_LondonPct >= 0 ? "+" : "") + DoubleToString(g_LondonPct, 2) + "%"
+                   : "n/a";
+   string lLbl   = g_LondonBias == 1 ? "BULL" : g_LondonBias == -1 ? "BEAR" : "NEUT";
+   DashLine("03d_lb",    "  London   : " + lPct + " → " + lLbl,
+                                                                                 cx, cy, row, lh, corner, (g_LondonBias>0?clrLime:g_LondonBias<0?clrRed:clrGray), 8); row++;
+   // Manual override indication
+   int manualBias = (EURGeoBias - USDGeoBias) + (NewsImpactEUR - NewsImpactUSD);
+   if(manualBias != 0) {
+      DashLine("03e_man", "  Manual   : " + (manualBias > 0 ? "+" : "") + IntegerToString(manualBias) + " (geo/news override)",
+                                                                                 cx, cy, row, lh, corner, clrGold,             8); row++;
+   }
    DashLine("04_lot",    "Lot     : " + DoubleToString(g_CurrentLot, 2),        cx, cy, row, lh, corner, clrWhite,      9); row++;
 
    // Zone info

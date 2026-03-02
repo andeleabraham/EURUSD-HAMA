@@ -2384,8 +2384,8 @@ void TryEntry()
    }
 
    // === BIAS FILTER ===
-   bool canBuy  = (g_TotalBias > -3);
-   bool canSell = (g_TotalBias <  3);
+   bool canBuy  = (g_TotalBias > -2);   // block BUY when STRONG BEAR (bias <= -2)
+   bool canSell = (g_TotalBias <  2);   // block SELL when STRONG BULL (bias >= +2)
    if(tradeDir == 1  && !canBuy)  { Print("BUY blocked by STRONG BEAR bias (", g_TotalBias, ")");  return; }
    if(tradeDir == -1 && !canSell) { Print("SELL blocked by STRONG BULL bias (", g_TotalBias, ")"); return; }
 

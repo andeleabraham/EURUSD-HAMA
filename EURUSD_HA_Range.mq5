@@ -54,6 +54,10 @@ input bool   UseManualRange   = false;
 input double ManualRangeHigh  = 0.0;
 input double ManualRangeLow   = 0.0;
 
+input group "=== EARLY SESSION RANGE ==="
+input int    EarlySessionHours = 4;     // Use prev-day range when today's range is narrower than MinRangePips
+input double MinRangePips      = 30.0;  // Minimum range width in pips before switching to prev-day reference
+
 input group "=== HEIKEN ASHI SETTINGS ==="
 input int    MaxConsecCandles    = 4;
 // Entry mode:
@@ -822,9 +826,24 @@ void SetActiveRange()
    // but no longer merged into the active range. This ensures Range H/L reflects
    // today's actual price action, not yesterday's stale levels.
    if(todayH > 0 && todayL > 0) {
-      g_RangeHigh = todayH;
-      g_RangeLow  = todayL;
-      g_RangeMid  = (todayH + todayL) / 2.0;
+      // Early session guard: if today's candle is too narrow, use prev-day H/L as the
+      // reference range so zone classification and Fibs stay meaningful.
+      MqlDateTime nowDt;
+      TimeToStruct(TimeCurrent(), nowDt);
+      bool   earlySession   = (nowDt.hour < EarlySessionHours);
+      double minRangePrice  = MinRangePips * _Point * 10.0;
+      bool   tooNarrow      = ((todayH - todayL) < minRangePrice);
+
+      if(earlySession && tooNarrow && g_PrevDayHigh > 0 && g_PrevDayLow > 0) {
+         // Narrow early bar — anchor to prev-day H/L so zones are tradeable
+         g_RangeHigh = g_PrevDayHigh;
+         g_RangeLow  = g_PrevDayLow;
+         g_RangeMid  = (g_PrevDayHigh + g_PrevDayLow) / 2.0;
+      } else {
+         g_RangeHigh = todayH;
+         g_RangeLow  = todayL;
+         g_RangeMid  = (todayH + todayL) / 2.0;
+      }
    }
    else if(g_PrevDayHigh > 0 && g_PrevDayLow > 0) {
       // Fallback only if D1[0] isn't available yet (e.g. very first tick of new day)
@@ -1436,14 +1455,23 @@ void CalcFibPivotLevels()
       }
    }
 
-   // --- Fibonacci retracement levels from current session range ---
+   // --- Fibonacci retracement levels ---
+   // Use prev-day H/L as the Fib anchor when today's range is still too narrow
+   // (happens during the early session — a 5-pip bar produces meaningless Fib levels).
    if(g_RangeHigh > 0 && g_RangeLow > 0) {
-      double span = g_RangeHigh - g_RangeLow;
-      g_Fib236 = g_RangeHigh - 0.236 * span;
-      g_Fib382 = g_RangeHigh - 0.382 * span;
-      g_Fib500 = g_RangeHigh - 0.500 * span;   // = midpoint
-      g_Fib618 = g_RangeHigh - 0.618 * span;
-      g_Fib764 = g_RangeHigh - 0.764 * span;
+      double fibH = g_RangeHigh, fibL = g_RangeLow;
+      double minRangePrice = MinRangePips * _Point * 10.0;
+      if((fibH - fibL) < minRangePrice && g_PrevDayHigh > 0 && g_PrevDayLow > 0) {
+         // Today's range is narrow — compute Fibs from yesterday's full day instead
+         fibH = g_PrevDayHigh;
+         fibL = g_PrevDayLow;
+      }
+      double span = fibH - fibL;
+      g_Fib236 = fibH - 0.236 * span;
+      g_Fib382 = fibH - 0.382 * span;
+      g_Fib500 = fibH - 0.500 * span;   // = midpoint
+      g_Fib618 = fibH - 0.618 * span;
+      g_Fib764 = fibH - 0.764 * span;
    }
 
    // Draw lines if requested
@@ -1533,6 +1561,8 @@ double CalcConfidence(int tradeDir, string zone, bool isMeanRev, bool isSideways
    // Support levels (S1, S2, Fib 61.8%, 76.4%) favour BUY; resist BUY headwind if selling from support
    // Resistance levels (R1, R2, Fib 23.6%, 38.2%) favour SELL; penalise BUY at resistance
    // PP and Fib 50% are neutral
+   // STRUCTURE CONTEXT: BEARISH structure implies key supports have been broken (now act as resistance).
+   //                    BULLISH structure implies key resistances are broken (now act as support).
    if(nearLevel != "") {
       bool isSupport    = (StringFind(nearLevel, "S1") >= 0 || StringFind(nearLevel, "S2") >= 0 ||
                            StringFind(nearLevel, "61.8") >= 0 || StringFind(nearLevel, "76.4") >= 0);
@@ -1540,14 +1570,21 @@ double CalcConfidence(int tradeDir, string zone, bool isMeanRev, bool isSideways
                            StringFind(nearLevel, "23.6") >= 0 || StringFind(nearLevel, "38.2") >= 0);
       bool isNeutral    = (!isSupport && !isResistance);   // PP, Fib 50%
 
+      bool supportIntact    = (g_StructureLabel != "BEARISH");  // BEARISH = support probably broken
+      bool resistanceIntact = (g_StructureLabel != "BULLISH");  // BULLISH = resistance probably broken
+
       if(isNeutral) {
          conf += 6.0;   // mild boost for both directions
       } else if(isSupport) {
-         if(tradeDir == 1)  conf += 12.0;  // buying at support = strong confirmation
-         else               conf +=  2.0;  // selling at support = fighting against the level
+         if(tradeDir == 1)
+            conf += supportIntact ? 12.0 : 3.0;   // intact support = great for buy; broken = weak
+         else
+            conf += supportIntact ? 2.0  : 8.0;   // broken support now acts as resistance = decent for sell
       } else {  // isResistance
-         if(tradeDir == -1) conf += 12.0;  // selling at resistance = strong confirmation
-         else               conf +=  2.0;  // buying at resistance = fighting against the level
+         if(tradeDir == -1)
+            conf += resistanceIntact ? 12.0 : 3.0; // intact resistance = great for sell; broken = weak
+         else
+            conf += resistanceIntact ? 2.0  : 8.0; // broken resistance now acts as support = decent for buy
       }
    }
 
@@ -2868,6 +2905,16 @@ void UpdateDashboard()
    string rhStr = (g_RangeHigh > 0) ? DoubleToString(g_RangeHigh, 5) : "N/A";
    string rlStr = (g_RangeLow  > 0) ? DoubleToString(g_RangeLow,  5) : "N/A";
    string rmStr = (g_RangeMid  > 0) ? DoubleToString(g_RangeMid,  5) : "N/A";
+
+   // Show whether range is anchored to prev day (early session narrow-bar fallback)
+   MqlDateTime _nowDt; TimeToStruct(TimeCurrent(), _nowDt);
+   bool   _earlyNow    = (_nowDt.hour < EarlySessionHours);
+   double _todaySpan   = iHigh(_Symbol, PERIOD_D1, 0) - iLow(_Symbol, PERIOD_D1, 0);
+   bool   _usingPrev   = _earlyNow && (_todaySpan < MinRangePips * _Point * 10.0) && g_PrevDayHigh > 0;
+   string rangeAnchor  = _usingPrev ? "PREV-DAY anchor (early session)" : "live today";
+   color  rangeAncClr  = _usingPrev ? clrOrange : clrAqua;
+   DashLine("04d_ranc", "RngSrc  : " + rangeAnchor,                             cx, cy, row, lh, corner, rangeAncClr,   8); row++;
+
    DashLine("05_rh",     "Range   H: " + rhStr,                                 cx, cy, row, lh, corner, clrAqua,       9); row++;
    DashLine("06_rl",     "Range   L: " + rlStr,                                 cx, cy, row, lh, corner, clrAqua,       9); row++;
    DashLine("07_rm",     "Range   M: " + rmStr,                                 cx, cy, row, lh, corner, clrAqua,       9); row++;

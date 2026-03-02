@@ -78,6 +78,12 @@ input bool   ShowFibLevels       = true;   // Draw fib lines on chart
 // Daily pivot (standard floor pivot from previous day)
 input bool   UseDailyPivot       = true;   // Include daily pivot S1/R1/PP in confluence
 
+input group "=== MARKET STRUCTURE (Smart Money Concepts) ==="
+input bool   UseSwingStructure   = true;   // Detect H1 swing highs/lows for BOS/CHoCH
+input bool   UseOrderBlocks      = true;   // Detect H1 institutional order blocks
+input bool   UseVolumeAnalysis   = true;   // Tick volume confirmation & divergence
+input bool   UseLiquiditySweep   = true;   // Detect stop-hunt sweeps at key levels
+
 input group "=== RANGE ZONE FILTERS ==="
 // How far inside range boundaries before a trade is allowed (as % of total range)
 input double MidZonePct       = 0.30;   // Mid zone = middle 30% of range (15% each side of mid)
@@ -186,6 +192,27 @@ double   g_BollingerMid2 = 0;       // confirmed bar 2
 bool     g_MRVArmed       = false;
 int      g_MRVDir         = 0;       // 1=buy bounce, -1=sell bounce
 datetime g_MRVConfirmOpen = 0;       // open time of bar after 2nd confirming MRV candle
+
+// Market Structure (H1 swing points)
+double g_SwingHigh1 = 0, g_SwingHigh2 = 0;  // two most recent swing highs (H1)
+double g_SwingLow1  = 0, g_SwingLow2  = 0;  // two most recent swing lows (H1)
+string g_StructureLabel = "RANGING";          // "BULLISH" / "BEARISH" / "RANGING"
+bool   g_BOS         = false;                // Break of Structure on this bar
+bool   g_CHoCH       = false;                // Change of Character (trend reversal)
+
+// Liquidity Sweep detection
+bool   g_LiquiditySweep = false;             // price swept a key level and reversed
+string g_SweepLevel     = "";                // which level was swept
+int    g_SweepDir       = 0;                 // 1=bullish sweep (swept low), -1=bearish (swept high)
+
+// Volume Analysis (tick volume)
+string g_VolumeState   = "NORMAL";           // "HIGH" / "ABOVE_AVG" / "NORMAL" / "LOW"
+double g_VolRatio      = 1.0;               // current vol / average vol
+bool   g_VolDivergence = false;              // price trending but volume declining
+
+// Order Blocks (institutional entry zones on H1)
+double g_BullOB_High = 0, g_BullOB_Low = 0; // last bear candle before bull impulse
+double g_BearOB_High = 0, g_BearOB_Low = 0; // last bull candle before bear impulse
 
 // Fibonacci & Pivot levels (recalculated each day/session)
 double g_PivotPP  = 0, g_PivotR1 = 0, g_PivotS1 = 0;
@@ -452,6 +479,13 @@ void OnTick()
       SetActiveRange();
       RecalcBias();
       CalcFibPivotLevels();   // recalc on every new bar
+
+      // Market structure analysis (runs on new bar only — uses confirmed bars)
+      if(UseSwingStructure)  DetectSwingStructure();
+      if(UseOrderBlocks)     DetectOrderBlocks();
+      if(UseVolumeAnalysis)  AnalyzeVolume();
+      if(UseLiquiditySweep)  DetectLiquiditySweep();
+
       EvaluateHAPattern();
    }
 
@@ -806,6 +840,257 @@ void CalcBollinger()
 }
 
 //+------------------------------------------------------------------+
+//| MARKET STRUCTURE DETECTION (H1 Swing Points)                     |
+//| Scans H1 bars for swing highs/lows using a 3-bar left/right     |
+//| confirmation.  Determines overall structure (bullish HH/HL,      |
+//| bearish LH/LL, or ranging) and flags BOS / CHoCH events.        |
+//+------------------------------------------------------------------+
+void DetectSwingStructure()
+{
+   int lookback = 3;   // bars each side to confirm a swing point
+   int scanBars = 50;  // H1 bars to scan
+
+   double swingHighs[];
+   double swingLows[];
+   ArrayResize(swingHighs, 6);
+   ArrayResize(swingLows, 6);
+   int shCount = 0, slCount = 0;
+
+   for(int i = lookback; i < scanBars - lookback && (shCount < 4 || slCount < 4); i++)
+   {
+      double h = iHigh(_Symbol, PERIOD_H1, i);
+      double l = iLow (_Symbol, PERIOD_H1, i);
+
+      // --- swing high: bar high > all neighbours within lookback ---
+      bool isSH = true;
+      for(int j = 1; j <= lookback; j++) {
+         if(iHigh(_Symbol, PERIOD_H1, i - j) >= h ||
+            iHigh(_Symbol, PERIOD_H1, i + j) >= h) { isSH = false; break; }
+      }
+      if(isSH && shCount < 4) swingHighs[shCount++] = h;
+
+      // --- swing low: bar low < all neighbours within lookback ---
+      bool isSL = true;
+      for(int j = 1; j <= lookback; j++) {
+         if(iLow(_Symbol, PERIOD_H1, i - j) <= l ||
+            iLow(_Symbol, PERIOD_H1, i + j) <= l) { isSL = false; break; }
+      }
+      if(isSL && slCount < 4) swingLows[slCount++] = l;
+   }
+
+   g_SwingHigh1 = (shCount >= 1) ? swingHighs[0] : 0;
+   g_SwingHigh2 = (shCount >= 2) ? swingHighs[1] : 0;
+   g_SwingLow1  = (slCount >= 1) ? swingLows[0]  : 0;
+   g_SwingLow2  = (slCount >= 2) ? swingLows[1]  : 0;
+
+   string prevStructure = g_StructureLabel;
+   g_BOS   = false;
+   g_CHoCH = false;
+
+   if(shCount >= 2 && slCount >= 2)
+   {
+      // 10-point tolerance (1 pip) to avoid noise
+      bool HH = (g_SwingHigh1 > g_SwingHigh2 + _Point * 10);
+      bool HL = (g_SwingLow1  > g_SwingLow2  + _Point * 10);
+      bool LH = (g_SwingHigh1 < g_SwingHigh2 - _Point * 10);
+      bool LL = (g_SwingLow1  < g_SwingLow2  - _Point * 10);
+
+      if(HH && HL)       g_StructureLabel = "BULLISH";
+      else if(LH && LL)  g_StructureLabel = "BEARISH";
+      else                g_StructureLabel = "RANGING";
+
+      // BOS: live price breaks the most recent swing in trend direction
+      double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+      if(g_StructureLabel == "BULLISH" && bid > g_SwingHigh1)  g_BOS = true;
+      if(g_StructureLabel == "BEARISH" && bid < g_SwingLow1)   g_BOS = true;
+
+      // CHoCH: structure just flipped direction
+      if(prevStructure == "BULLISH"  && g_StructureLabel == "BEARISH") g_CHoCH = true;
+      if(prevStructure == "BEARISH"  && g_StructureLabel == "BULLISH") g_CHoCH = true;
+   }
+}
+
+//+------------------------------------------------------------------+
+//| LIQUIDITY SWEEP DETECTION                                         |
+//| Checks if the last closed M15 bar swept a key level (session     |
+//| H/L, prev day H/L, swing H/L) and then closed back inside —     |
+//| indicating a stop-hunt / institutional liquidity grab.            |
+//+------------------------------------------------------------------+
+void DetectLiquiditySweep()
+{
+   g_LiquiditySweep = false;
+   g_SweepLevel = "";
+   g_SweepDir = 0;
+
+   double barH = iHigh (_Symbol, PERIOD_M15, 1);
+   double barL = iLow  (_Symbol, PERIOD_M15, 1);
+   double barC = iClose(_Symbol, PERIOD_M15, 1);
+   double tol  = 2.0 * _Point * 10;   // 2 pip pierce required
+
+   // --- Low levels (buy-side liquidity pools — stops cluster below) ---
+   double loLvl[];  string loNm[];
+   int loCnt = 0;
+   ArrayResize(loLvl, 8);  ArrayResize(loNm, 8);
+   if(g_AsianLow  > 0)  { loLvl[loCnt] = g_AsianLow;   loNm[loCnt] = "Asian Low";   loCnt++; }
+   if(g_LondonLow > 0)  { loLvl[loCnt] = g_LondonLow;  loNm[loCnt] = "London Low";  loCnt++; }
+   if(g_NYLow     > 0)  { loLvl[loCnt] = g_NYLow;      loNm[loCnt] = "NY Low";      loCnt++; }
+   if(g_PrevDayLow > 0) { loLvl[loCnt] = g_PrevDayLow; loNm[loCnt] = "PrevDay Low"; loCnt++; }
+   if(g_SwingLow1  > 0) { loLvl[loCnt] = g_SwingLow1;  loNm[loCnt] = "Swing Low";   loCnt++; }
+
+   // --- High levels (sell-side liquidity pools — stops cluster above) ---
+   double hiLvl[];  string hiNm[];
+   int hiCnt = 0;
+   ArrayResize(hiLvl, 8);  ArrayResize(hiNm, 8);
+   if(g_AsianHigh  > 0) { hiLvl[hiCnt] = g_AsianHigh;   hiNm[hiCnt] = "Asian High";   hiCnt++; }
+   if(g_LondonHigh > 0) { hiLvl[hiCnt] = g_LondonHigh;  hiNm[hiCnt] = "London High";  hiCnt++; }
+   if(g_NYHigh     > 0) { hiLvl[hiCnt] = g_NYHigh;      hiNm[hiCnt] = "NY High";      hiCnt++; }
+   if(g_PrevDayHigh > 0){ hiLvl[hiCnt] = g_PrevDayHigh; hiNm[hiCnt] = "PrevDay High"; hiCnt++; }
+   if(g_SwingHigh1  > 0){ hiLvl[hiCnt] = g_SwingHigh1;  hiNm[hiCnt] = "Swing High";   hiCnt++; }
+
+   // Bullish sweep: bar dipped BELOW a low level, closed back ABOVE  → expect UP
+   for(int i = 0; i < loCnt; i++) {
+      if(barL < loLvl[i] - tol && barC > loLvl[i]) {
+         g_LiquiditySweep = true;
+         g_SweepLevel = loNm[i];
+         g_SweepDir = 1;
+         Print("LIQUIDITY SWEEP UP: ", loNm[i], " at ", DoubleToString(loLvl[i], 5),
+               " | BarL:", DoubleToString(barL, 5), " C:", DoubleToString(barC, 5));
+         return;
+      }
+   }
+   // Bearish sweep: bar spiked ABOVE a high level, closed back BELOW → expect DOWN
+   for(int i = 0; i < hiCnt; i++) {
+      if(barH > hiLvl[i] + tol && barC < hiLvl[i]) {
+         g_LiquiditySweep = true;
+         g_SweepLevel = hiNm[i];
+         g_SweepDir = -1;
+         Print("LIQUIDITY SWEEP DN: ", hiNm[i], " at ", DoubleToString(hiLvl[i], 5),
+               " | BarH:", DoubleToString(barH, 5), " C:", DoubleToString(barC, 5));
+         return;
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| VOLUME ANALYSIS (Tick Volume on M15)                              |
+//| Compares the last completed bar's tick volume to the 20-bar      |
+//| average.  Also detects volume divergence (price trending but     |
+//| volume declining — a sign of a weakening move).                  |
+//+------------------------------------------------------------------+
+void AnalyzeVolume()
+{
+   int avgPeriod = 20;
+   long volumes[];
+   ArraySetAsSeries(volumes, true);
+
+   if(CopyTickVolume(_Symbol, PERIOD_M15, 0, avgPeriod + 2, volumes) < avgPeriod + 2) {
+      g_VolumeState = "NORMAL";
+      g_VolRatio = 1.0;
+      g_VolDivergence = false;
+      return;
+   }
+
+   // Average of bars 2..avgPeriod+1 (confirmed, excludes bar 0 forming + bar 1 just closed)
+   long totalVol = 0;
+   for(int i = 2; i <= avgPeriod + 1; i++) totalVol += volumes[i];
+   double avgVol = (double)totalVol / avgPeriod;
+
+   double currVol = (double)volumes[1];   // last completed bar
+   g_VolRatio = (avgVol > 0) ? currVol / avgVol : 1.0;
+
+   if(g_VolRatio >= 1.8)       g_VolumeState = "HIGH";
+   else if(g_VolRatio >= 1.3)  g_VolumeState = "ABOVE_AVG";
+   else if(g_VolRatio <= 0.5)  g_VolumeState = "LOW";
+   else                        g_VolumeState = "NORMAL";
+
+   // Divergence: price making new highs/lows over 5 bars but volume declining
+   g_VolDivergence = false;
+   double c1 = iClose(_Symbol, PERIOD_M15, 1);
+   double c3 = iClose(_Symbol, PERIOD_M15, 3);
+   double c5 = iClose(_Symbol, PERIOD_M15, 5);
+   bool priceMove = (c1 > c3 && c3 > c5) || (c1 < c3 && c3 < c5);
+   bool volDrop   = (volumes[1] < volumes[3] && volumes[3] < volumes[5]);
+   if(priceMove && volDrop)
+      g_VolDivergence = true;
+}
+
+//+------------------------------------------------------------------+
+//| ORDER BLOCK DETECTION (H1)                                        |
+//| Scans H1 bars for strong impulse moves (3+ consecutive bars,     |
+//| 12+ pips).  The last opposing candle before the impulse is the   |
+//| "order block" — a zone where institutional orders were placed.   |
+//| Price often returns to these zones for high-quality entries.     |
+//+------------------------------------------------------------------+
+void DetectOrderBlocks()
+{
+   g_BullOB_High = 0;  g_BullOB_Low  = 0;
+   g_BearOB_High = 0;  g_BearOB_Low  = 0;
+
+   int scanBars       = 30;     // H1 bars to scan
+   int impulseLen     = 3;      // min consecutive H1 candles for an impulse
+   double minPips     = 12.0;   // min total impulse size in pips
+
+   // --- BULLISH ORDER BLOCK: bearish H1 candle before a bullish impulse ---
+   for(int i = impulseLen; i < scanBars; i++)
+   {
+      // Check bars i (oldest) down to i-impulseLen+1 (newest) are all bullish
+      bool allBull = true;
+      for(int j = 0; j < impulseLen; j++) {
+         int idx = i - j;
+         if(idx < 1) { allBull = false; break; }
+         if(iClose(_Symbol, PERIOD_H1, idx) <= iOpen(_Symbol, PERIOD_H1, idx)) {
+            allBull = false; break;
+         }
+      }
+      if(!allBull) continue;
+
+      // Check impulse size
+      double impOpen  = iOpen (_Symbol, PERIOD_H1, i);                    // open of oldest impulse bar
+      double impClose = iClose(_Symbol, PERIOD_H1, i - impulseLen + 1);   // close of newest
+      if((impClose - impOpen) / _Point / 10.0 < minPips) continue;
+
+      // OB = the candle just before the impulse (one bar older)
+      int ob = i + 1;
+      if(ob >= scanBars) continue;
+      double obO = iOpen (_Symbol, PERIOD_H1, ob);
+      double obC = iClose(_Symbol, PERIOD_H1, ob);
+      if(obC < obO) {   // bearish candle = valid bullish OB
+         g_BullOB_High = obO;
+         g_BullOB_Low  = obC;
+         break;         // most recent OB found
+      }
+   }
+
+   // --- BEARISH ORDER BLOCK: bullish H1 candle before a bearish impulse ---
+   for(int i = impulseLen; i < scanBars; i++)
+   {
+      bool allBear = true;
+      for(int j = 0; j < impulseLen; j++) {
+         int idx = i - j;
+         if(idx < 1) { allBear = false; break; }
+         if(iClose(_Symbol, PERIOD_H1, idx) >= iOpen(_Symbol, PERIOD_H1, idx)) {
+            allBear = false; break;
+         }
+      }
+      if(!allBear) continue;
+
+      double impOpen  = iOpen (_Symbol, PERIOD_H1, i);
+      double impClose = iClose(_Symbol, PERIOD_H1, i - impulseLen + 1);
+      if((impOpen - impClose) / _Point / 10.0 < minPips) continue;
+
+      int ob = i + 1;
+      if(ob >= scanBars) continue;
+      double obO = iOpen (_Symbol, PERIOD_H1, ob);
+      double obC = iClose(_Symbol, PERIOD_H1, ob);
+      if(obC > obO) {   // bullish candle = valid bearish OB
+         g_BearOB_High = obC;
+         g_BearOB_Low  = obO;
+         break;
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
 //| HEIKEN ASHI CALCULATION for bar at index idx                     |
 //+------------------------------------------------------------------+
 void CalcHA(int idx, double &haO, double &haH, double &haL, double &haC)
@@ -1002,6 +1287,51 @@ int CalcTradeTier(int tradeDir, string zone, bool isMeanRev, bool isSideways, st
    // --- 8. SIDEWAYS PENALTY ---
    if(isSideways)  score -= 2;
 
+   // --- 9. MARKET STRUCTURE ALIGNMENT (H1 swing points) ---
+   bool structAligned = false;
+   if(UseSwingStructure) {
+      if(g_StructureLabel == "BULLISH" && tradeDir == 1)  { score += 1; structAligned = true; }
+      if(g_StructureLabel == "BEARISH" && tradeDir == -1) { score += 1; structAligned = true; }
+      // Counter-structure penalty (trading against the trend)
+      if(g_StructureLabel == "BULLISH" && tradeDir == -1)  score -= 1;
+      if(g_StructureLabel == "BEARISH" && tradeDir == 1)   score -= 1;
+      // Break of Structure = strong continuation signal
+      if(g_BOS && structAligned)  score += 1;
+   }
+
+   // --- 10. VOLUME CONFIRMATION ---
+   if(UseVolumeAnalysis) {
+      if(g_VolumeState == "HIGH")       score += 2;   // heavy activity = institutional interest
+      else if(g_VolumeState == "ABOVE_AVG") score += 1;
+      else if(g_VolumeState == "LOW")   score -= 1;   // dead volume = low conviction
+      if(g_VolDivergence)               score -= 1;   // weakening trend
+   }
+
+   // --- 11. LIQUIDITY SWEEP ---
+   // A sweep = price hunted stops then reversed.  If sweep direction matches
+   // our trade → very high conviction setup (institutions repositioning).
+   if(UseLiquiditySweep && g_LiquiditySweep) {
+      if(g_SweepDir == tradeDir)  score += 3;
+   }
+
+   // --- 12. ORDER BLOCK PROXIMITY ---
+   // Price sitting inside an institutional order block = strong S/R zone
+   bool nearOB = false;
+   if(UseOrderBlocks) {
+      double obTol = 3.0 * _Point * 10;   // 3-pip tolerance around OB zone
+      double bidNow = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+      if(tradeDir == 1 && g_BullOB_High > 0) {
+         if(bidNow >= g_BullOB_Low - obTol && bidNow <= g_BullOB_High + obTol) {
+            score += 2;  nearOB = true;
+         }
+      }
+      if(tradeDir == -1 && g_BearOB_High > 0) {
+         if(bidNow >= g_BearOB_Low - obTol && bidNow <= g_BearOB_High + obTol) {
+            score += 2;  nearOB = true;
+         }
+      }
+   }
+
    // --- MAP SCORE TO TIER ---
    // score <= 3  : SCALP (tier 1)  — low conviction, take $1-1.50 and go
    // score 4-7   : SWING (tier 2)  — normal trade, target $2-3
@@ -1013,9 +1343,12 @@ int CalcTradeTier(int tradeDir, string zone, bool isMeanRev, bool isSideways, st
 
    Print("TRADE TIER: ", tier, " (score=", score, ")",
          " ATR:", DoubleToString(atrPips,1), "pip",
-         " Session:", (isOverlap?"OVERLAP":isLondon?"LONDON":isNY?"NY":"OTHER"),
-         " Zone:", zone, " Confluence:", (nearLevel==""?"none":nearLevel),
-         " Bias:", g_TotalBias, " MRV:", isMeanRev, " Sideways:", isSideways);
+         " Sess:", (isOverlap?"OVERLAP":isLondon?"LONDON":isNY?"NY":"OTHER"),
+         " Zone:", zone, " Cnfl:", (nearLevel==""?"none":nearLevel),
+         " Struct:", g_StructureLabel, (g_BOS?" BOS":""), (g_CHoCH?" CHoCH":""),
+         " Vol:", g_VolumeState, " Sweep:", (g_LiquiditySweep ? g_SweepLevel : "none"),
+         " OB:", (nearOB?"YES":"no"),
+         " Bias:", g_TotalBias, " MRV:", isMeanRev);
 
    return tier;
 }
@@ -1034,7 +1367,7 @@ double FindNextTargetLevel(double entryPrice, int tradeDir)
    // Collect all known levels
    double levels[];
    int    cnt = 0;
-   ArrayResize(levels, 15);
+   ArrayResize(levels, 30);
 
    if(UseDailyPivot && g_PivotPP > 0) {
       levels[cnt++] = g_PivotPP;
@@ -1054,6 +1387,21 @@ double FindNextTargetLevel(double entryPrice, int tradeDir)
    if(g_RangeHigh > 0) levels[cnt++] = g_RangeHigh;
    if(g_RangeLow  > 0) levels[cnt++] = g_RangeLow;
    if(g_RangeMid  > 0) levels[cnt++] = g_RangeMid;
+   // Swing structure levels (H1)
+   if(g_SwingHigh1 > 0) levels[cnt++] = g_SwingHigh1;
+   if(g_SwingHigh2 > 0) levels[cnt++] = g_SwingHigh2;
+   if(g_SwingLow1  > 0) levels[cnt++] = g_SwingLow1;
+   if(g_SwingLow2  > 0) levels[cnt++] = g_SwingLow2;
+   // Order block edges (institutional S/R)
+   if(g_BullOB_High > 0) levels[cnt++] = g_BullOB_High;
+   if(g_BullOB_Low  > 0) levels[cnt++] = g_BullOB_Low;
+   if(g_BearOB_High > 0) levels[cnt++] = g_BearOB_High;
+   if(g_BearOB_Low  > 0) levels[cnt++] = g_BearOB_Low;
+   // Session extremes as targets
+   if(g_AsianHigh > 0) levels[cnt++] = g_AsianHigh;
+   if(g_AsianLow  > 0) levels[cnt++] = g_AsianLow;
+   if(g_LondonHigh > 0) levels[cnt++] = g_LondonHigh;
+   if(g_LondonLow  > 0) levels[cnt++] = g_LondonLow;
 
    for(int i = 0; i < cnt; i++) {
       double lvl = levels[i];
@@ -2093,6 +2441,46 @@ void UpdateDashboard()
                                                                                  cx, cy, row, lh, corner, clrWhite,      9); row++;
    DashLine("09_cih",    "CI High : " + cihStr,                                 cx, cy, row, lh, corner, clrLightBlue,  9); row++;
    DashLine("10_cil",    "CI Low  : " + cilStr,                                 cx, cy, row, lh, corner, clrLightBlue,  9); row++;
+   row++;
+
+   // --- Market Structure & Smart Money ---
+   color structClr = (g_StructureLabel == "BULLISH") ? clrLime :
+                     (g_StructureLabel == "BEARISH") ? clrRed : clrGray;
+   string structStr = g_StructureLabel;
+   if(g_BOS)   structStr += " BOS";
+   if(g_CHoCH) structStr += " CHoCH!";
+   DashLine("10b_struct", "Struct  : " + structStr,                              cx, cy, row, lh, corner, structClr, 9); row++;
+   if(g_SwingHigh1 > 0 || g_SwingLow1 > 0)
+      DashLine("10b2_sw",  "  SH:" + (g_SwingHigh1>0 ? DoubleToString(g_SwingHigh1,5) : "n/a") +
+                            " SL:" + (g_SwingLow1>0 ? DoubleToString(g_SwingLow1,5) : "n/a"),
+                                                                                 cx, cy, row, lh, corner, clrSilver, 8);
+   else
+      DashLine("10b2_sw",  "",                                                   cx, cy, row, lh, corner, clrGray, 8);
+   row++;
+
+   color volClr = (g_VolumeState == "HIGH" || g_VolumeState == "ABOVE_AVG") ? clrLime :
+                  (g_VolumeState == "LOW") ? clrRed : clrGray;
+   DashLine("10c_vol",   "Volume  : " + g_VolumeState + " (x" + DoubleToString(g_VolRatio,1) + ")" +
+                          (g_VolDivergence ? " DIVERGENCE" : ""),                 cx, cy, row, lh, corner, volClr, 9); row++;
+
+   if(g_LiquiditySweep)
+      DashLine("10d_sweep", "Sweep   : " + g_SweepLevel + (g_SweepDir==1?" BUY":" SELL"),
+                                                                                 cx, cy, row, lh, corner, clrGold, 9);
+   else
+      DashLine("10d_sweep", "",                                                  cx, cy, row, lh, corner, clrGray, 8);
+   row++;
+
+   string obLine = "";
+   if(g_BullOB_High > 0) obLine += "Bull:" + DoubleToString(g_BullOB_Low,5) + "-" + DoubleToString(g_BullOB_High,5);
+   if(g_BearOB_High > 0) {
+      if(obLine != "") obLine += " ";
+      obLine += "Bear:" + DoubleToString(g_BearOB_Low,5) + "-" + DoubleToString(g_BearOB_High,5);
+   }
+   if(obLine != "")
+      DashLine("10e_ob",  "OB      : " + obLine,                                cx, cy, row, lh, corner, clrYellow, 7);
+   else
+      DashLine("10e_ob",  "",                                                    cx, cy, row, lh, corner, clrGray, 7);
+   row++;
    row++;
 
    // Fib / Pivot nearest level

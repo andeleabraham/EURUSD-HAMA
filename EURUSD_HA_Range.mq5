@@ -2694,6 +2694,7 @@ void DashLine(string suffix, string text,
    ObjectSetInteger(0, name, OBJPROP_SELECTABLE,true);
    ObjectSetInteger(0, name, OBJPROP_SELECTED,  false);
    ObjectSetInteger(0, name, OBJPROP_BACK,      false);
+   ObjectSetInteger(0, name, OBJPROP_ZORDER,    1);   // above background panel
 }
 
 void UpdateDashboard()
@@ -3027,6 +3028,30 @@ void UpdateDashboard()
                                                                                  cx, cy, row, lh, corner, clrOrange,    8); row++;
    } else {
       DashLine("18b_cool", "",                                                   cx, cy, row, lh, corner, clrGray,      8); row++;
+   }
+
+   // --- Semi-transparent background panel (drawn last; OBJ_RECTANGLE_LABEL renders behind OBJ_LABEL) ---
+   {
+      int    bgPad = 5;
+      int    bgW   = 258;
+      int    bgH   = row * lh + bgPad * 2;
+      int    bgX   = MathMax(0, cx - bgPad);
+      int    bgY   = MathMax(0, cy - bgPad);
+      string bgName = DASH_PREFIX + "BG_panel";
+      if(ObjectFind(0, bgName) < 0)
+         ObjectCreate(0, bgName, OBJ_RECTANGLE_LABEL, 0, 0, 0);
+      ObjectSetInteger(0, bgName, OBJPROP_CORNER,     corner);
+      ObjectSetInteger(0, bgName, OBJPROP_XDISTANCE,  bgX);
+      ObjectSetInteger(0, bgName, OBJPROP_YDISTANCE,  bgY);
+      ObjectSetInteger(0, bgName, OBJPROP_XSIZE,       bgW);
+      ObjectSetInteger(0, bgName, OBJPROP_YSIZE,       bgH);
+      ObjectSetInteger(0, bgName, OBJPROP_BGCOLOR,     C'8,12,28');  // dark navy
+      ObjectSetInteger(0, bgName, OBJPROP_BORDER_TYPE, BORDER_FLAT);
+      ObjectSetInteger(0, bgName, OBJPROP_COLOR,        C'60,80,120'); // subtle blue-grey border
+      ObjectSetInteger(0, bgName, OBJPROP_TRANSPARENCY, 45);           // 0=opaque 100=invisible; 45≈55% visible
+      ObjectSetInteger(0, bgName, OBJPROP_BACK,         false);
+      ObjectSetInteger(0, bgName, OBJPROP_ZORDER,       0);            // below all text labels
+      ObjectSetInteger(0, bgName, OBJPROP_SELECTABLE,   false);
    }
 }
 

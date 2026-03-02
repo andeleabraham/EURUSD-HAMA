@@ -80,6 +80,8 @@ input bool   UseDailyPivot       = true;   // Include daily pivot S1/R1/PP in co
 input group "=== MARKET STRUCTURE (Smart Money Concepts) ==="
 input bool   UseSwingStructure   = true;   // Detect H1 swing highs/lows for BOS/CHoCH
 input bool   UseOrderBlocks      = true;   // Detect H1 institutional order blocks
+input double OBMinBodyPips       = 8.0;    // Minimum OB candle body size in pips (filters doji/tiny OBs)
+input int    OBScanBars          = 60;     // H1 bars to scan (~2.5 days; was 30)
 input bool   UseVolumeAnalysis   = true;   // Tick volume confirmation & divergence
 input bool   UseLiquiditySweep   = true;   // Detect stop-hunt sweeps at key levels
 input bool            UseFairValueGaps = true;      // Detect and display Fair Value Gaps
@@ -1082,14 +1084,15 @@ void DetectOrderBlocks()
    g_BullOB_High = 0;  g_BullOB_Low = 0;  g_BullOB_Time = 0;
    g_BearOB_High = 0;  g_BearOB_Low = 0;  g_BearOB_Time = 0;
 
-   int scanBars       = 30;     // H1 bars to scan
-   int impulseLen     = 3;      // min consecutive H1 candles for an impulse
-   double minPips     = 12.0;   // min total impulse size in pips
+   int    scanBars   = OBScanBars;  // H1 bars to look back
+   int    impulseLen = 3;           // min consecutive H1 candles forming an impulse
+   double minImpulse = 12.0;        // min total impulse size in pips
+   double minBody    = OBMinBodyPips * _Point * 10.0;  // min OB candle body in price
 
    // --- BULLISH ORDER BLOCK: bearish H1 candle before a bullish impulse ---
    for(int i = impulseLen; i < scanBars; i++)
    {
-      // Check bars i (oldest) down to i-impulseLen+1 (newest) are all bullish
+      // All bars from i down to i-impulseLen+1 must be bullish
       bool allBull = true;
       for(int j = 0; j < impulseLen; j++) {
          int idx = i - j;
@@ -1100,22 +1103,22 @@ void DetectOrderBlocks()
       }
       if(!allBull) continue;
 
-      // Check impulse size
-      double impOpen  = iOpen (_Symbol, PERIOD_H1, i);                    // open of oldest impulse bar
-      double impClose = iClose(_Symbol, PERIOD_H1, i - impulseLen + 1);   // close of newest
-      if((impClose - impOpen) / _Point / 10.0 < minPips) continue;
+      // Impulse must be at least minImpulse pips
+      double impOpen  = iOpen (_Symbol, PERIOD_H1, i);
+      double impClose = iClose(_Symbol, PERIOD_H1, i - impulseLen + 1);
+      if((impClose - impOpen) / _Point / 10.0 < minImpulse) continue;
 
-      // OB = the candle just before the impulse (one bar older)
+      // OB candle = bar just before the impulse
       int ob = i + 1;
       if(ob >= scanBars) continue;
       double obO = iOpen (_Symbol, PERIOD_H1, ob);
       double obC = iClose(_Symbol, PERIOD_H1, ob);
-      if(obC < obO) {   // bearish candle = valid bullish OB
-         g_BullOB_High = obO;
-         g_BullOB_Low  = obC;
-         g_BullOB_Time = iTime(_Symbol, PERIOD_H1, ob);
-         break;         // most recent OB found
-      }
+      if(obC >= obO) continue;                  // must be bearish
+      if((obO - obC) < minBody) continue;       // body too small = not a real OB
+      g_BullOB_High = obO;
+      g_BullOB_Low  = obC;
+      g_BullOB_Time = iTime(_Symbol, PERIOD_H1, ob);
+      break;
    }
 
    // --- BEARISH ORDER BLOCK: bullish H1 candle before a bearish impulse ---
@@ -1133,18 +1136,18 @@ void DetectOrderBlocks()
 
       double impOpen  = iOpen (_Symbol, PERIOD_H1, i);
       double impClose = iClose(_Symbol, PERIOD_H1, i - impulseLen + 1);
-      if((impOpen - impClose) / _Point / 10.0 < minPips) continue;
+      if((impOpen - impClose) / _Point / 10.0 < minImpulse) continue;
 
       int ob = i + 1;
       if(ob >= scanBars) continue;
       double obO = iOpen (_Symbol, PERIOD_H1, ob);
       double obC = iClose(_Symbol, PERIOD_H1, ob);
-      if(obC > obO) {   // bullish candle = valid bearish OB
-         g_BearOB_High = obC;
-         g_BearOB_Low  = obO;
-         g_BearOB_Time = iTime(_Symbol, PERIOD_H1, ob);
-         break;
-      }
+      if(obC <= obO) continue;                  // must be bullish
+      if((obC - obO) < minBody) continue;       // body too small = not a real OB
+      g_BearOB_High = obC;
+      g_BearOB_Low  = obO;
+      g_BearOB_Time = iTime(_Symbol, PERIOD_H1, ob);
+      break;
    }
 }
 

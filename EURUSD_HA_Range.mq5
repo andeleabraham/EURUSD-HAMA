@@ -17,30 +17,21 @@ CPositionInfo  posInfo;
 //=== INPUTS ===
 
 input group "=== LOT SIZING ==="
-input bool   AutoLotSize      = true;
-input double ManualLotSize    = 0.01;
+input bool   AutoLotSize      = false;   // OFF by default — user can enable for risk-based sizing
+input double ManualLotSize    = 0.01;    // Default for small accounts ($10+)
 input double MaxLotSize       = 0.10;   // Hard cap — protects against large early losses
-input double RiskPercent      = 2.0;    // Max risk per trade as % of balance (2% = professional standard)
+input double RiskPercent      = 2.0;    // Max risk per trade as % of balance (only when AutoLotSize=true)
 
 input group "=== RISK & PROFIT (per 0.01 lot baseline) ==="
-input double MaxLossUSD       = 2.50;   // Hard max loss before forced close — matches worst-case tier SL (per 0.01 lot)
-// Tier-based stop loss: wider SL for higher tiers so runners can breathe
-input double Tier1SL_USD      = 1.50;   // Scalp SL per 0.01 lot (15 pips) — tight for quick trades
-input double Tier2SL_USD      = 2.00;   // Swing SL per 0.01 lot (20 pips) — room for pullbacks
-input double Tier3SL_USD      = 2.50;   // Runner SL per 0.01 lot (25 pips) — needs breathing room
-// Tier system: the bot classifies each trade and auto-sets TP/lock/trail
-// Tier 1 (SCALP)  : mid-zone, sideways, weak ATR   → TP $1.50, lock $0.80, trail $0.25
-// Tier 2 (SWING)  : good zone, normal ATR, some confluence → TP $3.00, lock $1.50, trail $0.40
-// Tier 3 (RUNNER) : extreme zone, strong ATR, London/NY, pivot confluence → TP $5.00, lock $2.00, trail $0.60
-input double Tier1TP_USD      = 1.50;   // Scalp TP per 0.01 lot
-input double Tier1Lock_USD    = 0.80;   // Scalp lock threshold
-input double Tier1Trail_USD   = 0.25;   // Scalp trail gap
-input double Tier2TP_USD      = 3.00;   // Swing TP per 0.01 lot
-input double Tier2Lock_USD    = 1.50;   // Swing lock threshold
-input double Tier2Trail_USD   = 0.40;   // Swing trail gap
-input double Tier3TP_USD      = 5.00;   // Runner TP per 0.01 lot
-input double Tier3Lock_USD    = 2.00;   // Runner lock threshold
-input double Tier3Trail_USD   = 0.60;   // Runner trail gap
+input double MaxLossUSD       = 2.50;   // Hard max loss before forced close (per 0.01 lot)
+// Dynamic SL/TP: the bot finds structural SL (nearest invalidation) and calculates TP from R:R.
+// The SL is clamped within MinSL/MaxSL range. TP = SL × RRRatio.
+input double MinSL_USD        = 1.50;   // Minimum SL per 0.01 lot (15 pips) — won't go tighter
+input double MaxSL_USD        = 2.50;   // Maximum SL per 0.01 lot (25 pips) — won't go wider
+input double RRRatio          = 1.8;    // Reward:Risk ratio (1.8 = for every $1 risk, target $1.80)
+// Lock/trail are now proportional to the dynamic SL, not fixed per tier
+input double LockPct          = 0.60;   // Lock profit at 60% of TP — engage trailing stop
+input double TrailPct         = 0.20;   // Trail gap = 20% of TP — gives room to breathe
 // Mid-range time-exit: close if stalling below this profit after MidRangeMaxBars
 input double MidRangeStallUSD = 0.50;   // Close stalled trade if below this after stall period (per 0.01 lot)
 input int    MidRangeMaxBars  = 16;     // Tier 1 max hold before stall-exit check (bars, 16 = 4h)
@@ -87,6 +78,8 @@ input bool   UseSwingStructure   = true;   // Detect H1 swing highs/lows for BOS
 input bool   UseOrderBlocks      = true;   // Detect H1 institutional order blocks
 input bool   UseVolumeAnalysis   = true;   // Tick volume confirmation & divergence
 input bool   UseLiquiditySweep   = true;   // Detect stop-hunt sweeps at key levels
+input bool   UseFairValueGaps    = true;   // Detect and display M15/H1 Fair Value Gaps
+input double MinConfidence       = 60.0;   // Minimum confidence % to take a trade (0-100, 60=default)
 
 input group "=== RANGE ZONE FILTERS ==="
 // How far inside range boundaries before a trade is allowed (as % of total range)
@@ -178,7 +171,7 @@ bool   g_IsNearMid      = false;   // trade entered near midrange → tighter ta
 bool   g_IsMeanRev      = false;   // trade is a mean reversion setup
 int    g_OpenBarCount   = 0;       // bars elapsed since trade opened
 datetime g_TradeOpenTime = 0;
-int    g_TradeTier      = 2;       // 1=SCALP, 2=SWING, 3=RUNNER (set at entry)
+// Confidence system (replaces old tier system)
 
 // HA state machine
 bool   g_HABullSetup  = false;
@@ -218,6 +211,27 @@ bool   g_VolDivergence = false;              // price trending but volume declin
 // Order Blocks (institutional entry zones on H1)
 double g_BullOB_High = 0, g_BullOB_Low = 0; // last bear candle before bull impulse
 double g_BearOB_High = 0, g_BearOB_Low = 0; // last bull candle before bear impulse
+
+// Fair Value Gaps (FVG) — M15 imbalance zones
+struct FVGZone {
+   double high;       // upper edge of gap
+   double low;        // lower edge of gap
+   int    dir;        // 1=bullish FVG (gap up), -1=bearish FVG (gap down)
+   datetime created;  // when detected
+   bool   filled;     // true once price has traded through the gap
+};
+FVGZone g_FVGs[];                          // active FVG array
+int     g_FVGCount        = 0;             // number of active FVGs
+bool    g_NearBullFVG     = false;         // price near a bullish FVG (expect support)
+bool    g_NearBearFVG     = false;         // price near a bearish FVG (expect resistance)
+double  g_NearestFVGHigh  = 0;             // nearest FVG zone high
+double  g_NearestFVGLow   = 0;             // nearest FVG zone low
+int     g_NearestFVGDir   = 0;             // direction of nearest FVG
+
+// Confidence model output (replaces tier system)
+double g_Confidence       = 0;             // 0-100% confidence score for current setup
+double g_DynamicSL_USD    = 2.0;           // structural SL for current setup (per 0.01 lot)
+double g_DynamicTP_USD    = 3.6;           // calculated TP = SL × RRRatio (per 0.01 lot)
 
 // Fibonacci & Pivot levels (recalculated each day/session)
 double g_PivotPP  = 0, g_PivotR1 = 0, g_PivotS1 = 0;
@@ -274,14 +288,26 @@ void RestoreExistingTrade()
       g_IsMeanRev = (StringFind(comment, "MRV") >= 0);
       g_IsNearMid = g_IsMeanRev;   // MRV is always mid-context; trend zone not recoverable
 
-      // Recover tier from comment if present (tag ends with _T1/_T2/_T3)
-      int tierIdx = StringFind(comment, "_T3");
-      if(tierIdx >= 0) g_TradeTier = 3;
-      else if(StringFind(comment, "_T1") >= 0) g_TradeTier = 1;
-      else g_TradeTier = 2;  // default to Tier 2 if unknown
+      // Recover confidence-based SL/TP from comment or use defaults
+      // New comment format: ...C75_SL2.00_TP3.60
+      g_DynamicSL_USD = MaxSL_USD;   // safe default
+      g_DynamicTP_USD = MaxSL_USD * RRRatio;
+      int slIdx = StringFind(comment, "_SL");
+      int tpIdx = StringFind(comment, "_TP");
+      if(slIdx >= 0 && tpIdx >= 0) {
+         g_DynamicSL_USD = StringToDouble(StringSubstr(comment, slIdx + 3, tpIdx - slIdx - 3));
+         g_DynamicTP_USD = StringToDouble(StringSubstr(comment, tpIdx + 3));
+      }
+      // Also try to recover confidence
+      int cIdx = StringFind(comment, "C");
+      if(cIdx >= 0) {
+         string cStr = StringSubstr(comment, cIdx + 1, 3);
+         double cVal = StringToDouble(cStr);
+         if(cVal > 0 && cVal <= 100) g_Confidence = cVal;
+      }
 
-      // Rebuild scaled USD thresholds for the recovered tier
-      SetScaledThresholds(lot, g_TradeTier);
+      // Rebuild scaled USD thresholds from recovered SL/TP
+      SetScaledThresholds(lot);
 
       // Restore peak profit and lock flag
       g_PeakProfit   = (profit > 0.0) ? profit : 0.0;
@@ -377,6 +403,7 @@ void OnDeinit(const int reason)
 {
    ObjectsDeleteAll(0, DASH_PREFIX);
    ObjectsDeleteAll(0, "HABOT_LVL_");
+   ObjectsDeleteAll(0, "HABOT_FVG_");
    Comment("");
 }
 
@@ -490,6 +517,7 @@ void OnTick()
       if(UseOrderBlocks)     DetectOrderBlocks();
       if(UseVolumeAnalysis)  AnalyzeVolume();
       if(UseLiquiditySweep)  DetectLiquiditySweep();
+      if(UseFairValueGaps)   { DetectFairValueGaps(); DrawFVGZones(); }
 
       EvaluateHAPattern();
    }
@@ -1096,6 +1124,164 @@ void DetectOrderBlocks()
 }
 
 //+------------------------------------------------------------------+
+//| FAIR VALUE GAP (FVG) DETECTION — M15                              |
+//| An FVG is a 3-candle pattern where the middle candle's body      |
+//| creates a gap between candle 1's wick and candle 3's wick.       |
+//| Bullish FVG: bar3.high < bar1.low (gap up = demand zone)        |
+//| Bearish FVG: bar3.low  > bar1.high (gap down = supply zone)     |
+//| Price tends to return to fill these gaps — key institutional     |
+//| reference points for entries and targets.                        |
+//+------------------------------------------------------------------+
+void DetectFairValueGaps()
+{
+   // Mark existing FVGs as filled if price has traded through them
+   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   for(int f = 0; f < g_FVGCount; f++) {
+      if(g_FVGs[f].filled) continue;
+      // Bullish FVG filled when price drops into the gap
+      if(g_FVGs[f].dir == 1 && bid <= g_FVGs[f].high && bid >= g_FVGs[f].low)
+         g_FVGs[f].filled = true;
+      // Bearish FVG filled when price rises into the gap
+      if(g_FVGs[f].dir == -1 && bid >= g_FVGs[f].low && bid <= g_FVGs[f].high)
+         g_FVGs[f].filled = true;
+      // Expire FVGs older than 48 hours
+      if(TimeCurrent() - g_FVGs[f].created > 48 * 3600)
+         g_FVGs[f].filled = true;
+   }
+
+   // Scan last 30 M15 bars for new FVGs (only check confirmed bars 1+)
+   int scanBars = 30;
+   double minGapPips = 3.0;  // minimum gap size to be significant
+   double minGap = minGapPips * _Point * 10;
+
+   for(int i = 2; i < scanBars; i++)
+   {
+      // 3-candle pattern: bar i+1 (oldest), bar i (middle), bar i-1 (newest)
+      double bar1_high = iHigh(_Symbol, PERIOD_M15, i + 1);  // oldest
+      double bar1_low  = iLow (_Symbol, PERIOD_M15, i + 1);
+      double bar3_high = iHigh(_Symbol, PERIOD_M15, i - 1);  // newest
+      double bar3_low  = iLow (_Symbol, PERIOD_M15, i - 1);
+
+      // Bullish FVG: bar3's low > bar1's high (gap between them = demand)
+      if(bar3_low > bar1_high + minGap) {
+         double gapHigh = bar3_low;
+         double gapLow  = bar1_high;
+         datetime gapTime = iTime(_Symbol, PERIOD_M15, i);
+         if(!FVGExists(gapHigh, gapLow, 1)) {
+            AddFVG(gapHigh, gapLow, 1, gapTime);
+         }
+      }
+
+      // Bearish FVG: bar3's high < bar1's low (gap between them = supply)
+      if(bar3_high < bar1_low - minGap) {
+         double gapHigh = bar1_low;
+         double gapLow  = bar3_high;
+         datetime gapTime = iTime(_Symbol, PERIOD_M15, i);
+         if(!FVGExists(gapHigh, gapLow, -1)) {
+            AddFVG(gapHigh, gapLow, -1, gapTime);
+         }
+      }
+   }
+
+   // Clean up filled FVGs — compress array
+   int writeIdx = 0;
+   for(int f = 0; f < g_FVGCount; f++) {
+      if(!g_FVGs[f].filled) {
+         if(writeIdx != f) g_FVGs[writeIdx] = g_FVGs[f];
+         writeIdx++;
+      }
+   }
+   g_FVGCount = writeIdx;
+
+   // Determine if price is near any active FVG
+   g_NearBullFVG = false;
+   g_NearBearFVG = false;
+   g_NearestFVGHigh = 0;
+   g_NearestFVGLow  = 0;
+   g_NearestFVGDir  = 0;
+   double nearestDist = 99999;
+   double proxPips = 5.0 * _Point * 10;  // within 5 pips of FVG edge
+
+   for(int f = 0; f < g_FVGCount; f++) {
+      double mid = (g_FVGs[f].high + g_FVGs[f].low) / 2.0;
+      double dist = MathAbs(bid - mid);
+
+      // "Near" = price within 5 pips of FVG zone, or inside it
+      bool inside = (bid >= g_FVGs[f].low - proxPips && bid <= g_FVGs[f].high + proxPips);
+      if(inside && dist < nearestDist) {
+         nearestDist      = dist;
+         g_NearestFVGHigh = g_FVGs[f].high;
+         g_NearestFVGLow  = g_FVGs[f].low;
+         g_NearestFVGDir  = g_FVGs[f].dir;
+         if(g_FVGs[f].dir == 1)  g_NearBullFVG = true;
+         if(g_FVGs[f].dir == -1) g_NearBearFVG = true;
+      }
+   }
+}
+
+bool FVGExists(double high, double low, int dir)
+{
+   double tol = 1.0 * _Point * 10;
+   for(int f = 0; f < g_FVGCount; f++) {
+      if(g_FVGs[f].dir == dir &&
+         MathAbs(g_FVGs[f].high - high) < tol &&
+         MathAbs(g_FVGs[f].low  - low)  < tol)
+         return true;
+   }
+   return false;
+}
+
+void AddFVG(double high, double low, int dir, datetime created)
+{
+   if(g_FVGCount >= ArraySize(g_FVGs))
+      ArrayResize(g_FVGs, g_FVGCount + 10);
+   g_FVGs[g_FVGCount].high    = high;
+   g_FVGs[g_FVGCount].low     = low;
+   g_FVGs[g_FVGCount].dir     = dir;
+   g_FVGs[g_FVGCount].created = created;
+   g_FVGs[g_FVGCount].filled  = false;
+   g_FVGCount++;
+}
+
+//+------------------------------------------------------------------+
+//| DRAW FVG ZONES ON CHART as semi-transparent rectangles           |
+//+------------------------------------------------------------------+
+void DrawFVGZones()
+{
+   // Remove old FVG rectangles
+   for(int i = ObjectsTotal(0, 0) - 1; i >= 0; i--) {
+      string name = ObjectName(0, i, 0);
+      if(StringFind(name, "HABOT_FVG_") == 0)
+         ObjectDelete(0, name);
+   }
+
+   // Draw active FVGs
+   for(int f = 0; f < g_FVGCount; f++) {
+      string name = "HABOT_FVG_" + IntegerToString(f);
+      datetime t1 = g_FVGs[f].created;
+      datetime t2 = TimeCurrent() + 3600;   // extend to current time + 1h
+
+      if(ObjectFind(0, name) < 0)
+         ObjectCreate(0, name, OBJ_RECTANGLE, 0, t1, g_FVGs[f].high, t2, g_FVGs[f].low);
+      else {
+         ObjectSetInteger(0, name, OBJPROP_TIME, 0, t1);
+         ObjectSetDouble (0, name, OBJPROP_PRICE, 0, g_FVGs[f].high);
+         ObjectSetInteger(0, name, OBJPROP_TIME, 1, t2);
+         ObjectSetDouble (0, name, OBJPROP_PRICE, 1, g_FVGs[f].low);
+      }
+
+      color fvgClr = (g_FVGs[f].dir == 1) ? clrDodgerBlue : clrCrimson;
+      ObjectSetInteger(0, name, OBJPROP_COLOR, fvgClr);
+      ObjectSetInteger(0, name, OBJPROP_STYLE, STYLE_SOLID);
+      ObjectSetInteger(0, name, OBJPROP_WIDTH, 1);
+      ObjectSetInteger(0, name, OBJPROP_FILL,  true);
+      ObjectSetInteger(0, name, OBJPROP_BACK,  true);
+      ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
+      ObjectSetString (0, name, OBJPROP_TEXT, (g_FVGs[f].dir == 1 ? "Bull FVG" : "Bear FVG"));
+   }
+}
+
+//+------------------------------------------------------------------+
 //| HEIKEN ASHI CALCULATION for bar at index idx                     |
 //+------------------------------------------------------------------+
 void CalcHA(int idx, double &haO, double &haH, double &haL, double &haC)
@@ -1230,140 +1416,260 @@ string NearFibPivotLevel(double price)
 }
 
 //+------------------------------------------------------------------+
-//| TRADE TIER CLASSIFICATION                                        |
-//| Scores the setup quality using ATR, session, zone, confluence,  |
-//| bias alignment —  returns 1 (SCALP), 2 (SWING), or 3 (RUNNER)   |
+//| CONFIDENCE-BASED PROBABILITY MODEL                               |
+//| Scores how likely a setup is to succeed on a 0-100 scale.       |
+//| Combines every analysis dimension into a weighted probability.  |
+//| This replaces the old tier (1/2/3) classification.              |
+//|                                                                  |
+//| Factor weights (sum = 100):                                      |
+//|  1. HA Pattern:      15  (clean consecutive candles)            |
+//|  2. Session Quality: 10  (London/NY overlap = best)             |
+//|  3. Zone Position:   10  (trade from extreme toward mid)        |
+//|  4. Confluence:      10  (near Fib/Pivot level)                 |
+//|  5. Bias Alignment:   5  (trade with market bias)               |
+//|  6. Range Room:      10  (enough room for TP target)            |
+//|  7. ATR Volatility:  10  (enough movement to reach target)      |
+//|  8. Swing Structure: 10  (BOS/CHoCH alignment)                 |
+//|  9. Volume:           5  (institutional activity confirms)      |
+//| 10. Liquidity Sweep: 10  (stop hunt reversal = highest edge)    |
+//| 11. Order Block:      5  (inside institutional zone)            |
+//| 12. Fair Value Gap:  10  (FVG support/resistance)               |
+//|                ──────── = 110 raw, normalized to 100             |
+//| Penalties reduce score: sideways, counter-trend, divergence     |
 //+------------------------------------------------------------------+
-int CalcTradeTier(int tradeDir, string zone, bool isMeanRev, bool isSideways, string nearLevel)
+double CalcConfidence(int tradeDir, string zone, bool isMeanRev, bool isSideways, string nearLevel)
 {
-   int score = 0;   // accumulate evidence; will map to tier at the end
+   double conf = 0;   // accumulate weighted confidence
 
-   // --- 1. ATR STRENGTH ---
-   // H1 ATR for EURUSD typically 5-15 pips quiet, 15-25 pips active, 25+ volatile
-   double atrPips = (g_ATR > 0) ? (g_ATR / _Point / 10.0) : 10.0;
-   if(atrPips >= 20.0)      score += 3;   // strong volatility = room to move
-   else if(atrPips >= 12.0)  score += 2;   // normal
-   else if(atrPips >= 7.0)   score += 1;   // mild
-   // < 7 = dead market, no points
+   // --- 1. HA PATTERN QUALITY (0-15) ---
+   // Consecutive HA candles in trade direction = trend strength
+   // g_HAConsecCount is already set by EvaluateHAPattern for the active signal direction
+   int consec = g_HAConsecCount;
+   if(consec >= 5)      conf += 15.0;   // very strong HA trend
+   else if(consec >= 4) conf += 12.0;
+   else if(consec >= 3) conf += 9.0;    // minimum pattern
+   else if(consec >= 2) conf += 5.0;    // early entry (if EarlyEntry on)
+   // 0-1 consecutive = very weak, no points
 
-   // --- 2. SESSION --- (London/NY overlap = best, Asian = worst)
+   // --- 2. SESSION QUALITY (0-10) ---
    MqlDateTime dt;
    TimeToStruct(TimeCurrent(), dt);
    int h = dt.hour;
    bool isLondon  = (h >= LondonStartHour  && h < LondonEndHour);
    bool isNY      = (h >= NewYorkStartHour && h < NewYorkEndHour);
    bool isOverlap = isLondon && isNY;   // 13:00-16:00 = prime time
-   if(isOverlap)       score += 3;
-   else if(isNY)       score += 2;
-   else if(isLondon)   score += 2;
-   // Asian or off-hours: +0
+   if(isOverlap)       conf += 10.0;
+   else if(isNY)       conf += 7.0;
+   else if(isLondon)   conf += 7.0;
+   else                conf += 2.0;  // Asian/off-hours: minimal
 
-   // --- 3. ZONE POSITION --- (trade FROM extreme TOWARD mid/opposite = most room)
-   if(zone == "LOWER_THIRD" && tradeDir == 1)   score += 2;  // buy from low  = great
-   if(zone == "UPPER_THIRD" && tradeDir == -1)  score += 2;  // sell from high = great
-   if(zone == "MID_ZONE")                        score -= 1;  // mid = limited runway
+   // --- 3. ZONE POSITION (0-10) ---
+   if(zone == "LOWER_THIRD" && tradeDir == 1)   conf += 10.0;  // buy from low
+   else if(zone == "UPPER_THIRD" && tradeDir == -1)  conf += 10.0;  // sell from high
+   else if(zone == "LOWER_THIRD" && tradeDir == -1)  conf += 3.0;   // sell from low (risky)
+   else if(zone == "UPPER_THIRD" && tradeDir == 1)   conf += 3.0;   // buy from high (risky)
+   else if(zone == "MID_ZONE")   conf += 1.0;   // mid = limited runway
 
-   // --- 4. CONFLUENCE --- (near a pivot/fib level)
-   if(nearLevel != "")  score += 2;
+   // --- 4. CONFLUENCE — near a Fib/Pivot level (0-10) ---
+   if(nearLevel != "")  conf += 10.0;
 
-   // --- 5. BIAS ALIGNMENT --- (trade direction matches bias)
-   if(tradeDir == 1  && g_TotalBias >= 1)   score += 1;
-   if(tradeDir == -1 && g_TotalBias <= -1)  score += 1;
-   if(tradeDir == 1  && g_TotalBias <= -2)  score -= 1;  // counter-trend penalty
-   if(tradeDir == -1 && g_TotalBias >= 2)   score -= 1;
+   // --- 5. BIAS ALIGNMENT (0-5, can go negative) ---
+   if(tradeDir == 1  && g_TotalBias >= 2)   conf += 5.0;   // strong bull bias + buy
+   else if(tradeDir == 1  && g_TotalBias >= 1)  conf += 3.0;
+   else if(tradeDir == -1 && g_TotalBias <= -2) conf += 5.0;   // strong bear bias + sell
+   else if(tradeDir == -1 && g_TotalBias <= -1) conf += 3.0;
+   // Counter-trend penalty
+   if(tradeDir == 1  && g_TotalBias <= -2) conf -= 5.0;
+   if(tradeDir == -1 && g_TotalBias >= 2)  conf -= 5.0;
 
-   // --- 6. RANGE ROOM --- how much of the range can this trade travel?
+   // --- 6. RANGE ROOM (0-10) ---
    if(g_RangeHigh > 0 && g_RangeLow > 0) {
-      double rangeSize = g_RangeHigh - g_RangeLow;
       double bid       = SymbolInfoDouble(_Symbol, SYMBOL_BID);
       double roomForBuy = g_RangeHigh - bid;
       double roomForSell = bid - g_RangeLow;
       double room = (tradeDir == 1) ? roomForBuy : roomForSell;
       double roomPips = room / _Point / 10.0;
-      if(roomPips >= 30.0)      score += 2;   // 30+ pips to next boundary = runner
-      else if(roomPips >= 15.0)  score += 1;   // decent room
-      // < 15 pips room = don't add points
+      if(roomPips >= 40.0)      conf += 10.0;  // massive room
+      else if(roomPips >= 25.0) conf += 7.0;
+      else if(roomPips >= 15.0) conf += 4.0;
+      else                      conf += 1.0;   // tight
    }
 
-   // --- 7. MEAN REVERSION BONUS ---
-   // MRV from extreme = bounce plays often travel to mid = good for $2-3
-   if(isMeanRev && zone != "MID_ZONE")  score += 1;
+   // --- 7. ATR VOLATILITY (0-10) ---
+   double atrPips = (g_ATR > 0) ? (g_ATR / _Point / 10.0) : 10.0;
+   if(atrPips >= 25.0)      conf += 10.0;  // very strong volatility
+   else if(atrPips >= 15.0) conf += 7.0;
+   else if(atrPips >= 10.0) conf += 5.0;
+   else if(atrPips >= 7.0)  conf += 3.0;
+   // < 7 = dead market, minimal confidence
 
-   // --- 8. SIDEWAYS PENALTY ---
-   if(isSideways)  score -= 2;
-
-   // --- 9. MARKET STRUCTURE ALIGNMENT (H1 swing points) ---
+   // --- 8. SWING STRUCTURE (0-10) ---
    bool structAligned = false;
    if(UseSwingStructure) {
-      if(g_StructureLabel == "BULLISH" && tradeDir == 1)  { score += 1; structAligned = true; }
-      if(g_StructureLabel == "BEARISH" && tradeDir == -1) { score += 1; structAligned = true; }
-      // Counter-structure penalty (trading against the trend)
-      if(g_StructureLabel == "BULLISH" && tradeDir == -1)  score -= 1;
-      if(g_StructureLabel == "BEARISH" && tradeDir == 1)   score -= 1;
-      // Break of Structure = strong continuation signal
-      if(g_BOS && structAligned)  score += 1;
+      if(g_StructureLabel == "BULLISH" && tradeDir == 1)  { conf += 5.0; structAligned = true; }
+      if(g_StructureLabel == "BEARISH" && tradeDir == -1) { conf += 5.0; structAligned = true; }
+      // Counter-structure penalty
+      if(g_StructureLabel == "BULLISH" && tradeDir == -1)  conf -= 5.0;
+      if(g_StructureLabel == "BEARISH" && tradeDir == 1)   conf -= 5.0;
+      // BOS = strong continuation, CHoCH = reversal confirmed
+      if(g_BOS && structAligned)   conf += 5.0;
+      if(g_CHoCH && structAligned) conf += 3.0;
    }
 
-   // --- 10. VOLUME CONFIRMATION ---
+   // --- 9. VOLUME CONFIRMATION (0-5) ---
    if(UseVolumeAnalysis) {
-      if(g_VolumeState == "HIGH")       score += 2;   // heavy activity = institutional interest
-      else if(g_VolumeState == "ABOVE_AVG") score += 1;
-      else if(g_VolumeState == "LOW")   score -= 1;   // dead volume = low conviction
-      if(g_VolDivergence)               score -= 1;   // weakening trend
+      if(g_VolumeState == "HIGH")           conf += 5.0;
+      else if(g_VolumeState == "ABOVE_AVG") conf += 3.0;
+      else if(g_VolumeState == "LOW")       conf -= 3.0;  // dead volume
+      if(g_VolDivergence)                   conf -= 3.0;  // weakening
    }
 
-   // --- 11. LIQUIDITY SWEEP ---
-   // A sweep = price hunted stops then reversed.  If sweep direction matches
-   // our trade → very high conviction setup (institutions repositioning).
+   // --- 10. LIQUIDITY SWEEP (0-10) ---
+   // Sweep = institutions hunted stops, then reversed. If sweep matches our
+   // direction, this is the HIGHEST-EDGE setup pattern in smart money.
    if(UseLiquiditySweep && g_LiquiditySweep) {
-      if(g_SweepDir == tradeDir)  score += 3;
+      if(g_SweepDir == tradeDir)  conf += 10.0;  // aligned sweep = maximum edge
+      else                         conf -= 3.0;   // sweep against us = danger
    }
 
-   // --- 12. ORDER BLOCK PROXIMITY ---
-   // Price sitting inside an institutional order block = strong S/R zone
+   // --- 11. ORDER BLOCK PROXIMITY (0-5) ---
    bool nearOB = false;
    if(UseOrderBlocks) {
-      double obTol = 3.0 * _Point * 10;   // 3-pip tolerance around OB zone
+      double obTol = 3.0 * _Point * 10;
       double bidNow = SymbolInfoDouble(_Symbol, SYMBOL_BID);
       if(tradeDir == 1 && g_BullOB_High > 0) {
          if(bidNow >= g_BullOB_Low - obTol && bidNow <= g_BullOB_High + obTol) {
-            score += 2;  nearOB = true;
+            conf += 5.0; nearOB = true;
          }
       }
       if(tradeDir == -1 && g_BearOB_High > 0) {
          if(bidNow >= g_BearOB_Low - obTol && bidNow <= g_BearOB_High + obTol) {
-            score += 2;  nearOB = true;
+            conf += 5.0; nearOB = true;
          }
       }
    }
 
-   // --- MAP SCORE TO TIER ---
-   // score <= 3  : SCALP (tier 1)  — low conviction, take $1-1.50 and go
-   // score 4-7   : SWING (tier 2)  — normal trade, target $2-3
-   // score >= 10 : RUNNER (tier 3) — only the strongest setups get to run
-   int tier;
-   if(score >= 10)      tier = 3;   // raised from 8 — T3 must have overwhelming evidence
-   else if(score >= 4)  tier = 2;
-   else                 tier = 1;
-
-   // --- MRV CAP: mean reversion bounces are NOT breakout runners ---
-   // MRV = bounce from extreme toward mid. It's capped by the range.
-   // These should never be T3 runners targeting $5.
-   if(isMeanRev && tier == 3) {
-      tier = 2;
-      Print("MRV capped at T2: mean reversion bounces don't run to $5");
+   // --- 12. FAIR VALUE GAP (0-10) ---
+   bool nearFVG = false;
+   if(UseFairValueGaps) {
+      // Bullish FVG near price supports a buy; bearish FVG supports a sell
+      if(tradeDir == 1 && g_NearBullFVG) { conf += 10.0; nearFVG = true; }
+      if(tradeDir == -1 && g_NearBearFVG) { conf += 10.0; nearFVG = true; }
+      // Opposing FVG = headwind
+      if(tradeDir == 1 && g_NearBearFVG && !g_NearBullFVG) conf -= 3.0;
+      if(tradeDir == -1 && g_NearBullFVG && !g_NearBearFVG) conf -= 3.0;
    }
 
-   Print("TRADE TIER: ", tier, " (score=", score, ")",
-         " ATR:", DoubleToString(atrPips,1), "pip",
-         " Sess:", (isOverlap?"OVERLAP":isLondon?"LONDON":isNY?"NY":"OTHER"),
-         " Zone:", zone, " Cnfl:", (nearLevel==""?"none":nearLevel),
-         " Struct:", g_StructureLabel, (g_BOS?" BOS":""), (g_CHoCH?" CHoCH":""),
-         " Vol:", g_VolumeState, " Sweep:", (g_LiquiditySweep ? g_SweepLevel : "none"),
-         " OB:", (nearOB?"YES":"no"),
-         " Bias:", g_TotalBias, " MRV:", isMeanRev);
+   // --- PENALTIES ---
+   if(isSideways)  conf -= 8.0;   // choppy market = unreliable signals
+   if(isMeanRev)   conf -= 3.0;   // MRV = limited runway, lower confidence
 
-   return tier;
+   // Clamp to 0-100
+   conf = MathMax(0, MathMin(100, conf));
+
+   // Store globally for dashboard and entry logic
+   g_Confidence = conf;
+
+   Print("CONFIDENCE: ", DoubleToString(conf, 1), "%",
+         " HA:", consec,
+         " ATR:", DoubleToString(atrPips, 1), "pip",
+         " Sess:", (isOverlap ? "OVERLAP" : isLondon ? "LONDON" : isNY ? "NY" : "OTHER"),
+         " Zone:", zone,
+         " Cnfl:", (nearLevel == "" ? "none" : nearLevel),
+         " Struct:", g_StructureLabel, (g_BOS ? " BOS" : ""), (g_CHoCH ? " CHoCH" : ""),
+         " Vol:", g_VolumeState, (g_VolDivergence ? " DIV" : ""),
+         " Sweep:", (g_LiquiditySweep ? g_SweepLevel : "none"),
+         " OB:", (nearOB ? "YES" : "no"),
+         " FVG:", (nearFVG ? (g_NearestFVGDir == 1 ? "BULL" : "BEAR") : "none"),
+         " Bias:", g_TotalBias,
+         " MRV:", isMeanRev, " Side:", isSideways);
+
+   return conf;
+}
+
+//+------------------------------------------------------------------+
+//| STRUCTURAL STOP-LOSS CALCULATION                                 |
+//| Finds the nearest invalidation level behind our entry.          |
+//| For BUY: SL below nearest support (swing low, bull OB low, FVG)|
+//| For SELL: SL above nearest resistance (swing high, bear OB)    |
+//| Returns SL distance in USD per 0.01 lot, clamped to min/max.   |
+//+------------------------------------------------------------------+
+double CalcStructuralSL(int tradeDir)
+{
+   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   double entry = (tradeDir == 1) ? ask : bid;
+
+   // Collect invalidation levels
+   double levels[];
+   int cnt = 0;
+   ArrayResize(levels, 20);
+
+   if(tradeDir == 1) {
+      // BUY invalidation: supports BELOW entry
+      if(g_SwingLow1 > 0 && g_SwingLow1 < entry) levels[cnt++] = g_SwingLow1;
+      if(g_SwingLow2 > 0 && g_SwingLow2 < entry) levels[cnt++] = g_SwingLow2;
+      if(g_BullOB_Low > 0 && g_BullOB_Low < entry) levels[cnt++] = g_BullOB_Low;
+      if(g_RangeLow > 0 && g_RangeLow < entry) levels[cnt++] = g_RangeLow;
+      if(g_AsianLow > 0 && g_AsianLow < entry) levels[cnt++] = g_AsianLow;
+      // FVG lows (bullish FVGs below = demand support)
+      for(int f = 0; f < g_FVGCount; f++) {
+         if(g_FVGs[f].dir == 1 && g_FVGs[f].low < entry && g_FVGs[f].low > 0)
+            levels[cnt++] = g_FVGs[f].low;
+      }
+   } else {
+      // SELL invalidation: resistance ABOVE entry
+      if(g_SwingHigh1 > 0 && g_SwingHigh1 > entry) levels[cnt++] = g_SwingHigh1;
+      if(g_SwingHigh2 > 0 && g_SwingHigh2 > entry) levels[cnt++] = g_SwingHigh2;
+      if(g_BearOB_High > 0 && g_BearOB_High > entry) levels[cnt++] = g_BearOB_High;
+      if(g_RangeHigh > 0 && g_RangeHigh > entry) levels[cnt++] = g_RangeHigh;
+      if(g_AsianHigh > 0 && g_AsianHigh > entry) levels[cnt++] = g_AsianHigh;
+      // FVG highs (bearish FVGs above = supply resistance)
+      for(int f = 0; f < g_FVGCount; f++) {
+         if(g_FVGs[f].dir == -1 && g_FVGs[f].high > entry && g_FVGs[f].high > 0)
+            levels[cnt++] = g_FVGs[f].high;
+      }
+   }
+
+   // Find the NEAREST invalidation level (smallest distance from entry)
+   double bestDist = 99999;
+   double pipValue = _Point * 10;
+   double minSLdist = MinSL_USD / 10.0;  // convert USD/0.01lot to price distance
+   double maxSLdist = MaxSL_USD / 10.0;
+
+   for(int i = 0; i < cnt; i++) {
+      double dist = MathAbs(entry - levels[i]);
+      if(dist < minSLdist * 0.5) continue;  // too close, skip (would give SL < min)
+      if(dist < bestDist) bestDist = dist;
+   }
+
+   // If no structural level found, use ATR-based fallback
+   if(bestDist >= 99000) {
+      double atrDist = (g_ATR > 0) ? g_ATR * 1.5 : 20 * pipValue;
+      bestDist = atrDist;
+   }
+
+   // Add a small buffer beyond the structural level (2 pips)
+   bestDist += 2.0 * pipValue;
+
+   // Convert price distance to USD per 0.01 lot
+   // For EURUSD: 1 pip = $0.10 per 0.01 lot
+   double slPips = bestDist / pipValue;
+   double slUSD  = slPips * 0.10;   // $0.10 per pip per 0.01 lot
+
+   // Clamp to user limits
+   slUSD = MathMax(MinSL_USD, MathMin(MaxSL_USD, slUSD));
+
+   // Store globally
+   g_DynamicSL_USD = slUSD;
+   g_DynamicTP_USD = slUSD * RRRatio;   // TP = SL × R:R
+
+   Print("STRUCTURAL SL: $", DoubleToString(slUSD, 2), "/0.01lot",
+         " (", DoubleToString(slPips, 1), " pips)",
+         " TP: $", DoubleToString(g_DynamicTP_USD, 2),
+         " R:R=1:", DoubleToString(RRRatio, 1));
+
+   return slUSD;
 }
 
 //+------------------------------------------------------------------+
@@ -1380,7 +1686,7 @@ double FindNextTargetLevel(double entryPrice, int tradeDir)
    // Collect all known levels
    double levels[];
    int    cnt = 0;
-   ArrayResize(levels, 30);
+   ArrayResize(levels, 60);
 
    if(UseDailyPivot && g_PivotPP > 0) {
       levels[cnt++] = g_PivotPP;
@@ -1415,6 +1721,12 @@ double FindNextTargetLevel(double entryPrice, int tradeDir)
    if(g_AsianLow  > 0) levels[cnt++] = g_AsianLow;
    if(g_LondonHigh > 0) levels[cnt++] = g_LondonHigh;
    if(g_LondonLow  > 0) levels[cnt++] = g_LondonLow;
+   // Fair Value Gap edges (institutional imbalance = magnets)
+   for(int f = 0; f < g_FVGCount; f++) {
+      if(cnt >= ArraySize(levels) - 2) break;
+      levels[cnt++] = g_FVGs[f].high;
+      levels[cnt++] = g_FVGs[f].low;
+   }
 
    for(int i = 0; i < cnt; i++) {
       double lvl = levels[i];
@@ -1799,10 +2111,10 @@ double CalcLot()
    if(!AutoLotSize) return NormalizeDouble(ManualLotSize, 2);
    double bal = AccountInfoDouble(ACCOUNT_BALANCE);
    // Risk-based position sizing: risk RiskPercent% of balance per trade
-   // Uses the worst-case (largest) tier SL to ensure we never over-risk
+   // Uses MaxSL_USD as the worst-case SL to ensure we never over-risk
    double riskUSD = bal * RiskPercent / 100.0;
-   double worstSL = MathMax(Tier1SL_USD, MathMax(Tier2SL_USD, Tier3SL_USD));
-   if(worstSL <= 0) worstSL = 1.50;  // safety fallback
+   double worstSL = MaxSL_USD;
+   if(worstSL <= 0) worstSL = 2.50;  // safety fallback
    double lot = (riskUSD / worstSL) * 0.01;
    lot = MathFloor(lot * 100.0) / 100.0;  // round DOWN to nearest 0.01
    if(lot < 0.01) lot = 0.01;
@@ -2016,73 +2328,78 @@ void TryEntry()
          Print("Confluence level nearby: ", lvlName);
    }
 
-   // === TRADE TIER CLASSIFICATION ===
-   // Scores the setup and assigns optimal TP/lock/trail
+   // === CONFIDENCE-BASED PROBABILITY MODEL ===
+   // Scores the setup 0-100% and computes dynamic SL/TP
    bool isMidContext = (zone == "MID_ZONE" || isSideways);
-   int tier = CalcTradeTier(tradeDir, zone, isMeanRev, isSideways, g_NearLevel);
+   double confidence = CalcConfidence(tradeDir, zone, isMeanRev, isSideways, g_NearLevel);
+
+   // === CONFIDENCE GATE — reject low-probability setups ===
+   if(confidence < MinConfidence) {
+      Print("ENTRY REJECTED: confidence ", DoubleToString(confidence, 1),
+            "% < min ", DoubleToString(MinConfidence, 1), "%");
+      return;
+   }
+
+   // === STRUCTURAL STOP-LOSS ===
+   double slBase = CalcStructuralSL(tradeDir);  // sets g_DynamicSL_USD, g_DynamicTP_USD
 
    // === ATR-INFORMED TP BOOST ===
-   // If ATR says there is room beyond the tier TP, extend the broker TP
-   // to the next structural level (pivot, fib, range boundary)
-   double baseTpUSD = (tier == 3) ? Tier3TP_USD :
-                      (tier == 2) ? Tier2TP_USD : Tier1TP_USD;
+   // If a structural level is closer than R:R-derived TP, use that;
+   // if a level is further and within reach, extend TP
+   double baseTpUSD = g_DynamicTP_USD;  // SL × RRRatio (from CalcStructuralSL)
    double targetLvl = FindNextTargetLevel(price, tradeDir);
    if(targetLvl > 0) {
       double targetDist = MathAbs(targetLvl - price);
       double targetPips = targetDist / _Point / 10.0;
-      // Convert target distance to USD per 0.01 lot
-      // For EURUSD: 1 pip = $0.10 per 0.01 lot
       double targetUSD  = targetPips * 0.10;
-      // If the structural target gives more than the tier TP, use it (capped at $6)
+      // If the structural target gives more than R:R TP, use it (capped at $6/0.01)
       if(targetUSD > baseTpUSD && targetUSD <= 6.0) {
          Print("TP EXTENDED to structural level: $", DoubleToString(targetUSD, 2),
                " (at ", DoubleToString(targetLvl, 5), ", ", DoubleToString(targetPips, 1), " pips)");
          baseTpUSD = targetUSD;
+         g_DynamicTP_USD = baseTpUSD;
       }
    }
 
-   // Tier-based SL: scalps tight, swings moderate, runners wide
-   double slBase   = (tier == 3) ? Tier3SL_USD : (tier == 2) ? Tier2SL_USD : Tier1SL_USD;
-   double slUSD    = slBase * scale;
-   double tpUSD    = baseTpUSD * scale;
+   // Scale SL/TP by lot size
+   double slUSD = g_DynamicSL_USD * scale;
+   double tpUSD = baseTpUSD * scale;
 
    double slDist = USDtoPoints(slUSD, lot);
    double tpDist = USDtoPoints(tpUSD, lot);
    if(slDist < minStop + _Point * 5) slDist = minStop + _Point * 5;
    if(tpDist < minStop + _Point * 5) tpDist = minStop + _Point * 5;
 
-   string tierLabel = (tier == 3) ? "RUNNER" : (tier == 2) ? "SWING" : "SCALP";
+   // Build comment tag with confidence and SL/TP for recovery
+   string confStr = IntegerToString((int)MathRound(confidence));
    string tag = isMeanRev ? (tradeDir==1 ? "MRV_BUY" : "MRV_SELL")
-                          : (tradeDir==1 ? "HA_BUY_v5" : "HA_SELL_v5");
+                          : (tradeDir==1 ? "HA_BUY_v6" : "HA_SELL_v6");
    if(HAEntryMode == 1) tag = tag + "_E";
-   tag = tag + "_T" + IntegerToString(tier);  // append tier to comment
+   tag = tag + "_C" + confStr
+             + "_SL" + DoubleToString(g_DynamicSL_USD, 2)
+             + "_TP" + DoubleToString(g_DynamicTP_USD, 2);
 
    // === EXECUTE ===
    bool ok = false;
    if(tradeDir == 1) {
       double sl = NormalizeDouble(ask - slDist, _Digits);
       double tp = NormalizeDouble(ask + tpDist, _Digits);
-      Print("Attempting ", tag, " [", tierLabel, "] | Zone:", zone,
+      Print("Attempting ", tag, " | Conf:", DoubleToString(confidence,1), "% Zone:", zone,
             " Lot:", lot, " Ask:", ask, " SL:", sl, " TP:", tp,
-            " TP$:", DoubleToString(baseTpUSD, 2));
+            " SL$:", DoubleToString(g_DynamicSL_USD,2), " TP$:", DoubleToString(baseTpUSD,2));
       ok = trade.Buy(lot, _Symbol, ask, sl, tp, tag);
    } else {
       double sl = NormalizeDouble(bid + slDist, _Digits);
       double tp = NormalizeDouble(bid - tpDist, _Digits);
-      Print("Attempting ", tag, " [", tierLabel, "] | Zone:", zone,
+      Print("Attempting ", tag, " | Conf:", DoubleToString(confidence,1), "% Zone:", zone,
             " Lot:", lot, " Bid:", bid, " SL:", sl, " TP:", tp,
-            " TP$:", DoubleToString(baseTpUSD, 2));
+            " SL$:", DoubleToString(g_DynamicSL_USD,2), " TP$:", DoubleToString(baseTpUSD,2));
       ok = trade.Sell(lot, _Symbol, bid, sl, tp, tag);
    }
 
    if(ok) {
-      SetScaledThresholds(lot, tier);
-      // If TP was extended beyond base tier, update scaled TP
-      if(baseTpUSD > ((tier == 3) ? Tier3TP_USD : (tier == 2) ? Tier2TP_USD : Tier1TP_USD)) {
-         g_ScaledTPUSD = baseTpUSD * scale;
-      }
+      SetScaledThresholds(lot);
       g_TradeOpen     = true;
-      g_TradeTier     = tier;
       g_ProfitLocked  = false;
       g_PeakProfit    = 0;
       g_OpenBarCount  = 0;
@@ -2097,8 +2414,10 @@ void TryEntry()
       g_DailyTradeCount++;
       if(MaxDailyTrades > 0 && g_DailyTradeCount >= MaxDailyTrades)
          Print("DAILY TRADE LIMIT reached (", g_DailyTradeCount, "/", MaxDailyTrades, ")");
-      Print(tag, " OPENED [", tierLabel, "] Lock@$", DoubleToString(g_ScaledLockUSD,2),
+      Print(tag, " OPENED | Conf:", DoubleToString(confidence,1), "%",
+            " SL=$", DoubleToString(g_ScaledSLUSD,2),
             " TP=$", DoubleToString(g_ScaledTPUSD,2),
+            " Lock=$", DoubleToString(g_ScaledLockUSD,2),
             " Trail=$", DoubleToString(g_ScaledTrailUSD,2),
             " DayTrade#", g_DailyTradeCount);
    } else {
@@ -2108,39 +2427,26 @@ void TryEntry()
 
 //+------------------------------------------------------------------+
 //| Scale all USD thresholds proportionally to lot size             |
-//| Uses tier to select TP/Lock/Trail from Tier1/2/3 inputs         |
+//| Uses dynamic SL/TP from confidence model (g_DynamicSL_USD etc) |
+//| Lock = TP × LockPct, Trail = TP × TrailPct                     |
 //+------------------------------------------------------------------+
-void SetScaledThresholds(double lot, int tier)
+void SetScaledThresholds(double lot)
 {
    double scale = lot / 0.01;
-   double slBase;
-   if(tier == 1) {
-      g_ScaledTPUSD   = Tier1TP_USD   * scale;
-      g_ScaledLockUSD = Tier1Lock_USD * scale;
-      g_ScaledTrailUSD= Tier1Trail_USD * scale;
-      slBase = Tier1SL_USD;
-   } else if(tier == 3) {
-      g_ScaledTPUSD   = Tier3TP_USD   * scale;
-      g_ScaledLockUSD = Tier3Lock_USD * scale;
-      g_ScaledTrailUSD= Tier3Trail_USD * scale;
-      slBase = Tier3SL_USD;
-   } else {
-      g_ScaledTPUSD   = Tier2TP_USD   * scale;
-      g_ScaledLockUSD = Tier2Lock_USD * scale;
-      g_ScaledTrailUSD= Tier2Trail_USD * scale;
-      slBase = Tier2SL_USD;
-   }
-   g_ScaledSLUSD = slBase * scale;
+   g_ScaledSLUSD    = g_DynamicSL_USD * scale;
+   g_ScaledTPUSD    = g_DynamicTP_USD * scale;
+   g_ScaledLockUSD  = g_DynamicTP_USD * LockPct * scale;   // lock at 60% of TP
+   g_ScaledTrailUSD = g_DynamicTP_USD * TrailPct * scale;   // trail gap = 20% of TP
 }
 
 //+------------------------------------------------------------------+
-//| TRADE MANAGEMENT v6 — TIER-AWARE                                 |
-//| - Hard $1.75/0.01lot max loss (scaled) — never blow past this   |
-//| - Tier-based lock/trail: T1=$0.80, T2=$1.50, T3=$2.00           |
-//| - Mid-range stall: only Tier 1-2, disabled for Tier 3 runners   |
-//| - Max hold: T1=16, T2=32, T3=48 bars — only exit if not profit |
-//| - Sideways: tighten trail (T3 less aggressive than T1/T2)       |
-//| - Runner trail widening: T3 trail increases when profit > 2xLock|
+//| TRADE MANAGEMENT v7 — CONFIDENCE-BASED DYNAMIC                   |
+//| - Hard MaxLossUSD/0.01lot cap — absolute safety net             |
+//| - Dynamic lock/trail from LockPct/TrailPct × TP                |
+//| - Mid-range stall exit for low-momentum trades                  |
+//| - Max hold bars — exit if trade is stalling below lock level    |
+//| - Sideways: tighten trail when market chops                     |
+//| - High-confidence trail widening when profit exceeds 2× lock   |
 //+------------------------------------------------------------------+
 void ManageOpenTrade()
 {
@@ -2157,8 +2463,6 @@ void ManageOpenTrade()
    }
 
    if(!found) {
-      // Position was closed externally (broker SL/TP hit)
-      // Try to get the P&L from the last closed deal
       double closedPnL = GetLastClosedDealProfit();
       RecordTradeResult(closedPnL);
       Print("Position closed by broker (SL/TP) | P&L=$", DoubleToString(closedPnL, 2));
@@ -2173,8 +2477,7 @@ void ManageOpenTrade()
    double profit = posInfo.Commission() + posInfo.Swap() + posInfo.Profit();
    if(profit > g_PeakProfit) g_PeakProfit = profit;
 
-   // === HARD LOSS CAP — MaxLossUSD per 0.01 lot, ALWAYS, no exceptions ===
-   // Broker SL is tier-based but this is the absolute safety net
+   // === HARD LOSS CAP — MaxLossUSD per 0.01 lot, ALWAYS ===
    double hardLossLimit = -(MaxLossUSD * g_CurrentLot / 0.01);
    if(profit <= hardLossLimit) {
       Print("HARD LOSS CAP triggered: profit=$", DoubleToString(profit,2),
@@ -2186,16 +2489,13 @@ void ManageOpenTrade()
       return;
    }
 
-   // === MID-RANGE / SCALP STALL EXIT ===
-   // Tier 1 (scalp): close if stalling near breakeven after MidRangeMaxBars
-   // Tier 2: stall check at 1.5x MidRangeMaxBars (give swing room)
-   // Tier 3 (runner): NO stall exit — let it run
-   if(g_TradeTier <= 2 && g_IsNearMid && !g_ProfitLocked) {
-      int stallBars = (g_TradeTier == 1) ? MidRangeMaxBars : (int)(MidRangeMaxBars * 1.5);
-      if(g_OpenBarCount >= stallBars) {
+   // === MID-RANGE STALL EXIT ===
+   // If trade is near mid and not profiting after MidRangeMaxBars, cut it
+   if(g_IsNearMid && !g_ProfitLocked) {
+      if(g_OpenBarCount >= MidRangeMaxBars) {
          double midStallLimit = MidRangeStallUSD * g_CurrentLot / 0.01;
          if(profit < midStallLimit) {
-            Print("STALL exit [T", g_TradeTier, "]: open ", g_OpenBarCount, " bars profit=$",
+            Print("STALL exit: open ", g_OpenBarCount, " bars profit=$",
                   DoubleToString(profit,2), " (below $", DoubleToString(midStallLimit,2), ")");
             trade.PositionClose(posInfo.Ticket());
             RecordTradeResult(profit);
@@ -2207,13 +2507,16 @@ void ManageOpenTrade()
    }
 
    // === MAX HOLD TIME EXIT ===
-   // Tier 1: MidRangeMaxBars (16)  |  Tier 2: MaxHoldBars (32)  |  Tier 3: MaxHoldBars * 1.5
-   int maxBars = (g_TradeTier == 1) ? MidRangeMaxBars :
-                 (g_TradeTier == 3) ? (int)(MaxHoldBars * 1.5) : MaxHoldBars;
+   // High-confidence trades get extra hold time (up to 1.5x)
+   int maxBars = MaxHoldBars;
+   if(g_Confidence >= 80) maxBars = (int)(MaxHoldBars * 1.5);
+   else if(g_Confidence < 65) maxBars = MidRangeMaxBars;
+
    if(g_OpenBarCount >= maxBars) {
       if(profit < g_ScaledLockUSD * 0.5) {
-         Print("MAX HOLD exit [T", g_TradeTier, "] after ", g_OpenBarCount, "/", maxBars,
-               " bars | profit=$", DoubleToString(profit,2));
+         Print("MAX HOLD exit after ", g_OpenBarCount, "/", maxBars,
+               " bars | profit=$", DoubleToString(profit,2),
+               " conf:", DoubleToString(g_Confidence,1), "%");
          trade.PositionClose(posInfo.Ticket());
          RecordTradeResult(profit);
          g_TradeOpen = false; g_ProfitLocked = false;
@@ -2223,29 +2526,27 @@ void ManageOpenTrade()
    }
 
    // === SIDEWAYS: tighten trail once locked ===
-   // Tier 1/2: tighten aggressively;  Tier 3: only moderate tightening
    if(g_ProfitLocked && IsSideways()) {
-      double sidewaysTrail = (g_TradeTier == 3) ? 0.30 : 0.15;
-      sidewaysTrail *= (g_CurrentLot / 0.01);
+      double sidewaysTrail = 0.15 * (g_CurrentLot / 0.01);
+      if(g_Confidence >= 80) sidewaysTrail = 0.30 * (g_CurrentLot / 0.01);  // high conf: less tight
       if(g_ScaledTrailUSD > sidewaysTrail) {
          g_ScaledTrailUSD = sidewaysTrail;
-         Print("SIDEWAYS tightened trail [T", g_TradeTier, "] to $",
-               DoubleToString(g_ScaledTrailUSD,2));
+         Print("SIDEWAYS tightened trail to $", DoubleToString(g_ScaledTrailUSD,2));
       }
    }
 
-   // === TIER 3 RUNNER: widen trail once profit exceeds 2x lock ===
-   // Let runners breathe — don't choke a $4 winner with a $0.60 trail
-   if(g_TradeTier == 3 && g_ProfitLocked && profit >= g_ScaledLockUSD * 2.0) {
-      double wideTrail = Tier3Trail_USD * 1.5 * (g_CurrentLot / 0.01);
+   // === HIGH-CONFIDENCE TRAIL WIDENING ===
+   // When profit exceeds 2× lock, let the trade breathe
+   if(g_Confidence >= 75 && g_ProfitLocked && profit >= g_ScaledLockUSD * 2.0) {
+      double wideTrail = g_DynamicTP_USD * TrailPct * 1.5 * (g_CurrentLot / 0.01);
       if(g_ScaledTrailUSD < wideTrail) {
          g_ScaledTrailUSD = wideTrail;
-         Print("RUNNER trail widened to $", DoubleToString(g_ScaledTrailUSD,2),
-               " (profit=$", DoubleToString(profit,2), ")");
+         Print("Trail widened to $", DoubleToString(g_ScaledTrailUSD,2),
+               " (profit=$", DoubleToString(profit,2), " conf:", DoubleToString(g_Confidence,1), "%)");
       }
    }
 
-   // === STANDARD PROFIT LOCK ($2 always) ===
+   // === STANDARD PROFIT LOCK ===
    if(!g_ProfitLocked && profit >= g_ScaledLockUSD) {
       g_ProfitLocked = true;
       Print("PROFIT LOCK engaged at $", DoubleToString(profit,2),
@@ -2365,7 +2666,7 @@ void UpdateDashboard()
    int row    = 0;
 
    // ---- helper macro replaced with inline calls ----
-   DashLine("00_title",  "[ EURUSD HA RANGE BOT v5 ]",                         cx, cy, row, lh, corner, clrWhite,     10); row++;
+   DashLine("00_title",  "[ EURUSD HA RANGE BOT v6 ]",                         cx, cy, row, lh, corner, clrWhite,     10); row++;
    row++;
    DashLine("01_sess",   "Session : " + session,                                cx, cy, row, lh, corner, clrCyan,       9); row++;
 
@@ -2510,6 +2811,32 @@ void UpdateDashboard()
    else
       DashLine("10e_ob",  "",                                                    cx, cy, row, lh, corner, clrGray, 7);
    row++;
+
+   // --- Fair Value Gaps ---
+   if(UseFairValueGaps) {
+      string fvgStr = IntegerToString(g_FVGCount) + " active";
+      if(g_NearBullFVG || g_NearBearFVG) {
+         fvgStr += " | Near: " + (g_NearBullFVG ? "BULL" : "BEAR") + " FVG " +
+                   DoubleToString(g_NearestFVGLow, 5) + "-" + DoubleToString(g_NearestFVGHigh, 5);
+      }
+      color fvgClr = (g_NearBullFVG || g_NearBearFVG) ? clrDodgerBlue : clrGray;
+      DashLine("10f_fvg",  "FVG     : " + fvgStr,                               cx, cy, row, lh, corner, fvgClr, 8); row++;
+   } else {
+      DashLine("10f_fvg",  "",                                                   cx, cy, row, lh, corner, clrGray, 8); row++;
+   }
+
+   // --- Confidence Score (live, recalculated from current signals) ---
+   {
+      string confStr2 = DoubleToString(g_Confidence, 1) + "%";
+      color  confClr2 = (g_Confidence >= 80) ? clrGold :
+                        (g_Confidence >= MinConfidence) ? clrLime :
+                        (g_Confidence > 0) ? clrOrange : clrGray;
+      string confLine = "Conf    : " + confStr2 +
+                        "  SL:$" + DoubleToString(g_DynamicSL_USD, 2) +
+                        "  TP:$" + DoubleToString(g_DynamicTP_USD, 2) +
+                        "  R:R=1:" + DoubleToString(RRRatio, 1);
+      DashLine("10g_conf", confLine,                                             cx, cy, row, lh, corner, confClr2, 8); row++;
+   }
    row++;
 
    // Fib / Pivot nearest level
@@ -2590,20 +2917,22 @@ void UpdateDashboard()
       color  modeClr  = g_IsMeanRev ? clrGold : (g_IsNearMid ? clrOrange : clrLime);
       DashLine("14b_mode", "Mode    : " + modeStr,                              cx, cy, row, lh, corner, modeClr,       9); row++;
 
-      // Trade tier display
-      string tierStr = (g_TradeTier == 3) ? "T3 RUNNER" : (g_TradeTier == 2) ? "T2 SWING" : "T1 SCALP";
-      color  tierClr = (g_TradeTier == 3) ? clrGold : (g_TradeTier == 2) ? clrCyan : clrSilver;
-      DashLine("14b2_tier", "Tier    : " + tierStr +
+      // Confidence + dynamic SL/TP display
+      string confLabel = "Conf " + DoubleToString(g_Confidence, 0) + "%";
+      color  confClr = (g_Confidence >= 80) ? clrGold : (g_Confidence >= 65) ? clrCyan : clrSilver;
+      DashLine("14b2_conf", confLabel +
+               "  SL:$" + DoubleToString(g_ScaledSLUSD, 2) +
                "  TP:$" + DoubleToString(g_ScaledTPUSD, 2) +
                "  Lock:$" + DoubleToString(g_ScaledLockUSD, 2) +
-               "  Trail:$" + DoubleToString(g_ScaledTrailUSD, 2),               cx, cy, row, lh, corner, tierClr,       8); row++;
+               "  Trail:$" + DoubleToString(g_ScaledTrailUSD, 2),               cx, cy, row, lh, corner, confClr,       8); row++;
 
       if(g_NearLevel != "")
          DashLine("14d_lvl", "Cnfl    : " + g_NearLevel,                        cx, cy, row, lh, corner, clrGold,       9); row++;
 
-      // Tier-aware hold bar display
-      int maxBars = (g_TradeTier == 1) ? MidRangeMaxBars :
-                    (g_TradeTier == 3) ? (int)(MaxHoldBars * 1.5) : MaxHoldBars;
+      // Confidence-aware hold bar display
+      int maxBars = MaxHoldBars;
+      if(g_Confidence >= 80) maxBars = (int)(MaxHoldBars * 1.5);
+      else if(g_Confidence < 65) maxBars = MidRangeMaxBars;
       DashLine("14c_bars", "Hold    : " + IntegerToString(g_OpenBarCount) + "/" + IntegerToString(maxBars) + " bars",
                                                                                  cx, cy, row, lh, corner, clrWhite,      9); row++;
       double hardLoss  = MaxLossUSD * g_CurrentLot / 0.01;

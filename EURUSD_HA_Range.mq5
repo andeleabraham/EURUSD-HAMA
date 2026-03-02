@@ -209,8 +209,10 @@ double g_VolRatio      = 1.0;               // current vol / average vol
 bool   g_VolDivergence = false;              // price trending but volume declining
 
 // Order Blocks (institutional entry zones on H1)
-double g_BullOB_High = 0, g_BullOB_Low = 0; // last bear candle before bull impulse
-double g_BearOB_High = 0, g_BearOB_Low = 0; // last bull candle before bear impulse
+double g_BullOB_High = 0, g_BullOB_Low = 0;   // last bear candle before bull impulse
+double g_BearOB_High = 0, g_BearOB_Low = 0;   // last bull candle before bear impulse
+datetime g_BullOB_Time = 0;                    // H1 bar time of bull OB candle
+datetime g_BearOB_Time = 0;                    // H1 bar time of bear OB candle
 
 // Fair Value Gaps (FVG) — M15 imbalance zones
 struct FVGZone {
@@ -514,7 +516,7 @@ void OnTick()
 
       // Market structure analysis (runs on new bar only — uses confirmed bars)
       if(UseSwingStructure)  DetectSwingStructure();
-      if(UseOrderBlocks)     DetectOrderBlocks();
+      if(UseOrderBlocks)   { DetectOrderBlocks(); DrawOBZones(); }
       if(UseVolumeAnalysis)  AnalyzeVolume();
       if(UseLiquiditySweep)  DetectLiquiditySweep();
       if(UseFairValueGaps)   { DetectFairValueGaps(); DrawFVGZones(); }
@@ -1056,8 +1058,8 @@ void AnalyzeVolume()
 //+------------------------------------------------------------------+
 void DetectOrderBlocks()
 {
-   g_BullOB_High = 0;  g_BullOB_Low  = 0;
-   g_BearOB_High = 0;  g_BearOB_Low  = 0;
+   g_BullOB_High = 0;  g_BullOB_Low = 0;  g_BullOB_Time = 0;
+   g_BearOB_High = 0;  g_BearOB_Low = 0;  g_BearOB_Time = 0;
 
    int scanBars       = 30;     // H1 bars to scan
    int impulseLen     = 3;      // min consecutive H1 candles for an impulse
@@ -1090,6 +1092,7 @@ void DetectOrderBlocks()
       if(obC < obO) {   // bearish candle = valid bullish OB
          g_BullOB_High = obO;
          g_BullOB_Low  = obC;
+         g_BullOB_Time = iTime(_Symbol, PERIOD_H1, ob);
          break;         // most recent OB found
       }
    }
@@ -1118,6 +1121,7 @@ void DetectOrderBlocks()
       if(obC > obO) {   // bullish candle = valid bearish OB
          g_BearOB_High = obC;
          g_BearOB_Low  = obO;
+         g_BearOB_Time = iTime(_Symbol, PERIOD_H1, ob);
          break;
       }
    }
@@ -1246,6 +1250,61 @@ void AddFVG(double high, double low, int dir, datetime created)
 //+------------------------------------------------------------------+
 //| DRAW FVG ZONES ON CHART as semi-transparent rectangles           |
 //+------------------------------------------------------------------+
+//+------------------------------------------------------------------+
+//| Draw Order Block (supply/demand) zones as chart rectangles        |
+//+------------------------------------------------------------------+
+void DrawOBZones()
+{
+   // Remove stale OB rectangles
+   for(int i = ObjectsTotal(0, 0) - 1; i >= 0; i--) {
+      string name = ObjectName(0, i, 0);
+      if(StringFind(name, "HABOT_OB_") == 0)
+         ObjectDelete(0, name);
+   }
+
+   datetime tEnd = TimeCurrent() + 3600 * 4;   // extend 4h to the right
+
+   // --- Demand zone (Bull OB) — green ---
+   if(g_BullOB_High > 0 && g_BullOB_Time > 0) {
+      string name = "HABOT_OB_BULL";
+      if(ObjectFind(0, name) < 0)
+         ObjectCreate(0, name, OBJ_RECTANGLE, 0, g_BullOB_Time, g_BullOB_High, tEnd, g_BullOB_Low);
+      else {
+         ObjectSetInteger(0, name, OBJPROP_TIME,  0, g_BullOB_Time);
+         ObjectSetDouble (0, name, OBJPROP_PRICE, 0, g_BullOB_High);
+         ObjectSetInteger(0, name, OBJPROP_TIME,  1, tEnd);
+         ObjectSetDouble (0, name, OBJPROP_PRICE, 1, g_BullOB_Low);
+      }
+      ObjectSetInteger(0, name, OBJPROP_COLOR,     clrLimeGreen);
+      ObjectSetInteger(0, name, OBJPROP_STYLE,     STYLE_SOLID);
+      ObjectSetInteger(0, name, OBJPROP_WIDTH,     1);
+      ObjectSetInteger(0, name, OBJPROP_FILL,      true);
+      ObjectSetInteger(0, name, OBJPROP_BACK,      true);
+      ObjectSetInteger(0, name, OBJPROP_SELECTABLE,false);
+      ObjectSetString (0, name, OBJPROP_TEXT,      "Demand Zone (Bull OB)");
+   }
+
+   // --- Supply zone (Bear OB) — red ---
+   if(g_BearOB_High > 0 && g_BearOB_Time > 0) {
+      string name = "HABOT_OB_BEAR";
+      if(ObjectFind(0, name) < 0)
+         ObjectCreate(0, name, OBJ_RECTANGLE, 0, g_BearOB_Time, g_BearOB_High, tEnd, g_BearOB_Low);
+      else {
+         ObjectSetInteger(0, name, OBJPROP_TIME,  0, g_BearOB_Time);
+         ObjectSetDouble (0, name, OBJPROP_PRICE, 0, g_BearOB_High);
+         ObjectSetInteger(0, name, OBJPROP_TIME,  1, tEnd);
+         ObjectSetDouble (0, name, OBJPROP_PRICE, 1, g_BearOB_Low);
+      }
+      ObjectSetInteger(0, name, OBJPROP_COLOR,     clrCrimson);
+      ObjectSetInteger(0, name, OBJPROP_STYLE,     STYLE_SOLID);
+      ObjectSetInteger(0, name, OBJPROP_WIDTH,     1);
+      ObjectSetInteger(0, name, OBJPROP_FILL,      true);
+      ObjectSetInteger(0, name, OBJPROP_BACK,      true);
+      ObjectSetInteger(0, name, OBJPROP_SELECTABLE,false);
+      ObjectSetString (0, name, OBJPROP_TEXT,      "Supply Zone (Bear OB)");
+   }
+}
+
 void DrawFVGZones()
 {
    // Remove old FVG rectangles

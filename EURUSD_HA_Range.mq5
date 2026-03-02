@@ -3154,8 +3154,8 @@ void UpdateDashboard()
       ObjectSetInteger(0, bgName, OBJPROP_BGCOLOR,     C'8,12,28');   // dark navy fill
       ObjectSetInteger(0, bgName, OBJPROP_BORDER_TYPE, BORDER_FLAT);
       ObjectSetInteger(0, bgName, OBJPROP_COLOR,        C'60,80,120'); // subtle blue-grey border
-      ObjectSetInteger(0, bgName, OBJPROP_BACK,         true);         // background layer — text labels (BACK=false) render on top
-      ObjectSetInteger(0, bgName, OBJPROP_ZORDER,       0);
+      ObjectSetInteger(0, bgName, OBJPROP_BACK,         false);        // foreground — covers chart candles (opaque)
+      ObjectSetInteger(0, bgName, OBJPROP_ZORDER,       0);            // text labels at ZORDER=1 render on top
       ObjectSetInteger(0, bgName, OBJPROP_SELECTABLE,   false);
    }
 }

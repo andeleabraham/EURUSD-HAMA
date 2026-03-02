@@ -629,17 +629,20 @@ void SetActiveRange()
    if(todayH > 0) g_TodayHigh = todayH;
    if(todayL > 0) g_TodayLow  = todayL;
 
-   // --- Active range: today is primary; expand floor/ceiling with prev day so
-   // the zone boundaries never shrink below what yesterday established.
-   double hi = (todayH > 0) ? todayH : g_PrevDayHigh;
-   double lo = (todayL > 0) ? todayL : g_PrevDayLow;
-   if(g_PrevDayHigh > hi) hi = g_PrevDayHigh;
-   if(g_PrevDayLow  < lo) lo = g_PrevDayLow;
-
-   if(hi > 0 && lo > 0) {
-      g_RangeHigh = hi;
-      g_RangeLow  = lo;
-      g_RangeMid  = (hi + lo) / 2.0;
+   // --- Active range = today's D1[0] only ---
+   // Yesterday is kept as a separate reference (g_PrevDayHigh/Low) on the dashboard
+   // but no longer merged into the active range. This ensures Range H/L reflects
+   // today's actual price action, not yesterday's stale levels.
+   if(todayH > 0 && todayL > 0) {
+      g_RangeHigh = todayH;
+      g_RangeLow  = todayL;
+      g_RangeMid  = (todayH + todayL) / 2.0;
+   }
+   else if(g_PrevDayHigh > 0 && g_PrevDayLow > 0) {
+      // Fallback only if D1[0] isn't available yet (e.g. very first tick of new day)
+      g_RangeHigh = g_PrevDayHigh;
+      g_RangeLow  = g_PrevDayLow;
+      g_RangeMid  = (g_RangeHigh + g_RangeLow) / 2.0;
    }
    // g_AsianHigh/g_LondonHigh are still tracked and shown on dashboard
    // but no longer override the primary range
@@ -1346,10 +1349,19 @@ void TryEntry()
    }
 
    // === BIAS FILTER ===
-   bool canBuy  = (g_TotalBias >= 0);
-   bool canSell = (g_TotalBias <= 0);
-   if(tradeDir == 1  && !canBuy)  { Print("BUY blocked by bias");  return; }
-   if(tradeDir == -1 && !canSell) { Print("SELL blocked by bias"); return; }
+   // Bias is informational context, NOT a hard gate on validated entries.
+   // The HA pattern, Bollinger midline, zone filter, and consecutive-candle
+   // check have already approved this trade. Blocking on mild bias (-1/+1)
+   // kills valid counter-trend moves (bull runs in a bear day, and vice versa).
+   //
+   // Only block at STRONG bias (±3): this means BOTH auto market data AND
+   // manual geo/news inputs agree heavily against the direction.
+   // At ±2 or less, let the trade through — the risk management (SL, lock,
+   // trailing) handles the downside.
+   bool canBuy  = (g_TotalBias > -3);   // only block buys at STRONG BEAR (-3)
+   bool canSell = (g_TotalBias <  3);   // only block sells at STRONG BULL (+3)
+   if(tradeDir == 1  && !canBuy)  { Print("BUY blocked by STRONG BEAR bias (", g_TotalBias, ")");  return; }
+   if(tradeDir == -1 && !canSell) { Print("SELL blocked by STRONG BULL bias (", g_TotalBias, ")"); return; }
 
    // === TARGETS — unified $2 lock for all trade types ===
    // Mid-zone and sideways: same $2 lock but tighter TP ($2 — take it once we're there)

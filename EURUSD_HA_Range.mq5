@@ -2005,6 +2005,11 @@ void EvaluateHAPattern()
       g_HABearSetup        = false;
       g_ConfirmCandleOpen  = 0;       // not yet on confirming candle
       g_Signal             = "PREPARING BUY";
+      Print("PREPARING BUY: Bottomless bull candle at bar1. ",
+            "Consec=", g_HAConsecCount, "/", MaxConsecCandles, ". ",
+            "Waiting for next bull bar to confirm. ",
+            "Boll mid=", DoubleToString(g_BollingerMid1, 5),
+            " Zone=", g_ZoneLabel, " Bias=", g_TotalBias);
    }
    // Step 2: setup armed → next bull candle is the CONFIRMING candle
    //         Validate: both arm (bar2) and confirming (bar1) HA body mids <= Bollinger midline
@@ -2025,6 +2030,12 @@ void EvaluateHAPattern()
          } else {
             g_Signal            = "PREPARING BUY";  // Bollinger not validated yet
             g_ConfirmCandleOpen = 0;
+            Print("PREPARING BUY: Confirming bull bar present but Bollinger gate FAILED. ",
+                  "BodyMid1=", DoubleToString(bodyMid1, 5),
+                  " BodyMid2=", DoubleToString(bodyMid2, 5),
+                  " BollMid1=", DoubleToString(g_BollingerMid1, 5),
+                  " BollMid2=", DoubleToString(g_BollingerMid2, 5),
+                  " (Need both body mids <= Boll midline for BUY)");
          }
       } else {
          g_Signal            = "WAITING";
@@ -2039,6 +2050,11 @@ void EvaluateHAPattern()
       g_HABullSetup        = false;
       g_ConfirmCandleOpen  = 0;
       g_Signal             = "PREPARING SELL";
+      Print("PREPARING SELL: Topless bear candle at bar1. ",
+            "Consec=", g_HAConsecCount, "/", MaxConsecCandles, ". ",
+            "Waiting for next bear bar to confirm. ",
+            "Boll mid=", DoubleToString(g_BollingerMid1, 5),
+            " Zone=", g_ZoneLabel, " Bias=", g_TotalBias);
    }
    else if(g_HABearSetup && dir1 == -1) {
       if(g_HAConsecCount <= MaxConsecCandles) {
@@ -2057,6 +2073,12 @@ void EvaluateHAPattern()
          } else {
             g_Signal            = "PREPARING SELL"; // Bollinger not validated yet
             g_ConfirmCandleOpen = 0;
+            Print("PREPARING SELL: Confirming bear bar present but Bollinger gate FAILED. ",
+                  "BodyMid1=", DoubleToString(bodyMid1s, 5),
+                  " BodyMid2=", DoubleToString(bodyMid2s, 5),
+                  " BollMid1=", DoubleToString(g_BollingerMid1, 5),
+                  " BollMid2=", DoubleToString(g_BollingerMid2, 5),
+                  " (Need both body mids >= Boll midline for SELL)");
          }
       } else {
          g_Signal            = "WAITING";

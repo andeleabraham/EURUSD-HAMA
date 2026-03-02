@@ -244,6 +244,29 @@ void OnTick()
    // Always manage open trade on every tick
    if(g_TradeOpen) ManageOpenTrade();
 
+   // --- Retry session seeding if data wasn't ready on OnInit ---
+   // CopyHigh/CopyLow may return 0 bars on the very first attach tick;
+   // re-run until each session has real data (stops retrying once populated).
+   MqlDateTime nowDt;
+   TimeToStruct(TimeCurrent(), nowDt);
+   datetime dayStart0 = (datetime)(TimeCurrent() - (nowDt.hour*3600 + nowDt.min*60 + nowDt.sec));
+   if(g_AsianHigh == 0) {
+      datetime aStart = dayStart0 + (datetime)(AsianStartHour * 3600);
+      datetime aEnd   = dayStart0 + (datetime)(AsianEndHour   * 3600);
+      if(TimeCurrent() > aStart) {
+         datetime aTo = (TimeCurrent() < aEnd) ? TimeCurrent() : aEnd;
+         SeedSessionHL(aStart, aTo, g_AsianHigh, g_AsianLow);
+      }
+   }
+   if(g_LondonHigh == 0) {
+      datetime lStart = dayStart0 + (datetime)(LondonStartHour * 3600);
+      datetime lEnd   = dayStart0 + (datetime)(LondonEndHour   * 3600);
+      if(TimeCurrent() > lStart) {
+         datetime lTo = (TimeCurrent() < lEnd) ? TimeCurrent() : lEnd;
+         SeedSessionHL(lStart, lTo, g_LondonHigh, g_LondonLow);
+      }
+   }
+
    // Always track live bar[0] for session ranges (captures new session opening immediately)
    UpdateLiveSessionBar();
 
@@ -291,56 +314,74 @@ void OnTick()
 }
 
 //+------------------------------------------------------------------+
+//| SESSION RANGE HELPER                                             |
+//| Uses CopyHigh/CopyLow with datetime-range signature — this asks  |
+//| the terminal database directly and returns data immediately,     |
+//| even on first attach, regardless of chart zoom or buffer state.  |
+//+------------------------------------------------------------------+
+void SeedSessionHL(datetime fromTime, datetime toTime, double &hi, double &lo)
+{
+   if(fromTime >= toTime) return;
+
+   double arrH[], arrL[];
+   // CopyHigh/CopyLow(symbol, tf, from, to, array) — datetime-range form
+   // Returns the number of bars copied; negative = data unavailable
+   int copied = CopyHigh(_Symbol, PERIOD_M15, fromTime, toTime, arrH);
+   if(copied <= 0) {
+      Print("SeedSessionHL: CopyHigh returned ", copied,
+            " from ", TimeToString(fromTime), " to ", TimeToString(toTime));
+      return;
+   }
+   CopyLow(_Symbol, PERIOD_M15, fromTime, toTime, arrL);
+
+   for(int i = 0; i < copied; i++) {
+      if(arrH[i] > 0 && (hi == 0 || arrH[i] > hi)) hi = arrH[i];
+      if(arrL[i] > 0 && (lo == 0 || arrL[i] < lo)) lo = arrL[i];
+   }
+}
+
+//+------------------------------------------------------------------+
 //| Seed ranges from existing history bars on startup               |
+//| Uses iHighest/iLowest calls — instant, like iHigh(D1,1)        |
 //+------------------------------------------------------------------+
 void SeedRangesFromHistory()
 {
-   // Walk back through today's M15 bars to populate session ranges
    MqlDateTime now;
    TimeToStruct(TimeCurrent(), now);
-
    datetime dayStart = (datetime)(TimeCurrent() - (now.hour*3600 + now.min*60 + now.sec));
-   int bars = iBars(_Symbol, PERIOD_M15);
 
-   for(int i = bars - 1; i >= 1; i--)
-   {
-      datetime t = iTime(_Symbol, PERIOD_M15, i);
-      if(t < dayStart) continue;  // before today
+   // --- Previous day: single call, always instant ---
+   g_RangeHigh = iHigh(_Symbol, PERIOD_D1, 1);
+   g_RangeLow  = iLow (_Symbol, PERIOD_D1, 1);
+   if(g_RangeHigh > 0 && g_RangeLow > 0)
+      g_RangeMid = (g_RangeHigh + g_RangeLow) / 2.0;
 
-      double hi = iHigh(_Symbol, PERIOD_M15, i);
-      double lo = iLow(_Symbol,  PERIOD_M15, i);
+   // --- Today overall: midnight → now ---
+   SeedSessionHL(dayStart, TimeCurrent(), g_TodayHigh, g_TodayLow);
 
-      MqlDateTime bdt;
-      TimeToStruct(t, bdt);
-      int h = bdt.hour;
-
-      // Today overall
-      if(g_TodayHigh == 0 || hi > g_TodayHigh) g_TodayHigh = hi;
-      if(g_TodayLow  == 0 || lo < g_TodayLow)  g_TodayLow  = lo;
-
-      // Asian
-      if(h >= AsianStartHour && h < AsianEndHour) {
-         if(g_AsianHigh == 0 || hi > g_AsianHigh) g_AsianHigh = hi;
-         if(g_AsianLow  == 0 || lo < g_AsianLow)  g_AsianLow  = lo;
-      }
-      // London
-      if(h >= LondonStartHour && h < LondonEndHour) {
-         if(g_LondonHigh == 0 || hi > g_LondonHigh) g_LondonHigh = hi;
-         if(g_LondonLow  == 0 || lo < g_LondonLow)  g_LondonLow  = lo;
-      }
+   // --- Asian session: only if we are past or inside Asian hours ---
+   datetime asianStart = dayStart + (datetime)(AsianStartHour  * 3600);
+   datetime asianEnd   = dayStart + (datetime)(AsianEndHour    * 3600);
+   if(TimeCurrent() > asianStart) {
+      datetime asianTo = (TimeCurrent() < asianEnd) ? TimeCurrent() : asianEnd;
+      SeedSessionHL(asianStart, asianTo, g_AsianHigh, g_AsianLow);
    }
 
-   // Also grab previous day as fallback if today has no data yet
-   if(g_TodayHigh == 0) {
-      // Use D1 bar index 1 = yesterday
-      g_RangeHigh = iHigh(_Symbol, PERIOD_D1, 1);
-      g_RangeLow  = iLow(_Symbol,  PERIOD_D1, 1);
-      if(g_RangeHigh > 0 && g_RangeLow > 0)
-         g_RangeMid = (g_RangeHigh + g_RangeLow) / 2.0;
+   // --- London session: only if we are past or inside London hours ---
+   datetime londonStart = dayStart + (datetime)(LondonStartHour * 3600);
+   datetime londonEnd   = dayStart + (datetime)(LondonEndHour   * 3600);
+   if(TimeCurrent() > londonStart) {
+      datetime londonTo = (TimeCurrent() < londonEnd) ? TimeCurrent() : londonEnd;
+      SeedSessionHL(londonStart, londonTo, g_LondonHigh, g_LondonLow);
    }
 
+   // Fallback: if today has no data at all, g_RangeHigh/Low from D1 already set above
    SetActiveRange();
    CalcFibPivotLevels();
+   Print("SeedRangesFromHistory: PrevDay H=", DoubleToString(g_RangeHigh,5),
+         " L=", DoubleToString(g_RangeLow,5),
+         " | Asian H=", DoubleToString(g_AsianHigh,5), " L=", DoubleToString(g_AsianLow,5),
+         " | London H=", DoubleToString(g_LondonHigh,5), " L=", DoubleToString(g_LondonLow,5));
 }
 
 //+------------------------------------------------------------------+
@@ -383,10 +424,7 @@ void ResetDailyRanges()
 }
 
 //+------------------------------------------------------------------+
-//| Update session range from the most recent closed bar            |
-//+------------------------------------------------------------------+
-//+------------------------------------------------------------------+
-//| Update session ranges from bar[1] (called on new bar)           |
+//| Update session ranges from bar[1] (called on each new bar)      |
 //+------------------------------------------------------------------+
 void UpdateSessionRanges()
 {

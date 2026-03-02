@@ -94,6 +94,13 @@ input int    NewsImpactUSD    = 0;
 input group "=== FOREIGN TRADE AWARENESS ==="
 input bool   RespectForeignTrades = true;   // Block new entries if a non-bot trade exists on this symbol
 
+input group "=== OVERTRADING PROTECTION ==="
+input int    MaxDailyTrades     = 3;     // Max trades per day (0 = unlimited)
+input int    ConsecLossLimit    = 2;     // After N consecutive SL hits, pause trading
+input int    CooldownBars       = 8;     // Bars to pause after consecutive loss limit hit (8 = 2 hours)
+input int    NoEntryAfterHour   = 21;    // No new entries after this server hour (0-23, 0=disabled)
+input int    FridayCloseHour    = 20;    // Force close open trades on Friday at this hour (0=disabled)
+
 input group "=== DASHBOARD POSITION ==="
 input int    DashboardCorner  = 0;
 input int    DashboardX       = 10;
@@ -180,6 +187,14 @@ string g_NearLevel = "";    // label of the nearest confluence level at entry
 
 // Zone classification for display
 string g_ZoneLabel    = "UNKNOWN";
+
+// Overtrading protection
+int      g_DailyTradeCount = 0;      // trades opened today
+int      g_ConsecLosses    = 0;      // consecutive SL/hard-loss exits
+datetime g_CooldownUntil   = 0;      // if > 0, no entries until this time
+int      g_DailyWins       = 0;      // wins today (for dashboard)
+int      g_DailyLosses     = 0;      // losses today (for dashboard)
+double   g_DailyPnL        = 0.0;    // cumulative P&L today
 
 datetime g_LastBarTime  = 0;
 datetime g_LastDayReset = 0;
@@ -332,6 +347,27 @@ void OnTick()
 
    // Scan for foreign (non-bot) trades every tick
    ScanForeignTrades();
+
+   // === FRIDAY WEEKEND CLOSE ===
+   if(FridayCloseHour > 0 && g_TradeOpen) {
+      MqlDateTime fridayDt;
+      TimeToStruct(TimeCurrent(), fridayDt);
+      if(fridayDt.day_of_week == 5 && fridayDt.hour >= FridayCloseHour) {
+         // Force close before weekend
+         for(int i = PositionsTotal() - 1; i >= 0; i--) {
+            if(posInfo.SelectByIndex(i)) {
+               if(posInfo.Symbol() == _Symbol && posInfo.Magic() == 202502) {
+                  double pnl = posInfo.Commission() + posInfo.Swap() + posInfo.Profit();
+                  Print("FRIDAY CLOSE: closing before weekend | P&L=$", DoubleToString(pnl, 2));
+                  trade.PositionClose(posInfo.Ticket());
+                  RecordTradeResult(pnl);
+                  g_TradeOpen = false; g_ProfitLocked = false;
+                  g_PeakProfit = 0; g_OpenBarCount = 0; g_Signal = "WAITING";
+               }
+            }
+         }
+      }
+   }
 
    // Always manage open trade on every tick
    if(g_TradeOpen) ManageOpenTrade();
@@ -588,6 +624,11 @@ void ResetDailyRanges()
    g_MRVArmed          = false;
    g_MRVDir            = 0;
    g_MRVConfirmOpen    = 0;
+   g_DailyTradeCount   = 0;
+   g_DailyWins         = 0;
+   g_DailyLosses       = 0;
+   g_DailyPnL          = 0.0;
+   // Don't reset g_ConsecLosses or g_CooldownUntil — they persist across days
    Print("Day reset. Prev range: H=", g_RangeHigh, " L=", g_RangeLow);
 }
 
@@ -1302,6 +1343,30 @@ void TryEntry()
       return;
    }
 
+   // === DAILY TRADE LIMIT ===
+   if(MaxDailyTrades > 0 && g_DailyTradeCount >= MaxDailyTrades) {
+      return;   // silent — already logged when limit was hit
+   }
+
+   // === CONSECUTIVE LOSS COOLDOWN ===
+   if(g_CooldownUntil > 0 && TimeCurrent() < g_CooldownUntil) {
+      return;   // still in cooldown after consecutive losses
+   }
+   if(g_CooldownUntil > 0 && TimeCurrent() >= g_CooldownUntil) {
+      Print("COOLDOWN expired — resuming trading (consec losses reset)");
+      g_CooldownUntil = 0;
+      g_ConsecLosses  = 0;
+   }
+
+   // === NO ENTRY AFTER HOUR ===
+   if(NoEntryAfterHour > 0) {
+      MqlDateTime entryDt;
+      TimeToStruct(TimeCurrent(), entryDt);
+      if(entryDt.hour >= NoEntryAfterHour) {
+         return;   // too late in the day
+      }
+   }
+
    // Check both trend signals AND mean reversion setup
    bool isTrendSignal = (g_Signal == "BUY INCOMING" || g_Signal == "SELL INCOMING");
    int  meanRevDir    = MeanReversionSetup();
@@ -1501,9 +1566,13 @@ void TryEntry()
       g_HABearSetup   = false;
       g_MRVArmed      = false;
       g_MRVConfirmOpen = 0;
+      g_DailyTradeCount++;
+      if(MaxDailyTrades > 0 && g_DailyTradeCount >= MaxDailyTrades)
+         Print("DAILY TRADE LIMIT reached (", g_DailyTradeCount, "/", MaxDailyTrades, ") — no more entries today");
       Print(tag, " OPENED | Lock@$", DoubleToString(g_ScaledLockUSD,2),
             " TP=$", DoubleToString(g_ScaledTPUSD,2),
-            " MidContext:", isMidContext);
+            " MidContext:", isMidContext,
+            " DayTrade#", g_DailyTradeCount);
    } else {
       Print(tag, " FAILED: ", trade.ResultComment(), " Code:", trade.ResultRetcode());
    }
@@ -1545,6 +1614,11 @@ void ManageOpenTrade()
    }
 
    if(!found) {
+      // Position was closed externally (broker SL/TP hit)
+      // Try to get the P&L from the last closed deal
+      double closedPnL = GetLastClosedDealProfit();
+      RecordTradeResult(closedPnL);
+      Print("Position closed by broker (SL/TP) | P&L=$", DoubleToString(closedPnL, 2));
       g_TradeOpen    = false;
       g_ProfitLocked = false;
       g_PeakProfit   = 0;
@@ -1563,6 +1637,7 @@ void ManageOpenTrade()
       Print("HARD LOSS CAP triggered: profit=$", DoubleToString(profit,2),
             " limit=$", DoubleToString(hardLossLimit,2));
       trade.PositionClose(posInfo.Ticket());
+      RecordTradeResult(profit);
       g_TradeOpen = false; g_ProfitLocked = false;
       g_PeakProfit = 0; g_OpenBarCount = 0; g_Signal = "WAITING";
       return;
@@ -1579,6 +1654,7 @@ void ManageOpenTrade()
                DoubleToString(profit,2), " (below stall threshold $",
                DoubleToString(midStallLimit,2), ")");
          trade.PositionClose(posInfo.Ticket());
+         RecordTradeResult(profit);
          g_TradeOpen = false; g_ProfitLocked = false;
          g_PeakProfit = 0; g_OpenBarCount = 0; g_Signal = "WAITING";
          return;
@@ -1590,6 +1666,7 @@ void ManageOpenTrade()
       if(profit < g_ScaledLockUSD * 0.5) {
          Print("MAX HOLD TIME exit after ", g_OpenBarCount, " bars | profit=$", DoubleToString(profit,2));
          trade.PositionClose(posInfo.Ticket());
+         RecordTradeResult(profit);
          g_TradeOpen = false; g_ProfitLocked = false;
          g_PeakProfit = 0; g_OpenBarCount = 0; g_Signal = "WAITING";
          return;
@@ -1618,8 +1695,63 @@ void ManageOpenTrade()
             " now=$", DoubleToString(profit,2),
             " trail=$", DoubleToString(g_ScaledTrailUSD,2));
       trade.PositionClose(posInfo.Ticket());
+      RecordTradeResult(profit);
       g_TradeOpen = false; g_ProfitLocked = false;
       g_PeakProfit = 0; g_OpenBarCount = 0; g_Signal = "WAITING";
+   }
+}
+
+//+------------------------------------------------------------------+
+//| GET LAST CLOSED DEAL PROFIT                                      |
+//| When broker closes position (SL/TP), we query deal history to   |
+//| find the P&L so we can track consecutive losses properly.       |
+//+------------------------------------------------------------------+
+double GetLastClosedDealProfit()
+{
+   // Select recent history (last 24 hours)
+   datetime from = TimeCurrent() - 86400;
+   datetime to   = TimeCurrent() + 3600;
+   if(!HistorySelect(from, to)) return 0.0;
+
+   int totalDeals = HistoryDealsTotal();
+   // Walk backwards to find the most recent deal matching our symbol + magic
+   for(int i = totalDeals - 1; i >= 0; i--)
+   {
+      ulong ticket = HistoryDealGetTicket(i);
+      if(ticket == 0) continue;
+      if(HistoryDealGetString(ticket, DEAL_SYMBOL) != _Symbol) continue;
+      if(HistoryDealGetInteger(ticket, DEAL_MAGIC) != 202502) continue;
+      // Must be an "out" deal (closing a position)
+      long entry = HistoryDealGetInteger(ticket, DEAL_ENTRY);
+      if(entry != DEAL_ENTRY_OUT) continue;
+      double pnl = HistoryDealGetDouble(ticket, DEAL_PROFIT)
+                 + HistoryDealGetDouble(ticket, DEAL_COMMISSION)
+                 + HistoryDealGetDouble(ticket, DEAL_SWAP);
+      return pnl;
+   }
+   return 0.0;  // fallback if nothing found
+}
+
+//+------------------------------------------------------------------+
+//| RECORD TRADE RESULT — tracks wins/losses, consecutive losses,   |
+//| and triggers cooldown when ConsecLossLimit is hit               |
+//+------------------------------------------------------------------+
+void RecordTradeResult(double profit)
+{
+   g_DailyPnL += profit;
+   if(profit >= 0) {
+      g_DailyWins++;
+      g_ConsecLosses = 0;   // reset streak on any non-loss
+   } else {
+      g_DailyLosses++;
+      g_ConsecLosses++;
+      if(ConsecLossLimit > 0 && g_ConsecLosses >= ConsecLossLimit) {
+         int coolSecs = CooldownBars * 15 * 60;  // bars * 15min
+         g_CooldownUntil = TimeCurrent() + (datetime)coolSecs;
+         Print("CONSECUTIVE LOSS LIMIT hit (", g_ConsecLosses, " in a row) — ",
+               "COOLDOWN until ", TimeToString(g_CooldownUntil),
+               " (", CooldownBars, " bars / ", CooldownBars*15, " min)");
+      }
    }
 }
 
@@ -1870,6 +2002,29 @@ void UpdateDashboard()
    }
    if(NewsNote != "") {
       DashLine("17_news", "News: " + NewsNote,                                  cx, cy, row, lh, corner, clrLightGray,  8); row++;
+   }
+
+   // --- Daily trading stats ---
+   row++;
+   string dayStatsStr = "W:" + IntegerToString(g_DailyWins) +
+                        " L:" + IntegerToString(g_DailyLosses) +
+                        " P&L:$" + DoubleToString(g_DailyPnL, 2) +
+                        " (" + IntegerToString(g_DailyTradeCount) + "/" +
+                        (MaxDailyTrades > 0 ? IntegerToString(MaxDailyTrades) : "∞") + " trades)";
+   color dayClr = g_DailyPnL > 0 ? clrLime : g_DailyPnL < 0 ? clrRed : clrGray;
+   DashLine("18_dstat", "Today   : " + dayStatsStr,                             cx, cy, row, lh, corner, dayClr,        8); row++;
+
+   // Cooldown / consecutive loss warning
+   if(g_CooldownUntil > 0 && TimeCurrent() < g_CooldownUntil) {
+      int secsLeft = (int)(g_CooldownUntil - TimeCurrent());
+      DashLine("18b_cool", "COOLDOWN: " + IntegerToString(secsLeft/60) + "m " +
+               IntegerToString(secsLeft%60) + "s (" + IntegerToString(g_ConsecLosses) + " consec losses)",
+                                                                                 cx, cy, row, lh, corner, clrRed,       8); row++;
+   } else if(g_ConsecLosses > 0) {
+      DashLine("18b_cool", "ConsecL : " + IntegerToString(g_ConsecLosses) + "/" + IntegerToString(ConsecLossLimit) + " before cooldown",
+                                                                                 cx, cy, row, lh, corner, clrOrange,    8); row++;
+   } else {
+      DashLine("18b_cool", "",                                                   cx, cy, row, lh, corner, clrGray,      8); row++;
    }
 }
 

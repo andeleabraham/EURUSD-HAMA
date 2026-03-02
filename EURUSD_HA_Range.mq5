@@ -79,7 +79,7 @@ input bool   UseOrderBlocks      = true;   // Detect H1 institutional order bloc
 input bool   UseVolumeAnalysis   = true;   // Tick volume confirmation & divergence
 input bool   UseLiquiditySweep   = true;   // Detect stop-hunt sweeps at key levels
 input bool   UseFairValueGaps    = true;   // Detect and display M15/H1 Fair Value Gaps
-input double MinConfidence       = 60.0;   // Minimum confidence % to take a trade (0-100, 60=default)
+input double MinConfidence       = 35.0;   // Minimum confidence % to take a trade (0-100)
 
 input group "=== RANGE ZONE FILTERS ==="
 // How far inside range boundaries before a trade is allowed (as % of total range)

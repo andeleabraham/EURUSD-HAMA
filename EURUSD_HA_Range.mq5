@@ -4027,14 +4027,20 @@ void TryEntry()
       bool cleanConfirm = (tradeDir == 1) ? !IsBottomlessWithTopSpike(1)
                                           : !IsToplessWithBottomSpike(1);
       if(!cleanConfirm) {
-         Print("MID_ZONE BUY/SELL skipped: confirming candle has opposing wick (indecision)");
+         if(g_LastBlockReason != "MID_WICK_INDECISION") {
+            Print("MID_ZONE BUY/SELL skipped: confirming candle has opposing wick (indecision)");
+            g_LastBlockReason = "MID_WICK_INDECISION";
+         }
          return;
       }
       // Check recent bar has momentum (not flat)
       double recentRange = iHigh(_Symbol, PERIOD_M15, 1) - iLow(_Symbol, PERIOD_M15, 1);
       if(g_ATR > 0 && recentRange < g_ATR * 0.25) {
-         Print("MID_ZONE trade skipped: recent bar range too small (no momentum) recentRange=",
-               DoubleToString(recentRange*10000,1), "pip ATR=", DoubleToString(g_ATR*10000,1));
+         if(g_LastBlockReason != "MID_NO_MOMENTUM") {
+            Print("MID_ZONE trade skipped: recent bar range too small (no momentum) recentRange=",
+                  DoubleToString(recentRange*10000,1), "pip ATR=", DoubleToString(g_ATR*10000,1));
+            g_LastBlockReason = "MID_NO_MOMENTUM";
+         }
          return;
       }
       // Check HA consecutive — mid zone with 3+ same candles (including forming) = exhaustion
@@ -4043,7 +4049,10 @@ void TryEntry()
                                 (tradeDir == -1 && g_MacroStructLabel == "BEARISH");
       bool boldBetActive = g_BoldBet && macroMatchesTrade && (g_Confidence >= BoldBetMinConf);
       if(liveConsec >= 3 && !boldBetActive) {
-         Print("MID_ZONE trade skipped: ", liveConsec, " consecutive HA candles incl live (exhausted at mid)");
+         if(g_LastBlockReason != "MID_EXHAUSTION") {
+            Print("MID_ZONE trade skipped: ", liveConsec, " consecutive HA candles incl live (exhausted at mid)");
+            g_LastBlockReason = "MID_EXHAUSTION";
+         }
          return;
       } else if(liveConsec >= 3 && boldBetActive) {
          Print("[BOLD BET] MID_ZONE exhaustion override: MTF=", g_MacroStructLabel,

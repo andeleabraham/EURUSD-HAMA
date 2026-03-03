@@ -556,7 +556,6 @@ int OnInit()
 void OnDeinit(const int reason)
 {
    ObjectsDeleteAll(0, DASH_PREFIX);
-   ObjectDelete(0, DASH_PREFIX + "BG_panel");   // cleanup pre-v6.22a stale panel
    ObjectsDeleteAll(0, "HABOT_LVL_");
    ObjectsDeleteAll(0, "HABOT_FVG_");
    Comment("");
@@ -4527,7 +4526,7 @@ void UpdateDashboard()
    int rx     = cx + 345;   // right-column X offset
 
    // --- Background panels created FIRST so all labels render on top ---
-   // Panels use OBJPROP_BACK=true so they always render behind text labels.
+   // MT5 renders foreground objects in creation order: oldest = bottom, newest = top.
    {
       int    bgPad  = 5;
       int    bgW    = 340;
@@ -4544,7 +4543,7 @@ void UpdateDashboard()
          ObjectSetInteger(0, bgName, OBJPROP_BGCOLOR,     C'8,12,28');
          ObjectSetInteger(0, bgName, OBJPROP_BORDER_TYPE, BORDER_FLAT);
          ObjectSetInteger(0, bgName, OBJPROP_COLOR,        C'60,80,120');
-         ObjectSetInteger(0, bgName, OBJPROP_BACK,         true);
+         ObjectSetInteger(0, bgName, OBJPROP_BACK,         false);
          ObjectSetInteger(0, bgName, OBJPROP_ZORDER,       0);
          ObjectSetInteger(0, bgName, OBJPROP_SELECTABLE,   false);
       }
@@ -4562,7 +4561,7 @@ void UpdateDashboard()
          ObjectSetInteger(0, bgNameR, OBJPROP_BGCOLOR,     C'8,12,28');
          ObjectSetInteger(0, bgNameR, OBJPROP_BORDER_TYPE, BORDER_FLAT);
          ObjectSetInteger(0, bgNameR, OBJPROP_COLOR,        C'60,80,120');
-         ObjectSetInteger(0, bgNameR, OBJPROP_BACK,         true);
+         ObjectSetInteger(0, bgNameR, OBJPROP_BACK,         false);
          ObjectSetInteger(0, bgNameR, OBJPROP_ZORDER,       0);
          ObjectSetInteger(0, bgNameR, OBJPROP_SELECTABLE,   false);
       }

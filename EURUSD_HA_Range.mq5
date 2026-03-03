@@ -68,6 +68,14 @@ input int    HAEntryMode         = 1;      // 1=Early entry (default), 2=Late en
 input int    EarlyEntryMins      = 5;      // Minutes window for early entry (5 min on 15M chart)
 input bool   AllowLateEntry      = true;   // Also allow entry after early window closes (until bar closes)
 input int    BollingerPeriod     = 21;     // Bollinger middle-line SMA period (M15)
+input double NarrowBandPips      = 15.0;   // Band width (pips) below which Bollinger gate is relaxed
+
+input group "=== KEY HOUR BONUS ==="
+// Certain full-hour marks see institutional order flow and higher probability moves:
+//   00:00 Asian open  03:00 Asia late  04:00 Pre-London  07:00 Frankfurt
+//   08:00 London open  12:00 Midday  13:00 NY open  17:00 London close  21:00 NY close
+input bool   KeyHourBonusEnabled = true;   // Award confidence bonus near key session-boundary hours
+input double KeyHourBonusPts     = 8.0;   // Points within 15 min of key hour (half-points within 30 min)
 
 input group "=== FIBONACCI & PIVOT CONFLUENCE ==="
 input bool   UseFibPivot         = true;   // Enable Fib/Pivot confluence filter
@@ -191,9 +199,13 @@ int    g_HAConsecCount= 0;
 // know whether we are within EarlyEntryMins of its start
 datetime g_ConfirmCandleOpen = 0;   // time the confirming candle opened
 
-// Bollinger middle line (M15, BollingerPeriod SMA)
-double   g_BollingerMid1 = 0;       // confirmed bar 1 (most recent closed bar)
-double   g_BollingerMid2 = 0;       // confirmed bar 2
+// Bollinger middle line + bands (M15, BollingerPeriod SMA)
+double   g_BollingerMid1   = 0;     // confirmed bar 1 (most recent closed bar)
+double   g_BollingerMid2   = 0;     // confirmed bar 2
+double   g_BollingerUpper1 = 0;     // upper band bar 1 (for narrow-band detection)
+double   g_BollingerLower1 = 0;     // lower band bar 1
+double   g_BollingerUpper2 = 0;     // upper band bar 2
+double   g_BollingerLower2 = 0;     // lower band bar 2
 
 // Mean reversion two-candle state machine
 bool     g_MRVArmed       = false;
@@ -889,11 +901,21 @@ void CalcBollinger()
 {
    int handle = iBands(_Symbol, PERIOD_M15, BollingerPeriod, 0, 2.0, PRICE_CLOSE);
    if(handle == INVALID_HANDLE) return;
-   double mid[];
-   ArraySetAsSeries(mid, true);
-   if(CopyBuffer(handle, 0, 0, 4, mid) >= 3) {   // buffer 0 = middle/SMA line
-      g_BollingerMid1 = mid[1];   // confirmed bar 1
-      g_BollingerMid2 = mid[2];   // confirmed bar 2
+   double mid[], upper[], lower[];
+   ArraySetAsSeries(mid,   true);
+   ArraySetAsSeries(upper, true);
+   ArraySetAsSeries(lower, true);
+   bool midOK   = (CopyBuffer(handle, 0, 0, 4, mid)   >= 3);  // buffer 0 = SMA midline
+   bool upperOK = (CopyBuffer(handle, 1, 0, 4, upper) >= 3);  // buffer 1 = upper band
+   bool lowerOK = (CopyBuffer(handle, 2, 0, 4, lower) >= 3);  // buffer 2 = lower band
+   if(midOK) {
+      g_BollingerMid1 = mid[1];   g_BollingerMid2 = mid[2];
+   }
+   if(upperOK) {
+      g_BollingerUpper1 = upper[1]; g_BollingerUpper2 = upper[2];
+   }
+   if(lowerOK) {
+      g_BollingerLower1 = lower[1]; g_BollingerLower2 = lower[2];
    }
    IndicatorRelease(handle);
 }
@@ -1717,6 +1739,34 @@ double CalcConfidence(int tradeDir, string zone, bool isMeanRev, bool isSideways
       if(tradeDir == -1 && g_NearBullFVG && !g_NearBearFVG) conf -= 3.0;
    }
 
+   // --- 13. KEY HOUR BONUS (0-8) ---
+   // Full-hour session boundaries where institutional order flow and volatility spikes
+   // are statistically elevated. Award bonus scaled by proximity to the hour mark.
+   //   Key hours (server time): 00 03 04 07 08 12 13 17 21
+   double keyHourBonus = 0;
+   if(KeyHourBonusEnabled) {
+      // minutes elapsed into the current hour
+      int minIntoHour = dt.min;
+      // key hours where significant moves tend to start
+      int keyHrs[] = {0, 3, 4, 7, 8, 12, 13, 17, 21};
+      int nKey = ArraySize(keyHrs);
+      int closestMinDist = 99;
+      for(int ki = 0; ki < nKey; ki++) {
+         int kh = keyHrs[ki];
+         // Distance from start of a key hour: current hour == kh → offset forward
+         if(dt.hour == kh)
+            closestMinDist = MathMin(closestMinDist, minIntoHour);
+         // Distance to start of a key hour: current hour + 1 == kh → offset backward
+         if((dt.hour + 1) % 24 == kh)
+            closestMinDist = MathMin(closestMinDist, 60 - minIntoHour);
+      }
+      if(closestMinDist <= 15)
+         keyHourBonus = KeyHourBonusPts;              // within 15 min: full bonus
+      else if(closestMinDist <= 30)
+         keyHourBonus = KeyHourBonusPts * 0.5;        // within 30 min: half bonus
+      conf += keyHourBonus;
+   }
+
    // --- PENALTIES ---
    if(isSideways)  conf -= 8.0;   // choppy market = unreliable signals
    if(isMeanRev)   conf -= 3.0;   // MRV = limited runway, lower confidence
@@ -1749,6 +1799,7 @@ double CalcConfidence(int tradeDir, string zone, bool isMeanRev, bool isSideways
          " HA:", consec,
          " ATR:", DoubleToString(atrPips, 1), "pip",
          " Sess:", (isOverlap ? "OVERLAP" : isLondon ? "LONDON" : isNY ? "NY" : "OTHER"),
+         " KeyHr:", (keyHourBonus > 0 ? "+" + DoubleToString(keyHourBonus,1) : "0"), "@", dt.hour, ":", dt.min,
          " Zone:", zone,
          " Cnfl:", (nearLevel == "" ? "none" : nearLevel+lvlType),
          " Struct:", g_StructureLabel, (g_BOS ? " BOS" : ""), (g_CHoCH ? " CHoCH" : ""),
@@ -2014,7 +2065,9 @@ void EvaluateHAPattern()
             " — waiting for next bull bar to confirm.");
    }
    // Step 2: setup armed → any bull candle (including further bottomless ones) is the confirming bar
-   //         Validate: HA body mids of bars 1 & 2 must be <= Bollinger midline
+   //         Normal gate: both HA body mids <= Boll midline.
+   //         Narrow-band gate: band width < NarrowBandPips → relax to HA HIGH >= midline
+   //         (compressed Boll means the full body-below-mid requirement is too strict)
    else if(g_HABullSetup && dir1 == 1) {
       if(g_HAConsecCount <= MaxConsecCandles) {
          double haO1b, haH1b, haL1b, haC1b, haO2b, haH2b, haL2b, haC2b;
@@ -2022,8 +2075,21 @@ void EvaluateHAPattern()
          CalcHA(2, haO2b, haH2b, haL2b, haC2b);
          double bodyMid1 = (haO1b + haC1b) / 2.0;
          double bodyMid2 = (haO2b + haC2b) / 2.0;
-         bool bollOK = (g_BollingerMid1 <= 0 ||
-                        (bodyMid1 <= g_BollingerMid1 && bodyMid2 <= g_BollingerMid2));
+         double bandWidthPips = (g_BollingerUpper1 > 0 && g_BollingerLower1 > 0)
+                                ? (g_BollingerUpper1 - g_BollingerLower1) / _Point / 10.0
+                                : 999.0;
+         bool isNarrow = (g_BollingerUpper1 > 0 && bandWidthPips < NarrowBandPips);
+         bool bollOK;
+         if(g_BollingerMid1 <= 0) {
+            bollOK = true;   // no band data — don't block
+         } else if(isNarrow) {
+            // Relaxed: HA high pokes above midline (upside momentum) AND body not above upper band
+            bollOK = (haH1b >= g_BollingerMid1 && bodyMid1 <= g_BollingerUpper1 &&
+                      haH2b >= g_BollingerMid2);
+         } else {
+            // Standard: both body mids below midline — price still has room to rally
+            bollOK = (bodyMid1 <= g_BollingerMid1 && bodyMid2 <= g_BollingerMid2);
+         }
          if(bollOK) {
             if(g_ConfirmCandleOpen == 0)
                g_ConfirmCandleOpen = iTime(_Symbol, PERIOD_M15, 1);
@@ -2031,11 +2097,13 @@ void EvaluateHAPattern()
          } else {
             g_Signal            = "PREPARING BUY";
             g_ConfirmCandleOpen = 0;
-            Print("PREPARING BUY: Bollinger gate BLOCKING — HA body is ABOVE midline. ",
-                  "BodyMid1=", DoubleToString(bodyMid1, 5),
-                  " BodyMid2=", DoubleToString(bodyMid2, 5),
+            Print("PREPARING BUY: Bollinger gate BLOCKING",
+                  (isNarrow ? " [NARROW band=" + DoubleToString(bandWidthPips,1) + "pip]" : ""),
+                  " HA_H1=", DoubleToString(haH1b, 5),
+                  " BodyMid1=", DoubleToString(bodyMid1, 5),
                   " BollMid=", DoubleToString(g_BollingerMid1, 5),
-                  " (price too extended above SMA — waiting for pullback below midline)");
+                  " BollUpper=", DoubleToString(g_BollingerUpper1, 5),
+                  isNarrow ? " (need HA high >= BollMid)" : " (need body <= BollMid)");
          }
       } else {
          Print("BUY SETUP EXPIRED: Consec=", g_HAConsecCount, " exceeded MaxConsecCandles=", MaxConsecCandles, " — setup reset.");
@@ -2064,8 +2132,21 @@ void EvaluateHAPattern()
          CalcHA(2, haO2s, haH2s, haL2s, haC2s);
          double bodyMid1s = (haO1s + haC1s) / 2.0;
          double bodyMid2s = (haO2s + haC2s) / 2.0;
-         bool bollOK = (g_BollingerMid1 <= 0 ||
-                        (bodyMid1s >= g_BollingerMid1 && bodyMid2s >= g_BollingerMid2));
+         double bandWidthPips = (g_BollingerUpper1 > 0 && g_BollingerLower1 > 0)
+                                ? (g_BollingerUpper1 - g_BollingerLower1) / _Point / 10.0
+                                : 999.0;
+         bool isNarrow = (g_BollingerUpper1 > 0 && bandWidthPips < NarrowBandPips);
+         bool bollOK;
+         if(g_BollingerMid1 <= 0) {
+            bollOK = true;
+         } else if(isNarrow) {
+            // Relaxed: HA low pokes below midline (downside momentum) AND body not below lower band
+            bollOK = (haL1s <= g_BollingerMid1 && bodyMid1s >= g_BollingerLower1 &&
+                      haL2s <= g_BollingerMid2);
+         } else {
+            // Standard: both body mids above midline
+            bollOK = (bodyMid1s >= g_BollingerMid1 && bodyMid2s >= g_BollingerMid2);
+         }
          if(bollOK) {
             if(g_ConfirmCandleOpen == 0)
                g_ConfirmCandleOpen = iTime(_Symbol, PERIOD_M15, 1);
@@ -2073,11 +2154,13 @@ void EvaluateHAPattern()
          } else {
             g_Signal            = "PREPARING SELL";
             g_ConfirmCandleOpen = 0;
-            Print("PREPARING SELL: Bollinger gate BLOCKING — HA body is BELOW midline. ",
-                  "BodyMid1=", DoubleToString(bodyMid1s, 5),
-                  " BodyMid2=", DoubleToString(bodyMid2s, 5),
+            Print("PREPARING SELL: Bollinger gate BLOCKING",
+                  (isNarrow ? " [NARROW band=" + DoubleToString(bandWidthPips,1) + "pip]" : ""),
+                  " HA_L1=", DoubleToString(haL1s, 5),
+                  " BodyMid1=", DoubleToString(bodyMid1s, 5),
                   " BollMid=", DoubleToString(g_BollingerMid1, 5),
-                  " (price too extended below SMA — waiting for rally above midline)");
+                  " BollLower=", DoubleToString(g_BollingerLower1, 5),
+                  isNarrow ? " (need HA low <= BollMid)" : " (need body >= BollMid)");
          }
       } else {
          Print("SELL SETUP EXPIRED: Consec=", g_HAConsecCount, " exceeded MaxConsecCandles=", MaxConsecCandles, " — setup reset.");

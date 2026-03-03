@@ -1999,23 +1999,23 @@ void EvaluateHAPattern()
    g_HAConsecCount = CountConsecutive(1, dir1);
 
    // === BUY SETUP STATE MACHINE ===
-   // Step 1: bottomless bull → arm the setup
-   if(bl1 && dir1 == 1) {
+   // Step 1: bottomless bull → arm the setup (only if NOT already armed)
+   // A 2nd/3rd consecutive bottomless candle falls to Step 2 as confirmation.
+   if(bl1 && dir1 == 1 && !g_HABullSetup) {
       g_HABullSetup        = true;
       g_HABearSetup        = false;
-      g_ConfirmCandleOpen  = 0;       // not yet on confirming candle
+      g_ConfirmCandleOpen  = 0;
       g_Signal             = "PREPARING BUY";
-      Print("PREPARING BUY: Bottomless bull candle at bar1. ",
-            "Consec=", g_HAConsecCount, "/", MaxConsecCandles, ". ",
-            "Waiting for next bull bar to confirm. ",
-            "Boll mid=", DoubleToString(g_BollingerMid1, 5),
-            " Zone=", g_ZoneLabel, " Bias=", g_TotalBias);
+      Print("PREPARING BUY: Bottomless bull candle detected (bar1). ",
+            "Consec=", g_HAConsecCount, "/", MaxConsecCandles,
+            " Boll=", DoubleToString(g_BollingerMid1, 5),
+            " Zone=", g_ZoneLabel, " Bias=", g_TotalBias,
+            " — waiting for next bull bar to confirm.");
    }
-   // Step 2: setup armed → next bull candle is the CONFIRMING candle
-   //         Validate: both arm (bar2) and confirming (bar1) HA body mids <= Bollinger midline
+   // Step 2: setup armed → any bull candle (including further bottomless ones) is the confirming bar
+   //         Validate: HA body mids of bars 1 & 2 must be <= Bollinger midline
    else if(g_HABullSetup && dir1 == 1) {
       if(g_HAConsecCount <= MaxConsecCandles) {
-         // Bollinger gate: HA body midpoints of both candles must be <= SMA midline for BUY
          double haO1b, haH1b, haL1b, haC1b, haO2b, haH2b, haL2b, haC2b;
          CalcHA(1, haO1b, haH1b, haL1b, haC1b);
          CalcHA(2, haO2b, haH2b, haL2b, haC2b);
@@ -2028,16 +2028,16 @@ void EvaluateHAPattern()
                g_ConfirmCandleOpen = iTime(_Symbol, PERIOD_M15, 1);
             g_Signal = "BUY INCOMING";
          } else {
-            g_Signal            = "PREPARING BUY";  // Bollinger not validated yet
+            g_Signal            = "PREPARING BUY";
             g_ConfirmCandleOpen = 0;
-            Print("PREPARING BUY: Confirming bull bar present but Bollinger gate FAILED. ",
+            Print("PREPARING BUY: Bollinger gate BLOCKING — HA body is ABOVE midline. ",
                   "BodyMid1=", DoubleToString(bodyMid1, 5),
                   " BodyMid2=", DoubleToString(bodyMid2, 5),
-                  " BollMid1=", DoubleToString(g_BollingerMid1, 5),
-                  " BollMid2=", DoubleToString(g_BollingerMid2, 5),
-                  " (Need both body mids <= Boll midline for BUY)");
+                  " BollMid=", DoubleToString(g_BollingerMid1, 5),
+                  " (price too extended above SMA — waiting for pullback below midline)");
          }
       } else {
+         Print("BUY SETUP EXPIRED: Consec=", g_HAConsecCount, " exceeded MaxConsecCandles=", MaxConsecCandles, " — setup reset.");
          g_Signal            = "WAITING";
          g_HABullSetup       = false;
          g_ConfirmCandleOpen = 0;
@@ -2045,20 +2045,19 @@ void EvaluateHAPattern()
    }
 
    // === SELL SETUP STATE MACHINE ===
-   else if(tl1 && dir1 == -1) {
+   else if(tl1 && dir1 == -1 && !g_HABearSetup) {
       g_HABearSetup        = true;
       g_HABullSetup        = false;
       g_ConfirmCandleOpen  = 0;
       g_Signal             = "PREPARING SELL";
-      Print("PREPARING SELL: Topless bear candle at bar1. ",
-            "Consec=", g_HAConsecCount, "/", MaxConsecCandles, ". ",
-            "Waiting for next bear bar to confirm. ",
-            "Boll mid=", DoubleToString(g_BollingerMid1, 5),
-            " Zone=", g_ZoneLabel, " Bias=", g_TotalBias);
+      Print("PREPARING SELL: Topless bear candle detected (bar1). ",
+            "Consec=", g_HAConsecCount, "/", MaxConsecCandles,
+            " Boll=", DoubleToString(g_BollingerMid1, 5),
+            " Zone=", g_ZoneLabel, " Bias=", g_TotalBias,
+            " — waiting for next bear bar to confirm.");
    }
    else if(g_HABearSetup && dir1 == -1) {
       if(g_HAConsecCount <= MaxConsecCandles) {
-         // Bollinger gate: HA body midpoints of both candles must be >= SMA midline for SELL
          double haO1s, haH1s, haL1s, haC1s, haO2s, haH2s, haL2s, haC2s;
          CalcHA(1, haO1s, haH1s, haL1s, haC1s);
          CalcHA(2, haO2s, haH2s, haL2s, haC2s);
@@ -2071,16 +2070,16 @@ void EvaluateHAPattern()
                g_ConfirmCandleOpen = iTime(_Symbol, PERIOD_M15, 1);
             g_Signal = "SELL INCOMING";
          } else {
-            g_Signal            = "PREPARING SELL"; // Bollinger not validated yet
+            g_Signal            = "PREPARING SELL";
             g_ConfirmCandleOpen = 0;
-            Print("PREPARING SELL: Confirming bear bar present but Bollinger gate FAILED. ",
+            Print("PREPARING SELL: Bollinger gate BLOCKING — HA body is BELOW midline. ",
                   "BodyMid1=", DoubleToString(bodyMid1s, 5),
                   " BodyMid2=", DoubleToString(bodyMid2s, 5),
-                  " BollMid1=", DoubleToString(g_BollingerMid1, 5),
-                  " BollMid2=", DoubleToString(g_BollingerMid2, 5),
-                  " (Need both body mids >= Boll midline for SELL)");
+                  " BollMid=", DoubleToString(g_BollingerMid1, 5),
+                  " (price too extended below SMA — waiting for rally above midline)");
          }
       } else {
+         Print("SELL SETUP EXPIRED: Consec=", g_HAConsecCount, " exceeded MaxConsecCandles=", MaxConsecCandles, " — setup reset.");
          g_Signal            = "WAITING";
          g_HABearSetup       = false;
          g_ConfirmCandleOpen = 0;
@@ -2096,6 +2095,21 @@ void EvaluateHAPattern()
       g_HABullSetup       = false;
       g_ConfirmCandleOpen = 0;
       g_Signal            = "WAITING";
+   }
+
+   // === STILL PREPARING diagnostic — log ALL blocking gates after 2+ confirming candles ===
+   if((g_Signal == "PREPARING BUY" || g_Signal == "PREPARING SELL") && g_HAConsecCount >= 2) {
+      bool biasBlocked = (g_Signal == "PREPARING BUY")  ? (g_TotalBias <= -2) :
+                         (g_Signal == "PREPARING SELL") ? (g_TotalBias >=  2) : false;
+      bool cooldownActive = (g_CooldownUntil > TimeCurrent());
+      Print("STILL " + g_Signal + " after ", g_HAConsecCount, " bars — gate check:",
+            " Zone=", g_ZoneLabel,
+            " Bias=", g_TotalBias, (biasBlocked ? " [BIAS BLOCK]" : ""),
+            " BollMid=", DoubleToString(g_BollingerMid1, 5),
+            " Conf=", DoubleToString(g_Confidence, 1), "%/", MinConfidence, "%min",
+            " DailyTrades=", g_DailyTradeCount, "/", MaxDailyTrades,
+            " Cooldown=", (cooldownActive ? "YES" : "no"),
+            " TradeOpen=", (g_TradeOpen ? "YES" : "no"));
    }
 
    // === MEAN REVERSION TWO-CANDLE STATE MACHINE ===

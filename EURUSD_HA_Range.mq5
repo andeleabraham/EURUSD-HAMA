@@ -73,6 +73,11 @@ input double MinRangePips      = 30.0;  // Minimum range width in pips before sw
 
 input group "=== HEIKEN ASHI SETTINGS ==="
 input int    MaxConsecCandles    = 4;
+input bool   TrendBoldEnabled    = true;   // Evaluate trend bold bet when MaxConsecCandles exceeded (instead of hard reset)
+input int    SmallBoldMinScore   = 4;      // Min confluence score (0-10) for SMALL_BOLD tier (conservative TP)
+input int    HugeBoldMinScore    = 7;      // Min score for HUGE_BOLD tier (TP chases full CI boundary)
+input double SmallBoldTPPct      = 0.75;   // SMALL_BOLD TP: fraction of distance to CI boundary (0.75 = 75%)
+input int    TrendBoldHardCap    = 12;     // Absolute hard cap: always reset when consec > this (safety)
 // Entry mode:
 // 1 = EARLY (default) — enter within first EarlyEntryMins of the confirming candle
 //     Requires clean bottomless/topless candle (no double-sided wicks)
@@ -254,6 +259,9 @@ bool   g_MTFAligned = false;   // true when macro (H4) and intermediate (H1) agr
 bool   g_BoldBet    = false;   // true when MTF aligned + FVG or OB present + HA valid
 bool   g_BollOverridden     = false;  // true when Bollinger gate was bypassed by confluence override
 string g_BollOverrideReason = "";     // factors that triggered the override
+string g_BoldTier           = "NORMAL"; // entry tier: "NORMAL" / "SMALL_BOLD" / "HUGE_BOLD"
+int    g_BarsSinceLevelBreak = 999;      // bars since a key level was crossed in setup direction
+string g_LevelBreakLabel    = "";        // which level was broken
 
 // Liquidity Sweep detection
 bool   g_LiquiditySweep = false;             // price swept a key level and reversed
@@ -2640,6 +2648,60 @@ int LiveHAConsecTotal()
 //| behind rapidly moving price — blocking here is a false negative. |
 //| Position sizing still uses normal SL/TP — no extra risk taken.  |
 //+------------------------------------------------------------------+
+//+------------------------------------------------------------------+
+//| LEVEL BREAK DETECTION                                            |
+//| Returns how many M15 bars ago price last broke through a key    |
+//| structural level in 'tradeDir'. Sets g_LevelBreakLabel.         |
+//| Checked levels: S1/S2/R1/R2, SwingH/L (H1), MacroSwingH/L (H4).|
+//| Used to gauge trend strength when MaxConsecCandles is exceeded.  |
+//+------------------------------------------------------------------+
+int CheckLevelBreakBars(int tradeDir)
+{
+   g_LevelBreakLabel = "";
+   int    scanBack   = MathMax(TrendBoldHardCap + 2, MaxConsecCandles * 3 + 2);
+   double tol        = 3.0 * _Point * 10;   // 3-pip tolerance for level cross
+
+   // Collect candidate levels with labels
+   double lvlPrice[10];
+   string lvlName [10];
+   int    nLvl = 0;
+
+   if(tradeDir == 1) {
+      // BUY: look for break above resistance levels
+      if(g_PivotR1      > 0) { lvlPrice[nLvl] = g_PivotR1;           lvlName[nLvl++] = "R1"; }
+      if(g_PivotR2      > 0) { lvlPrice[nLvl] = g_PivotR2;           lvlName[nLvl++] = "R2"; }
+      if(g_SwingHigh1   > 0) { lvlPrice[nLvl] = g_SwingHigh1;        lvlName[nLvl++] = "H1-SwingH"; }
+      if(g_SwingHigh2   > 0) { lvlPrice[nLvl] = g_SwingHigh2;        lvlName[nLvl++] = "H1-SwingH2"; }
+      if(g_MacroSwingHigh1 > 0) { lvlPrice[nLvl] = g_MacroSwingHigh1; lvlName[nLvl++] = "H4-SwingH"; }
+      if(g_CIHigh       > 0) { lvlPrice[nLvl] = g_CIHigh;            lvlName[nLvl++] = "CI-High"; }
+   } else {
+      // SELL: look for break below support levels
+      if(g_PivotS1      > 0) { lvlPrice[nLvl] = g_PivotS1;           lvlName[nLvl++] = "S1"; }
+      if(g_PivotS2      > 0) { lvlPrice[nLvl] = g_PivotS2;           lvlName[nLvl++] = "S2"; }
+      if(g_SwingLow1    > 0) { lvlPrice[nLvl] = g_SwingLow1;         lvlName[nLvl++] = "H1-SwingL"; }
+      if(g_SwingLow2    > 0) { lvlPrice[nLvl] = g_SwingLow2;         lvlName[nLvl++] = "H1-SwingL2"; }
+      if(g_MacroSwingLow1 > 0)  { lvlPrice[nLvl] = g_MacroSwingLow1;  lvlName[nLvl++] = "H4-SwingL"; }
+      if(g_CILow        > 0) { lvlPrice[nLvl] = g_CILow;             lvlName[nLvl++] = "CI-Low"; }
+   }
+   if(nLvl == 0) return 999;
+
+   // Scan bars oldest-to-newest; return the most recent (smallest b) break found
+   for(int b = 1; b <= scanBack; b++) {
+      double closeB  = iClose(_Symbol, PERIOD_M15, b);
+      double closeB1 = iClose(_Symbol, PERIOD_M15, b + 1);   // bar before b
+      for(int li = 0; li < nLvl; li++) {
+         bool crossed = (tradeDir == 1)
+                        ? (closeB > lvlPrice[li] + tol && closeB1 < lvlPrice[li] - tol)
+                        : (closeB < lvlPrice[li] - tol && closeB1 > lvlPrice[li] + tol);
+         if(crossed) {
+            g_LevelBreakLabel = lvlName[li] + "@" + DoubleToString(lvlPrice[li], 5);
+            return b;
+         }
+      }
+   }
+   return 999;
+}
+
 bool BollingerOverrideCheck(int tradeDir, string &reason)
 {
    int    score   = 0;
@@ -2721,6 +2783,9 @@ void EvaluateHAPattern()
       g_HABullSetup        = true;
       g_HABearSetup        = false;
       g_ConfirmCandleOpen  = 0;
+      g_BoldTier           = "NORMAL";   // fresh arm — reset tier
+      g_BollOverridden     = false;
+      g_BollOverrideReason = "";
       g_Signal             = "PREPARING BUY";
       Print("PREPARING BUY: Bottomless bull candle detected (bar1). ",
             "Consec=", g_HAConsecCount, "/", MaxConsecCandles,
@@ -2791,10 +2856,47 @@ void EvaluateHAPattern()
                   " | Override-check: ", g_BollOverrideReason);
          }
       } else {
-         Print("BUY SETUP EXPIRED: Consec=", g_HAConsecCount, " exceeded MaxConsecCandles=", MaxConsecCandles, " — setup reset.");
-         g_Signal            = "WAITING";
-         g_HABullSetup       = false;
-         g_ConfirmCandleOpen = 0;
+         // === TREND BOLD TIER EVALUATION (consec > MaxConsecCandles) ===
+         // Rather than always hard-resetting, score the structural picture.
+         // If a key level broke recently AND confluence is strong enough,
+         // promote the setup to SMALL_BOLD or HUGE_BOLD and keep the signal live.
+         // Normal SL always used — only TP differs between tiers.
+         bool didReset = true;
+         if(TrendBoldEnabled && g_HAConsecCount <= TrendBoldHardCap) {
+            string ovReason = "";
+            BollingerOverrideCheck(1, ovReason);
+            int scoreIdx = StringFind(ovReason, "score=");
+            int ovScore  = (scoreIdx >= 0) ? (int)StringToInteger(StringSubstr(ovReason, scoreIdx + 6, 2)) : 0;
+            g_BarsSinceLevelBreak = CheckLevelBreakBars(1);
+            string lvlTag = (g_BarsSinceLevelBreak < 999)
+                            ? g_LevelBreakLabel + "(" + IntegerToString(g_BarsSinceLevelBreak) + "b)"
+                            : "none";
+            string tierInfo = "Consec=" + IntegerToString(g_HAConsecCount)
+                            + " Score=" + IntegerToString(ovScore)
+                            + " LvlBreak=" + lvlTag;
+            if(ovScore >= HugeBoldMinScore && g_BarsSinceLevelBreak <= MaxConsecCandles * 2) {
+               g_BoldTier          = "HUGE_BOLD";
+               g_ConfirmCandleOpen = iTime(_Symbol, PERIOD_M15, 1);
+               g_Signal            = "BUY INCOMING";
+               didReset            = false;
+               Print("[HUGE BOLD BUY] MaxConsec exceeded but strong trend — HUGE_BOLD: ", tierInfo);
+            } else if(ovScore >= SmallBoldMinScore && g_BarsSinceLevelBreak <= MaxConsecCandles * 3) {
+               g_BoldTier          = "SMALL_BOLD";
+               g_ConfirmCandleOpen = iTime(_Symbol, PERIOD_M15, 1);
+               g_Signal            = "BUY INCOMING";
+               didReset            = false;
+               Print("[SMALL BOLD BUY] MaxConsec exceeded — SMALL_BOLD (capped TP): ", tierInfo);
+            } else {
+               Print("[TREND BOLD REJECTED-BUY] Insufficient score/level break — hard reset. ", tierInfo);
+            }
+         }
+         if(didReset) {
+            Print("BUY SETUP EXPIRED: Consec=", g_HAConsecCount, " exceeded MaxConsecCandles=", MaxConsecCandles, " — setup reset.");
+            g_BoldTier          = "NORMAL";
+            g_Signal            = "WAITING";
+            g_HABullSetup       = false;
+            g_ConfirmCandleOpen = 0;
+         }
       }
    }
 
@@ -2803,6 +2905,9 @@ void EvaluateHAPattern()
       g_HABearSetup        = true;
       g_HABullSetup        = false;
       g_ConfirmCandleOpen  = 0;
+      g_BoldTier           = "NORMAL";   // fresh arm — reset tier
+      g_BollOverridden     = false;
+      g_BollOverrideReason = "";
       g_Signal             = "PREPARING SELL";
       Print("PREPARING SELL: Topless bear candle detected (bar1). ",
             "Consec=", g_HAConsecCount, "/", MaxConsecCandles,
@@ -2868,21 +2973,56 @@ void EvaluateHAPattern()
                   " | Override-check: ", g_BollOverrideReason);
          }
       } else {
-         Print("SELL SETUP EXPIRED: Consec=", g_HAConsecCount, " exceeded MaxConsecCandles=", MaxConsecCandles, " — setup reset.");
-         g_Signal            = "WAITING";
-         g_HABearSetup       = false;
-         g_ConfirmCandleOpen = 0;
+         // === TREND BOLD TIER EVALUATION (consec > MaxConsecCandles) ===
+         bool didReset = true;
+         if(TrendBoldEnabled && g_HAConsecCount <= TrendBoldHardCap) {
+            string ovReason = "";
+            BollingerOverrideCheck(-1, ovReason);
+            int scoreIdx = StringFind(ovReason, "score=");
+            int ovScore  = (scoreIdx >= 0) ? (int)StringToInteger(StringSubstr(ovReason, scoreIdx + 6, 2)) : 0;
+            g_BarsSinceLevelBreak = CheckLevelBreakBars(-1);
+            string lvlTag = (g_BarsSinceLevelBreak < 999)
+                            ? g_LevelBreakLabel + "(" + IntegerToString(g_BarsSinceLevelBreak) + "b)"
+                            : "none";
+            string tierInfo = "Consec=" + IntegerToString(g_HAConsecCount)
+                            + " Score=" + IntegerToString(ovScore)
+                            + " LvlBreak=" + lvlTag;
+            if(ovScore >= HugeBoldMinScore && g_BarsSinceLevelBreak <= MaxConsecCandles * 2) {
+               g_BoldTier          = "HUGE_BOLD";
+               g_ConfirmCandleOpen = iTime(_Symbol, PERIOD_M15, 1);
+               g_Signal            = "SELL INCOMING";
+               didReset            = false;
+               Print("[HUGE BOLD SELL] MaxConsec exceeded but strong trend — HUGE_BOLD: ", tierInfo);
+            } else if(ovScore >= SmallBoldMinScore && g_BarsSinceLevelBreak <= MaxConsecCandles * 3) {
+               g_BoldTier          = "SMALL_BOLD";
+               g_ConfirmCandleOpen = iTime(_Symbol, PERIOD_M15, 1);
+               g_Signal            = "SELL INCOMING";
+               didReset            = false;
+               Print("[SMALL BOLD SELL] MaxConsec exceeded — SMALL_BOLD (capped TP): ", tierInfo);
+            } else {
+               Print("[TREND BOLD REJECTED-SELL] Insufficient score/level break — hard reset. ", tierInfo);
+            }
+         }
+         if(didReset) {
+            Print("SELL SETUP EXPIRED: Consec=", g_HAConsecCount, " exceeded MaxConsecCandles=", MaxConsecCandles, " — setup reset.");
+            g_BoldTier          = "NORMAL";
+            g_Signal            = "WAITING";
+            g_HABearSetup       = false;
+            g_ConfirmCandleOpen = 0;
+         }
       }
    }
    // Direction flip — reset
    else if(dir1 == 1 && g_HABearSetup) {
       g_HABearSetup       = false;
       g_ConfirmCandleOpen = 0;
+      g_BoldTier          = "NORMAL";
       g_Signal            = "WAITING";
    }
    else if(dir1 == -1 && g_HABullSetup) {
       g_HABullSetup       = false;
       g_ConfirmCandleOpen = 0;
+      g_BoldTier          = "NORMAL";
       g_Signal            = "WAITING";
    }
 
@@ -2960,6 +3100,10 @@ void EvaluateHAPattern()
       if(g_NearBullFVG || g_NearBearFVG) confirmed += " | H1FVG=" + (g_NearBullFVG ? "BULL" : "BEAR");
       if(g_BullOB_High > 0 || g_BearOB_High > 0) confirmed += " | H1OB=" + (g_BullOB_High > 0 ? "BULL" : "BEAR");
       if(g_BollOverridden) confirmed += " | ⚡BOLL-OVERRIDDEN (" + g_BollOverrideReason + ")";
+      if(g_BoldTier != "NORMAL") confirmed += " | 🔥BOLD-TIER=" + g_BoldTier
+                                              + " LvlBreak=" + (g_BarsSinceLevelBreak < 999
+                                                ? g_LevelBreakLabel + "(" + IntegerToString(g_BarsSinceLevelBreak) + "b)"
+                                                : "none");
 
       // --- Compose pending (current blocker) ---
       string pending = "";
@@ -3528,6 +3672,39 @@ void TryEntry()
          baseTpUSD = targetUSD;
          g_DynamicTP_USD = baseTpUSD;
       }
+   }
+
+   // === BOLD TIER TP OVERRIDE ===
+   // Applied after ATR boost. Normal SL always preserved — only TP is adjusted.
+   // SMALL_BOLD: target SmallBoldTPPct (75%) of distance from entry to CI boundary.
+   //   Chase most of the trend move but leave room so we don't get stopped by late pullback.
+   // HUGE_BOLD:  target full CI boundary — trend has multi-factor confirmation.
+   if(g_BoldTier == "SMALL_BOLD" || g_BoldTier == "HUGE_BOLD") {
+      double ciTarget = (tradeDir == 1) ? g_CIHigh : g_CILow;
+      if(ciTarget > 0) {
+         double ciDist  = MathAbs(ciTarget - price);
+         double ciPips  = ciDist / _Point / 10.0;
+         double ciUSD   = ciPips * 0.10;
+         double pct     = (g_BoldTier == "HUGE_BOLD") ? 1.0 : SmallBoldTPPct;
+         double boldTP  = ciUSD * pct;
+         boldTP = MathMax(boldTP, baseTpUSD);   // never less than structural TP
+         boldTP = MathMin(boldTP, 8.0);          // safety cap $8/0.01 lot
+         if(boldTP != baseTpUSD) {
+            Print("[", g_BoldTier, "] TP: $", DoubleToString(baseTpUSD,2),
+                  " -> $", DoubleToString(boldTP,2),
+                  " (CI=", DoubleToString(ciTarget,5),
+                  " dist=", DoubleToString(ciPips,1), "pip pct=", DoubleToString(pct*100,0), "%)");
+            baseTpUSD = boldTP;
+            g_DynamicTP_USD = baseTpUSD;
+         }
+      } else if(g_BoldTier == "SMALL_BOLD") {
+         // No CI: cap TP at SmallBoldTPPct of standard TP
+         double cappedTP = MathMax(baseTpUSD * SmallBoldTPPct, g_DynamicSL_USD * RRRatio * 0.5);
+         Print("[SMALL_BOLD] TP capped (no CI): $", DoubleToString(cappedTP,2));
+         baseTpUSD = cappedTP;
+         g_DynamicTP_USD = baseTpUSD;
+      }
+      // HUGE_BOLD without CI: use standard TP (structural already the best estimate)
    }
 
    // Scale SL/TP by lot size

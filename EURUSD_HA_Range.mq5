@@ -166,7 +166,7 @@ input bool   AllowMeanReversion = true; // Enable HA-confirmed mean reversion tr
 //                       If score sufficient AND no Fib barrier ahead (or already past one)
 //                       → allows CAUTION entry, logged to journal for learning.
 //                       Ideal for trending markets where the zone filter alone is misleading.
-input int    ZoneStrictness        = 1;    // 0=STRICT | 1=RELAXED (Asian relax) | 2=CONTEXT_AWARE
+input int    ZoneStrictness        = 2;    // 0=STRICT | 1=RELAXED (Asian relax) | 2=CONTEXT_AWARE
 input int    ZoneContextMinScore   = 4;    // Min confluence score (0-12) for CONTEXT_AWARE zone override
 input bool   ZonePendingEnabled    = true; // CONTEXT mode: wait for Fib/Pivot breakout before entry
 input double ZonePendingPips       = 10.0; // Pip lookahead: detect approaching Fib/Pivot within this range
@@ -3819,8 +3819,9 @@ void TryEntry()
       if(wouldBlock) {
          // ── MODE 0: STRICT ─────────────────────────────────────────────────────────────
          if(ZoneStrictness == 0) {
-            Print((tradeDir == 1 ? "BUY" : "SELL"), " skipped: ", zone,
-                  " zone (ZoneStrictness=STRICT — no exceptions)");
+            string _br = (tradeDir == 1 ? "BUY" : "SELL") + " skipped: " + zone +
+                         " zone (ZoneStrictness=STRICT — no exceptions)";
+            if(_br != g_LastBlockReason) { Print(_br); g_LastBlockReason = _br; }
             return;
 
          // ── MODE 1: RELAXED (original Asian carry-over behavior) ───────────────────────
@@ -3851,7 +3852,9 @@ void TryEntry()
                else if(!prevDayAligned)   reason = "prev-day dir not aligned (" + IntegerToString(g_PrevDayLastHourDir) + ")";
                else if(AsianZoneStrictMode) reason = "StrictMode=true";
                else if(!ciConfirms)       reason = "CI band not confirmed (price not pushing into zone)";
-               Print((tradeDir == 1 ? "BUY" : "SELL"), " skipped: ", zone, " zone (", reason, ")");
+               string _br = (tradeDir == 1 ? "BUY" : "SELL") + " skipped: " + zone +
+                            " zone (" + reason + ")";
+               if(_br != g_LastBlockReason) { Print(_br); g_LastBlockReason = _br; }
                return;
             }
 
@@ -3862,9 +3865,10 @@ void TryEntry()
 
             if(ctxScore < ZoneContextMinScore) {
                // Not enough confluence to override the zone filter
-               Print((tradeDir == 1 ? "BUY" : "SELL"), " skipped: ", zone,
-                     " zone [CONTEXT score=", ctxScore, "/12, need ",
-                     ZoneContextMinScore, "+ for override]");
+               string _br = (tradeDir == 1 ? "BUY" : "SELL") + " skipped: " + zone +
+                            " zone [CONTEXT score=" + IntegerToString(ctxScore) + "/12, need " +
+                            IntegerToString(ZoneContextMinScore) + "+ for override]";
+               if(_br != g_LastBlockReason) { Print(_br); g_LastBlockReason = _br; }
                g_ZonePending = false;
                return;
             }

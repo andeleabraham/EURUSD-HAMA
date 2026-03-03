@@ -2774,19 +2774,109 @@ void EvaluateHAPattern()
       g_Signal            = "WAITING";
    }
 
-   // === STILL PREPARING diagnostic — log ALL blocking gates after 2+ confirming candles ===
+   // === STILL PREPARING diagnostic — structured confirmed / pending / next-gate report ===
    if((g_Signal == "PREPARING BUY" || g_Signal == "PREPARING SELL") && g_HAConsecCount >= 2) {
-      bool biasBlocked = (g_Signal == "PREPARING BUY")  ? (g_TotalBias <= -2) :
-                         (g_Signal == "PREPARING SELL") ? (g_TotalBias >=  2) : false;
-      bool cooldownActive = (g_CooldownUntil > TimeCurrent());
-      Print("STILL " + g_Signal + " after ", g_HAConsecCount, " bars — gate check:",
-            " Zone=", g_ZoneLabel,
-            " Bias=", g_TotalBias, (biasBlocked ? " [BIAS BLOCK]" : ""),
-            " BollMid=", DoubleToString(g_BollingerMid1, 5),
-            " Conf=", DoubleToString(g_Confidence, 1), "%/", MinConfidence, "%min",
-            " DailyTrades=", g_DailyTradeCount, "/", MaxDailyTrades,
-            " Cooldown=", (cooldownActive ? "YES" : "no"),
-            " TradeOpen=", (g_TradeOpen ? "YES" : "no"));
+      int  trD      = (g_Signal == "PREPARING BUY") ? 1 : -1;
+      bool isBuy    = (trD == 1);
+
+      // --- Recompute Bollinger gate status (mirrors state-machine logic above) ---
+      double hpO1, hpH1, hpL1, hpC1, hpO2, hpH2, hpL2, hpC2;
+      CalcHA(1, hpO1, hpH1, hpL1, hpC1);
+      CalcHA(2, hpO2, hpH2, hpL2, hpC2);
+      double hpBodyMid1 = (hpO1 + hpC1) / 2.0;
+      double hpBodyMid2 = (hpO2 + hpC2) / 2.0;
+      double hpBandPips = (g_BollingerUpper1 > 0 && g_BollingerLower1 > 0)
+                          ? (g_BollingerUpper1 - g_BollingerLower1) / _Point / 10.0 : 999.0;
+      bool   hpNarrow   = (g_BollingerUpper1 > 0 && hpBandPips < NarrowBandPips);
+      bool   hpBollOK   = false;
+      string hpBollReq  = "";
+      string hpBollStat = "";
+      if(g_BollingerMid1 <= 0) {
+         hpBollOK   = true;
+         hpBollStat = "no Boll data";
+      } else if(hpNarrow) {
+         if(isBuy) {
+            hpBollOK   = (hpH1 >= g_BollingerMid1 && hpBodyMid1 <= g_BollingerUpper1 && hpH2 >= g_BollingerMid2);
+            hpBollReq  = "HA_H >= BollMid + HA_H2 >= BollMid2 [NARROW band]";
+            hpBollStat = "HA_H1=" + DoubleToString(hpH1,5) + " BollMid=" + DoubleToString(g_BollingerMid1,5)
+                         + " H2=" + DoubleToString(hpH2,5) + " BollMid2=" + DoubleToString(g_BollingerMid2,5);
+         } else {
+            hpBollOK   = (hpL1 <= g_BollingerMid1 && hpBodyMid1 >= g_BollingerLower1 && hpL2 <= g_BollingerMid2);
+            hpBollReq  = "HA_L <= BollMid + HA_L2 <= BollMid2 [NARROW band]";
+            hpBollStat = "HA_L1=" + DoubleToString(hpL1,5) + " BollMid=" + DoubleToString(g_BollingerMid1,5)
+                         + " L2=" + DoubleToString(hpL2,5) + " BollMid2=" + DoubleToString(g_BollingerMid2,5);
+         }
+      } else {
+         if(isBuy) {
+            hpBollOK   = (hpBodyMid1 <= g_BollingerMid1 && hpBodyMid2 <= g_BollingerMid2);
+            hpBollReq  = "BodyMid1 <= BollMid AND BodyMid2 <= BollMid2";
+            hpBollStat = "BodyMid1=" + DoubleToString(hpBodyMid1,5) + " BollMid=" + DoubleToString(g_BollingerMid1,5)
+                         + " BodyMid2=" + DoubleToString(hpBodyMid2,5) + " BollMid2=" + DoubleToString(g_BollingerMid2,5);
+         } else {
+            hpBollOK   = (hpBodyMid1 >= g_BollingerMid1 && hpBodyMid2 >= g_BollingerMid2);
+            hpBollReq  = "BodyMid1 >= BollMid AND BodyMid2 >= BollMid2";
+            hpBollStat = "BodyMid1=" + DoubleToString(hpBodyMid1,5) + " BollMid=" + DoubleToString(g_BollingerMid1,5)
+                         + " BodyMid2=" + DoubleToString(hpBodyMid2,5) + " BollMid2=" + DoubleToString(g_BollingerMid2,5);
+         }
+      }
+
+      // --- TryEntry gate pre-checks (forward look once Bollinger clears) ---
+      bool hpBiasOK      = isBuy ? (g_TotalBias > -2) : (g_TotalBias < 2);
+      bool hpConfOK      = (g_Confidence >= MinConfidence);
+      bool hpDailyOK     = (MaxDailyTrades == 0 || g_DailyTradeCount < MaxDailyTrades);
+      bool hpCooldownOK  = !(g_CooldownUntil > 0 && TimeCurrent() < g_CooldownUntil);
+      bool hpTradeOpenOK = !g_TradeOpen;
+      bool hpZoneOK      = !(isBuy  && g_ZoneLabel == "UPPER_THIRD" && g_RangeHigh > 0) &&
+                           !(!isBuy && g_ZoneLabel == "LOWER_THIRD" && g_RangeLow  > 0);
+
+      MqlDateTime hpDt; TimeToStruct(TimeCurrent(), hpDt);
+      bool hpTimeOK = (NoEntryAfterHour == 0 || hpDt.hour < NoEntryAfterHour);
+      bool hpForeignOK = !(RespectForeignTrades && g_ForeignCountSymbol > 0);
+      bool hpDailyLossOK = (MaxDailyLossUSD == 0 || g_DailyPnL > -MaxDailyLossUSD);
+
+      // --- MTF / SMC (informational — scored via confidence) ---
+      string hpMTF = g_MTFAligned ? "ALIGNED" : "diverged";
+      string hpH4  = g_NearH4BullOB || g_NearBullH4FVG ? "BULL zone" :
+                     g_NearH4BearOB || g_NearBearH4FVG ? "BEAR zone" : "none near";
+
+      // --- Compose confirmed list ---
+      string confirmed = "";
+      confirmed += "  ✓ HA " + (isBuy ? "BULL" : "BEAR") + " x" + IntegerToString(g_HAConsecCount) + "/" + IntegerToString(MaxConsecCandles);
+      confirmed += " | Zone=" + g_ZoneLabel;
+      confirmed += " | Bias=" + IntegerToString(g_TotalBias) + (hpBiasOK ? " ok" : " [BLOCKED]");
+      if(g_MTFAligned) confirmed += " | MTF=" + hpMTF;
+      if(g_NearBullFVG || g_NearBearFVG) confirmed += " | H1FVG=" + (g_NearBullFVG ? "BULL" : "BEAR");
+      if(g_BullOB_High > 0 || g_BearOB_High > 0) confirmed += " | H1OB=" + (g_BullOB_High > 0 ? "BULL" : "BEAR");
+
+      // --- Compose pending (current blocker) ---
+      string pending = "";
+      if(!hpBollOK) {
+         pending += "  ✗ [Bollinger] " + hpBollReq + "\n";
+         pending += "      Values: " + hpBollStat;
+         if(hpNarrow) pending += " | BandWidth=" + DoubleToString(hpBandPips,1) + "pip (NARROW < " + DoubleToString(NarrowBandPips,1) + "p)";
+      } else {
+         pending += "  ✓ Bollinger gate CLEAR";
+      }
+
+      // --- Compose next-gate forward look ---
+      string nextGates = "";
+      nextGates += "  " + (hpZoneOK      ? "✓" : "✗") + " Zone=" + g_ZoneLabel + " (" + (isBuy?"need not UPPER_THIRD":"need not LOWER_THIRD") + ")";
+      nextGates += " | " + (hpBiasOK     ? "✓" : "✗") + " Bias=" + IntegerToString(g_TotalBias);
+      nextGates += " | " + (hpConfOK     ? "✓" : "✗") + " Conf=" + DoubleToString(g_Confidence,1) + "% (min " + DoubleToString(MinConfidence,1) + "%)";
+      nextGates += "\n  " + (hpDailyOK   ? "✓" : "✗") + " DailyTrades=" + IntegerToString(g_DailyTradeCount) + "/" + IntegerToString(MaxDailyTrades);
+      nextGates += " | " + (hpDailyLossOK? "✓" : "✗") + " DailyPnL=$" + DoubleToString(g_DailyPnL,2) + " (limit=$-" + DoubleToString(MaxDailyLossUSD,2) + ")";
+      nextGates += " | " + (hpCooldownOK ? "✓" : "✗") + " Cooldown=" + (hpCooldownOK ? "none" : TimeToString(g_CooldownUntil, TIME_MINUTES));
+      nextGates += " | " + (hpTimeOK     ? "✓" : "✗") + " Time=" + IntegerToString(hpDt.hour) + "h (NoEntryAfter=" + IntegerToString(NoEntryAfterHour) + ")";
+      nextGates += "\n  " + (hpForeignOK ? "✓" : "✗") + " ForeignTrades=" + IntegerToString(g_ForeignCountSymbol);
+      nextGates += " | " + (hpTradeOpenOK? "✓" : "✗") + " TradeOpen=" + (g_TradeOpen ? "YES" : "no");
+      nextGates += " | Struct=" + g_StructureLabel + " MacroStr=" + g_MacroStructLabel;
+      nextGates += " | H4zones=" + hpH4;
+      if(g_BoldBet) nextGates += " | BOLD BET active";
+
+      Print("STILL " + g_Signal + " — bar " + IntegerToString(g_HAConsecCount) + " of max " + IntegerToString(MaxConsecCandles) + "\n",
+            "  CONFIRMED:\n", confirmed, "\n",
+            "  CURRENT BLOCKER:\n", pending, "\n",
+            "  NEXT GATES (after Bollinger):\n", nextGates);
    }
 
    // === MEAN REVERSION TWO-CANDLE STATE MACHINE ===

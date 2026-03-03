@@ -252,6 +252,8 @@ bool   g_MacroBOS   = false;                           // Macro Break of Structu
 bool   g_MacroCHoCH = false;                           // Macro Change of Character (major reversal signal)
 bool   g_MTFAligned = false;   // true when macro (H4) and intermediate (H1) agree on direction
 bool   g_BoldBet    = false;   // true when MTF aligned + FVG or OB present + HA valid
+bool   g_BollOverridden     = false;  // true when Bollinger gate was bypassed by confluence override
+string g_BollOverrideReason = "";     // factors that triggered the override
 
 // Liquidity Sweep detection
 bool   g_LiquiditySweep = false;             // price swept a key level and reversed

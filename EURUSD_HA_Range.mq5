@@ -130,6 +130,21 @@ input double MidZonePct       = 0.30;   // Mid zone = middle 30% of range (15% e
 input double ExtremePct       = 0.15;   // Extreme zone = outer 15% near H/L (avoid for trend)
 // Mean reversion: enter when HA confirms bounce from range extreme
 input bool   AllowMeanReversion = true; // Enable HA-confirmed mean reversion trades at range extremes
+//
+// Zone strictness controls how "wrong zone" trend trades are treated:
+//   0 = STRICT        — Hard block. Zone is an absolute barrier; no exceptions ever.
+//   1 = RELAXED       — Block unless Asian session + prev-day carry-over bias (original default).
+//   2 = CONTEXT_AWARE — Smart mode. Scores structural confluence (up to 12 points):
+//                       If score >= ZoneContextMinScore AND price is approaching a Fib/Pivot level
+//                       → sets PENDING state; waits for that level to break + momentum before entry.
+//                       If score sufficient AND no Fib barrier ahead (or already past one)
+//                       → allows CAUTION entry, logged to journal for learning.
+//                       Ideal for trending markets where the zone filter alone is misleading.
+input int    ZoneStrictness        = 1;    // 0=STRICT | 1=RELAXED (Asian relax) | 2=CONTEXT_AWARE
+input int    ZoneContextMinScore   = 4;    // Min confluence score (0-12) for CONTEXT_AWARE zone override
+input bool   ZonePendingEnabled    = true; // CONTEXT mode: wait for Fib/Pivot breakout before entry
+input double ZonePendingPips       = 10.0; // Pip lookahead: detect approaching Fib/Pivot within this range
+input int    ZonePendingMaxBars    = 4;    // CONTEXT mode: auto-expire pending wait after N M15 bars (4=1hr)
 
 input group "=== ATR & RANGE CONFIDENCE ==="
 input int    ATRPeriod        = 14;
@@ -262,6 +277,13 @@ string g_BollOverrideReason = "";     // factors that triggered the override
 string g_BoldTier           = "NORMAL"; // entry tier: "NORMAL" / "SMALL_BOLD" / "HUGE_BOLD"
 int    g_BarsSinceLevelBreak = 999;      // bars since a key level was crossed in setup direction
 string g_LevelBreakLabel    = "";        // which level was broken
+
+// Zone-pending state (CONTEXT_AWARE ZoneStrictness=2)
+bool     g_ZonePending          = false;     // True: zone-blocked trade awaiting Fib/Pivot breakout
+string   g_ZonePendingLevel     = "";        // Level being monitored (e.g. "Fib 61.8%", "Pivot S1")
+int      g_ZonePendingDir       = 0;         // Direction of pending trade (1=buy, -1=sell)
+datetime g_ZonePendingStartTime = 0;         // Time pending state was set (bars elapsed computed from delta)
+bool     g_ZoneContextUsed      = false;     // True when CONTEXT_AWARE allowed a wrong-zone CAUTION entry
 
 // Liquidity Sweep detection
 bool   g_LiquiditySweep = false;             // price swept a key level and reversed
@@ -2702,6 +2724,119 @@ int CheckLevelBreakBars(int tradeDir)
    return 999;
 }
 
+//+------------------------------------------------------------------+
+//| ZONE CONTEXT SCORE                                               |
+//| Evaluates structural confluence to decide whether a wrong-zone  |
+//| trend trade should be allowed (CONTEXT_AWARE mode). Returns 0-12|
+//| — higher = stronger evidence the trend should override the zone. |
+//+------------------------------------------------------------------+
+int ZoneContextScore(int tradeDir)
+{
+   int score = 0;
+
+   // 1-2: Key level break recency (most powerful signal — price broke structure in trade dir)
+   int brkBars = CheckLevelBreakBars(tradeDir);
+   if(brkBars <= MaxConsecCandles * 2)    score += 2;   // recent: ≤ 2× MaxConsec bars
+   else if(brkBars <= MaxConsecCandles * 4) score += 1; // moderate: ≤ 4× MaxConsec bars
+
+   // 3-4: H4 macro structure (heaviest non-level weight)
+   if(tradeDir ==  1 && g_MacroStructLabel == "BULLISH") score += 2;
+   if(tradeDir == -1 && g_MacroStructLabel == "BEARISH") score += 2;
+
+   // 5: H1 swing structure aligned
+   if(tradeDir ==  1 && g_StructureLabel == "BULLISH") score++;
+   if(tradeDir == -1 && g_StructureLabel == "BEARISH") score++;
+
+   // 6: H1 BOS (recent short-term structural break)
+   if(g_BOS) score++;
+
+   // 7: Macro BOS on H4 (multi-day structural break = high-conviction trending move)
+   if(g_MacroBOS) score++;
+
+   // 8: Volume elevated (institutional participation confirms the move)
+   if(g_VolumeState == "HIGH" || g_VolumeState == "ABOVE_AVG") score++;
+
+   // 9: HA consecutive >= 3 (price is trending, not ranging)
+   if(g_HAConsecCount >= 3) score++;
+
+   // 10: MTF alignment (H4 + H1 both point the same way = fullest conviction)
+   if(g_MTFAligned) score++;
+
+   // 11: Liquidity sweep in trade direction (stop hunt confirms directional intent)
+   if(g_LiquiditySweep && g_SweepDir == tradeDir) score++;
+
+   return score;   // max 12
+}
+
+//+------------------------------------------------------------------+
+//| FIB LEVEL PRICE LOOKUP                                           |
+//| Returns the price of a named Fib/Pivot level. Returns 0 if the  |
+//| name is not recognised or data is not yet available.             |
+//+------------------------------------------------------------------+
+double FibLevelPrice(string levelName)
+{
+   if(levelName == "Pivot PP")  return g_PivotPP;
+   if(levelName == "Pivot R1")  return g_PivotR1;
+   if(levelName == "Pivot S1")  return g_PivotS1;
+   if(levelName == "Pivot R2")  return g_PivotR2;
+   if(levelName == "Pivot S2")  return g_PivotS2;
+   if(levelName == "Fib 23.6%") return g_Fib236;
+   if(levelName == "Fib 38.2%") return g_Fib382;
+   if(levelName == "Fib 50.0%") return g_Fib500;
+   if(levelName == "Fib 61.8%") return g_Fib618;
+   if(levelName == "Fib 76.4%") return g_Fib764;
+   return 0;
+}
+
+//+------------------------------------------------------------------+
+//| FIB/PIVOT APPROACHING LEVEL                                      |
+//| Finds the closest Fib/Pivot level that is AHEAD of 'price' in   |
+//| the 'tradeDir' direction and within 'pipRadius' pips.            |
+//|  BUY  (tradeDir=+1): looks for resistance ABOVE price.          |
+//|  SELL (tradeDir=-1): looks for support BELOW price.             |
+//| Returns the level name, or "" if none found within range.       |
+//+------------------------------------------------------------------+
+string FibApproachingLevel(double price, int tradeDir, double pipRadius)
+{
+   double r = pipRadius * _Point * 10.0;   // pips → price
+   if(r <= 0 || price <= 0) return "";
+
+   string lvlNames[12];
+   double lvlPrices[12];
+   int    cnt = 0;
+
+   if(UseDailyPivot && g_PivotPP > 0) {
+      lvlNames[cnt] = "Pivot PP"; lvlPrices[cnt++] = g_PivotPP;
+      lvlNames[cnt] = "Pivot R1"; lvlPrices[cnt++] = g_PivotR1;
+      lvlNames[cnt] = "Pivot S1"; lvlPrices[cnt++] = g_PivotS1;
+      lvlNames[cnt] = "Pivot R2"; lvlPrices[cnt++] = g_PivotR2;
+      lvlNames[cnt] = "Pivot S2"; lvlPrices[cnt++] = g_PivotS2;
+   }
+   if(g_Fib382 > 0) {
+      lvlNames[cnt] = "Fib 23.6%"; lvlPrices[cnt++] = g_Fib236;
+      lvlNames[cnt] = "Fib 38.2%"; lvlPrices[cnt++] = g_Fib382;
+      lvlNames[cnt] = "Fib 50.0%"; lvlPrices[cnt++] = g_Fib500;
+      lvlNames[cnt] = "Fib 61.8%"; lvlPrices[cnt++] = g_Fib618;
+      lvlNames[cnt] = "Fib 76.4%"; lvlPrices[cnt++] = g_Fib764;
+   }
+
+   string closest     = "";
+   double closestDist = r + 1;
+   for(int i = 0; i < cnt; i++) {
+      if(lvlPrices[i] <= 0) continue;
+      double delta = lvlPrices[i] - price;   // positive = above, negative = below
+      // BUY  → resistance ahead: level above price → delta ∈ (0, r]
+      // SELL → support ahead:   level below price → delta ∈ [-r, 0)
+      bool ahead = (tradeDir == 1) ? (delta > 0 && delta <= r)
+                                   : (delta < 0 && delta >= -r);
+      if(ahead) {
+         double dist = MathAbs(delta);
+         if(dist < closestDist) { closestDist = dist; closest = lvlNames[i]; }
+      }
+   }
+   return closest;
+}
+
 bool BollingerOverrideCheck(int tradeDir, string &reason)
 {
    int    score   = 0;
@@ -2786,6 +2921,8 @@ void EvaluateHAPattern()
       g_BoldTier           = "NORMAL";   // fresh arm — reset tier
       g_BollOverridden     = false;
       g_BollOverrideReason = "";
+      g_ZonePending        = false;
+      g_ZoneContextUsed    = false;
       g_Signal             = "PREPARING BUY";
       Print("PREPARING BUY: Bottomless bull candle detected (bar1). ",
             "Consec=", g_HAConsecCount, "/", MaxConsecCandles,
@@ -2892,9 +3029,11 @@ void EvaluateHAPattern()
          }
          if(didReset) {
             Print("BUY SETUP EXPIRED: Consec=", g_HAConsecCount, " exceeded MaxConsecCandles=", MaxConsecCandles, " — setup reset.");
-            g_BoldTier          = "NORMAL";
-            g_Signal            = "WAITING";
-            g_HABullSetup       = false;
+            g_BoldTier        = "NORMAL";
+            g_ZonePending     = false;
+            g_ZoneContextUsed = false;
+            g_Signal          = "WAITING";
+            g_HABullSetup     = false;
             g_ConfirmCandleOpen = 0;
          }
       }
@@ -2908,6 +3047,8 @@ void EvaluateHAPattern()
       g_BoldTier           = "NORMAL";   // fresh arm — reset tier
       g_BollOverridden     = false;
       g_BollOverrideReason = "";
+      g_ZonePending        = false;
+      g_ZoneContextUsed    = false;
       g_Signal             = "PREPARING SELL";
       Print("PREPARING SELL: Topless bear candle detected (bar1). ",
             "Consec=", g_HAConsecCount, "/", MaxConsecCandles,
@@ -3005,9 +3146,11 @@ void EvaluateHAPattern()
          }
          if(didReset) {
             Print("SELL SETUP EXPIRED: Consec=", g_HAConsecCount, " exceeded MaxConsecCandles=", MaxConsecCandles, " — setup reset.");
-            g_BoldTier          = "NORMAL";
-            g_Signal            = "WAITING";
-            g_HABearSetup       = false;
+            g_BoldTier        = "NORMAL";
+            g_ZonePending     = false;
+            g_ZoneContextUsed = false;
+            g_Signal          = "WAITING";
+            g_HABearSetup     = false;
             g_ConfirmCandleOpen = 0;
          }
       }
@@ -3017,12 +3160,16 @@ void EvaluateHAPattern()
       g_HABearSetup       = false;
       g_ConfirmCandleOpen = 0;
       g_BoldTier          = "NORMAL";
+      g_ZonePending       = false;
+      g_ZoneContextUsed   = false;
       g_Signal            = "WAITING";
    }
    else if(dir1 == -1 && g_HABullSetup) {
       g_HABullSetup       = false;
       g_ConfirmCandleOpen = 0;
       g_BoldTier          = "NORMAL";
+      g_ZonePending       = false;
+      g_ZoneContextUsed   = false;
       g_Signal            = "WAITING";
    }
 
@@ -3104,6 +3251,12 @@ void EvaluateHAPattern()
                                               + " LvlBreak=" + (g_BarsSinceLevelBreak < 999
                                                 ? g_LevelBreakLabel + "(" + IntegerToString(g_BarsSinceLevelBreak) + "b)"
                                                 : "none");
+      if(g_ZonePending)
+         confirmed += " | 🕐ZONE-PENDING=" + g_ZonePendingLevel + "("
+                      + IntegerToString((int)((TimeCurrent()-g_ZonePendingStartTime)/PeriodSeconds(PERIOD_M15)))
+                      + "b elapsed)";
+      else if(g_ZoneContextUsed)
+         confirmed += " | 🟡ZONE-CONTEXT-OVERRIDE (ZoneStrictness=" + IntegerToString(ZoneStrictness) + ")";
 
       // --- Compose pending (current blocker) ---
       string pending = "";
@@ -3516,63 +3669,138 @@ void TryEntry()
    //   that price is genuinely pushing into the (unfavorable) zone rather than drifting.
 
    g_AsianZoneRelaxed = false;
+   g_ZoneContextUsed  = false;
    if(isTrendSignal && !isMeanRev) {
       MqlDateTime zdt; TimeToStruct(TimeCurrent(), zdt);
       bool inAsian = (zdt.hour >= AsianStartHour && zdt.hour < AsianEndHour);
 
-      // Determine whether we would normally block this trade
+      // Determine whether we would normally block this trade (trending into unfavourable zone)
       bool wouldBlock = (tradeDir == 1  && zone == "UPPER_THIRD" && g_RangeHigh > 0) ||
                         (tradeDir == -1 && zone == "LOWER_THIRD" && g_RangeLow  > 0);
 
+      // Cancel stale pending state if direction flipped
+      if(g_ZonePending && g_ZonePendingDir != tradeDir)
+         g_ZonePending = false;
+
       if(wouldBlock) {
-         // Asian relax conditions:
-         // 1. In Asian session
-         // 2. Prev-day last hour moved in the same direction (carry-over bias)
-         // 3. AsianZoneStrictMode = false (default)
-         // 4. CI band confirmation: price is genuinely pushing into the zone
-         //    BUY into UPPER_THIRD: HA high >= Bollinger upper band (breakout momentum, not drift)
-         //    SELL into LOWER_THIRD: HA low <= Bollinger lower band
-         bool prevDayAligned = (AsianPrevDayMomEnabled && g_PrevDayLastHourDir == tradeDir);
-
-         // CI (Confidence-Interval) range check using Bollinger bands as proxy
-         // For buy in upper third: at least the wick reached above upper band — real push
-         // For sell in lower third: at least the wick reached below lower band — real push
-         bool ciConfirms = false;
-         if(tradeDir == 1 && g_BollingerUpper1 > 0) {
-            double haO1z, haH1z, haL1z, haC1z;
-            CalcHA(1, haO1z, haH1z, haL1z, haC1z);
-            ciConfirms = (haH1z >= g_BollingerUpper1);   // high reached or exceeded upper band
-         } else if(tradeDir == -1 && g_BollingerLower1 > 0) {
-            double haO1z, haH1z, haL1z, haC1z;
-            CalcHA(1, haO1z, haH1z, haL1z, haC1z);
-            ciConfirms = (haL1z <= g_BollingerLower1);   // low reached or exceeded lower band
-         } else {
-            ciConfirms = true;   // no band data — don't block on CI
-         }
-
-         bool canRelax = inAsian && prevDayAligned && !AsianZoneStrictMode && ciConfirms;
-
-         if(canRelax) {
-            g_AsianZoneRelaxed = true;
-            Print("ASIAN ZONE RELAX: zone=", zone,
-                  " signal=", g_Signal,
-                  " PrevDayDir=", g_PrevDayLastHourDir,
-                  " CI=OK — entering with CAUTION (standard SL, no zone block).");
-            // Do NOT return — allow the trade to proceed
-         } else {
-            // Block as normal, but explain why relax was not granted
-            string reason = "";
-            if(!inAsian)           reason = "not in Asian session";
-            else if(!prevDayAligned) reason = "prev-day dir not aligned (" + IntegerToString(g_PrevDayLastHourDir) + ")";
-            else if(AsianZoneStrictMode) reason = "StrictMode=true";
-            else if(!ciConfirms)   reason = "CI band not confirmed (price not pushing into zone)";
-            if(tradeDir == 1)
-               Print("BUY skipped: UPPER_THIRD zone (" + reason + ")");
-            else
-               Print("SELL skipped: LOWER_THIRD zone (" + reason + ")");
+         // ── MODE 0: STRICT ─────────────────────────────────────────────────────────────
+         if(ZoneStrictness == 0) {
+            Print((tradeDir == 1 ? "BUY" : "SELL"), " skipped: ", zone,
+                  " zone (ZoneStrictness=STRICT — no exceptions)");
             return;
+
+         // ── MODE 1: RELAXED (original Asian carry-over behavior) ───────────────────────
+         } else if(ZoneStrictness == 1) {
+            bool prevDayAligned = (AsianPrevDayMomEnabled && g_PrevDayLastHourDir == tradeDir);
+            bool ciConfirms     = false;
+            if(tradeDir == 1 && g_BollingerUpper1 > 0) {
+               double haO1z, haH1z, haL1z, haC1z;
+               CalcHA(1, haO1z, haH1z, haL1z, haC1z);
+               ciConfirms = (haH1z >= g_BollingerUpper1);   // wick reached or exceeded upper band
+            } else if(tradeDir == -1 && g_BollingerLower1 > 0) {
+               double haO1z, haH1z, haL1z, haC1z;
+               CalcHA(1, haO1z, haH1z, haL1z, haC1z);
+               ciConfirms = (haL1z <= g_BollingerLower1);   // wick at or below lower band
+            } else {
+               ciConfirms = true;   // no band data — don't block on CI
+            }
+            bool canRelax = inAsian && prevDayAligned && !AsianZoneStrictMode && ciConfirms;
+            if(canRelax) {
+               g_AsianZoneRelaxed = true;
+               Print("ASIAN ZONE RELAX: zone=", zone, " signal=", g_Signal,
+                     " PrevDayDir=", g_PrevDayLastHourDir,
+                     " CI=OK — entering with CAUTION (standard SL, no zone block).");
+               // fall through to trade
+            } else {
+               string reason = "";
+               if(!inAsian)               reason = "not in Asian session";
+               else if(!prevDayAligned)   reason = "prev-day dir not aligned (" + IntegerToString(g_PrevDayLastHourDir) + ")";
+               else if(AsianZoneStrictMode) reason = "StrictMode=true";
+               else if(!ciConfirms)       reason = "CI band not confirmed (price not pushing into zone)";
+               Print((tradeDir == 1 ? "BUY" : "SELL"), " skipped: ", zone, " zone (", reason, ")");
+               return;
+            }
+
+         // ── MODE 2: CONTEXT_AWARE (structural confluence + Fib/Pivot pending logic) ────
+         } else {
+            // Step 1: score structural confluence — how strong is the trend evidence?
+            int ctxScore = ZoneContextScore(tradeDir);
+
+            if(ctxScore < ZoneContextMinScore) {
+               // Not enough confluence to override the zone filter
+               Print((tradeDir == 1 ? "BUY" : "SELL"), " skipped: ", zone,
+                     " zone [CONTEXT score=", ctxScore, "/12, need ",
+                     ZoneContextMinScore, "+ for override]");
+               g_ZonePending = false;
+               return;
+            }
+
+            // Step 2: check for a Fib/Pivot level in the trade direction
+            string atLvl      = NearFibPivotLevel(price);              // within FibPivotZonePips
+            string approachLvl = ZonePendingEnabled
+                                 ? FibApproachingLevel(price, tradeDir, ZonePendingPips)
+                                 : "";
+
+            if(g_ZonePending && g_ZonePendingDir == tradeDir) {
+               // ── Continuing an existing PENDING wait — check if barrier was breached ──
+               int barsSince = (int)((TimeCurrent() - g_ZonePendingStartTime)
+                                     / PeriodSeconds(PERIOD_M15));
+               double recentRange = iHigh(_Symbol, PERIOD_M15, 1) - iLow(_Symbol, PERIOD_M15, 1);
+               bool momentumOK   = (g_ATR > 0 && recentRange >= g_ATR * 0.30);
+               double pendLvlPx  = FibLevelPrice(g_ZonePendingLevel);
+               bool levelBroken  = false;
+               if(pendLvlPx > 0) {
+                  double tol = FibPivotZonePips * _Point * 10.0;
+                  levelBroken = (tradeDir == 1) ? (price >= pendLvlPx - tol)
+                                                : (price <= pendLvlPx + tol);
+               } else {
+                  levelBroken = true;   // level data gone — let it through
+               }
+               if(levelBroken && momentumOK) {
+                  Print("ZONE PENDING RESOLVED: ", g_ZonePendingLevel,
+                        " breached + momentum (", DoubleToString(recentRange * 10000, 1),
+                        " pip range vs ATR=", DoubleToString(g_ATR * 10000, 1),
+                        ") after ", barsSince, " bars — CAUTION entry");
+                  g_ZonePending     = false;
+                  g_ZoneContextUsed = true;
+                  // fall through to trade
+               } else if(barsSince >= ZonePendingMaxBars) {
+                  string expReason = levelBroken ? "level reached but no momentum"
+                                                 : g_ZonePendingLevel + " not yet breached";
+                  Print("ZONE PENDING EXPIRED after ", barsSince, " bars — ", expReason, " — resetting");
+                  g_ZonePending = false;
+                  return;
+               } else {
+                  string pndMsg = levelBroken ? "level reached, awaiting momentum"
+                                              : ("awaiting " + g_ZonePendingLevel + " breakout");
+                  Print("ZONE PENDING: ", pndMsg, " (", barsSince, "/", ZonePendingMaxBars,
+                        " bars elapsed, score=", ctxScore, "/12)");
+                  return;
+               }
+
+            } else if(approachLvl != "" && atLvl == "") {
+               // ── Price approaching (but not yet at) a key level — defer entry ──────────
+               g_ZonePending          = true;
+               g_ZonePendingLevel     = approachLvl;
+               g_ZonePendingDir       = tradeDir;
+               g_ZonePendingStartTime = TimeCurrent();
+               Print("ZONE PENDING SET: ", zone, " zone, score=", ctxScore, "/12",
+                     " — approaching ", approachLvl, " within ",
+                     DoubleToString(ZonePendingPips, 1),
+                     " pips; waiting for breakout + momentum before entry");
+               return;
+
+            } else {
+               // ── No Fib barrier ahead, or price already at/past level — CAUTION entry ──
+               string ctx = "score=" + IntegerToString(ctxScore) + "/12"
+                           + (atLvl != "" ? " | at/past " + atLvl : " | no Fib barrier ahead");
+               Print("ZONE CONTEXT OVERRIDE: ", zone, " — ", ctx,
+                     " — CAUTION entry (structural confluence overrides zone filter)");
+               g_ZoneContextUsed = true;
+               // fall through to trade
+            }
          }
-      }
+      } // end if(wouldBlock)
    }
 
    // === MID-ZONE ENTRY VALIDATION ===

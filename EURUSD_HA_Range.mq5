@@ -104,6 +104,8 @@ input bool   UseSwingStructure   = true;   // Detect H1 swing highs/lows for BOS
 input bool   UseMacroStructure   = true;   // Detect higher-TF swing structure (H4/D1) for macro bias
 input ENUM_TIMEFRAMES MacroStructTF = PERIOD_H4; // Higher timeframe to use for macro structure
 input double BoldBetMinConf      = 55.0;   // Min confidence % to trigger a bold-bet entry (MTF + FVG/OB aligned)
+input bool   BollOverrideEnabled = true;   // Allow Bollinger gate to be bypassed by strong structural confluence
+input int    BollOverrideMinScore= 3;      // Min confluence score (out of 10) needed to override Bollinger gate
 input bool   UseOrderBlocks      = true;   // Detect H1 institutional order blocks
 input double OBMinBodyPips       = 8.0;    // Minimum OB candle body size in pips (filters doji/tiny OBs)
 input int    OBScanBars          = 60;     // H1 bars to scan (~2.5 days; was 30)
@@ -2627,6 +2629,73 @@ int LiveHAConsecTotal()
 //| CORE HA PATTERN DETECTION                                         |
 //| Called on every new bar using confirmed closed candles           |
 //+------------------------------------------------------------------+
+//+------------------------------------------------------------------+
+//| BOLLINGER GATE OVERRIDE CHECK                                    |
+//| Called when Bollinger midline test fails. Scores 10 confluence  |
+//| factors; if score >= BollOverrideMinScore the gate is bypassed. |
+//| Rationale: when a key level has genuinely broken with structure, |
+//| volume, timing and macro backdrop the Boll midline is lagging   |
+//| behind rapidly moving price — blocking here is a false negative. |
+//| Position sizing still uses normal SL/TP — no extra risk taken.  |
+//+------------------------------------------------------------------+
+bool BollingerOverrideCheck(int tradeDir, string &reason)
+{
+   int    score   = 0;
+   string factors = "";
+   double bid     = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+
+   // 1 — CI band breached: price has already moved beyond 1.5×ATR statistical boundary
+   if(tradeDir ==  1 && g_CIHigh > 0 && bid > g_CIHigh) { score++; factors += "CI-High-break "; }
+   if(tradeDir == -1 && g_CILow  > 0 && bid < g_CILow)  { score++; factors += "CI-Low-break ";  }
+
+   // 2 — H1 swing structure aligned with trade direction
+   if(tradeDir ==  1 && g_StructureLabel == "BULLISH") { score++; factors += "H1-Struct:BULL "; }
+   if(tradeDir == -1 && g_StructureLabel == "BEARISH") { score++; factors += "H1-Struct:BEAR "; }
+
+   // 3 — H1 BOS (recent structural break, short-term momentum confirmed)
+   if(g_BOS) { score++; factors += "H1-BOS "; }
+
+   // 4 — H4 macro structure aligned
+   if(tradeDir ==  1 && g_MacroStructLabel == "BULLISH") { score++; factors += "Macro:BULL "; }
+   if(tradeDir == -1 && g_MacroStructLabel == "BEARISH") { score++; factors += "Macro:BEAR "; }
+
+   // 5 — Macro BOS (multi-day structural break — strongest structural signal)
+   if(g_MacroBOS) { score++; factors += "MacroBOS "; }
+
+   // 6 — Volume elevated (institutional participation backing the move)
+   if(g_VolumeState == "HIGH" || g_VolumeState == "ABOVE_AVG") {
+      score++; factors += "Vol:" + g_VolumeState + " ";
+   }
+
+   // 7 — Key session hour (moves that begin at session boundaries have extra follow-through)
+   if(KeyHourBonusEnabled) {
+      MqlDateTime khDt; TimeToStruct(TimeCurrent(), khDt);
+      int keyHrs[] = {0, 3, 4, 7, 8, 12, 13, 17, 21};
+      int closestMin = 99;
+      for(int ki = 0; ki < ArraySize(keyHrs); ki++) {
+         if(khDt.hour == keyHrs[ki])
+            closestMin = MathMin(closestMin, khDt.min);
+         if((khDt.hour + 1) % 24 == keyHrs[ki])
+            closestMin = MathMin(closestMin, 60 - khDt.min);
+      }
+      if(closestMin <= 30) { score++; factors += "KeyHr(" + IntegerToString(closestMin) + "m) "; }
+   }
+
+   // 8 — H4 macro supply/demand zone in trade direction (institutional price memory)
+   if(tradeDir ==  1 && (g_NearH4BullOB || g_NearBullH4FVG)) { score++; factors += "H4-DemandZone "; }
+   if(tradeDir == -1 && (g_NearH4BearOB || g_NearBearH4FVG)) { score++; factors += "H4-SupplyZone "; }
+
+   // 9 — Liquidity sweep in trade direction (stop hunt confirms directional intent)
+   if(g_LiquiditySweep && g_SweepDir == tradeDir) { score++; factors += "LiqSweep "; }
+
+   // 10 — MTF alignment (H4 and H1 both agree — fullest structural conviction)
+   if(g_MTFAligned) { score++; factors += "MTF-aligned "; }
+
+   reason = "score=" + IntegerToString(score) + "/" + IntegerToString(BollOverrideMinScore)
+            + " [" + factors + "]";
+   return (score >= BollOverrideMinScore);
+}
+
 void EvaluateHAPattern()
 {
    // bar 1 = most recently closed bar
@@ -2683,10 +2752,30 @@ void EvaluateHAPattern()
             // Standard: both body mids below midline — price still has room to rally
             bollOK = (bodyMid1 <= g_BollingerMid1 && bodyMid2 <= g_BollingerMid2);
          }
+         // Bollinger override: when strong multi-factor confluence supports the break,
+         // the Boll midline lag should not veto. Position sizing unchanged (normal SL/TP).
+         bool bollOverrideApplied = false;
+         if(!bollOK && BollOverrideEnabled) {
+            string ovReason = "";
+            if(BollingerOverrideCheck(1, ovReason)) {
+               bollOK             = true;
+               bollOverrideApplied = true;
+               g_BollOverridden     = true;
+               g_BollOverrideReason = ovReason;
+               Print("BUY: Bollinger gate OVERRIDDEN by confluence — ", ovReason);
+            } else {
+               g_BollOverridden     = false;
+               g_BollOverrideReason = "insufficient: " + ovReason;
+            }
+         } else if(bollOK) {
+            g_BollOverridden = false; g_BollOverrideReason = "";
+         }
          if(bollOK) {
             if(g_ConfirmCandleOpen == 0)
                g_ConfirmCandleOpen = iTime(_Symbol, PERIOD_M15, 1);
             g_Signal = "BUY INCOMING";
+            if(bollOverrideApplied)
+               Print("BUY INCOMING [BOLL OVERRIDE]: entering despite Boll midline — ", g_BollOverrideReason);
          } else {
             g_Signal            = "PREPARING BUY";
             g_ConfirmCandleOpen = 0;
@@ -2696,7 +2785,8 @@ void EvaluateHAPattern()
                   " BodyMid1=", DoubleToString(bodyMid1, 5),
                   " BollMid=", DoubleToString(g_BollingerMid1, 5),
                   " BollUpper=", DoubleToString(g_BollingerUpper1, 5),
-                  isNarrow ? " (need HA high >= BollMid)" : " (need body <= BollMid)");
+                  isNarrow ? " (need HA high >= BollMid)" : " (need body <= BollMid)",
+                  " | Override-check: ", g_BollOverrideReason);
          }
       } else {
          Print("BUY SETUP EXPIRED: Consec=", g_HAConsecCount, " exceeded MaxConsecCandles=", MaxConsecCandles, " — setup reset.");
@@ -2740,10 +2830,29 @@ void EvaluateHAPattern()
             // Standard: both body mids above midline
             bollOK = (bodyMid1s >= g_BollingerMid1 && bodyMid2s >= g_BollingerMid2);
          }
+         // Bollinger override: same logic as BUY side — key-level break + confluence.
+         bool bollOverrideAppliedS = false;
+         if(!bollOK && BollOverrideEnabled) {
+            string ovReasonS = "";
+            if(BollingerOverrideCheck(-1, ovReasonS)) {
+               bollOK              = true;
+               bollOverrideAppliedS = true;
+               g_BollOverridden      = true;
+               g_BollOverrideReason  = ovReasonS;
+               Print("SELL: Bollinger gate OVERRIDDEN by confluence — ", ovReasonS);
+            } else {
+               g_BollOverridden     = false;
+               g_BollOverrideReason = "insufficient: " + ovReasonS;
+            }
+         } else if(bollOK) {
+            g_BollOverridden = false; g_BollOverrideReason = "";
+         }
          if(bollOK) {
             if(g_ConfirmCandleOpen == 0)
                g_ConfirmCandleOpen = iTime(_Symbol, PERIOD_M15, 1);
             g_Signal = "SELL INCOMING";
+            if(bollOverrideAppliedS)
+               Print("SELL INCOMING [BOLL OVERRIDE]: entering despite Boll midline — ", g_BollOverrideReason);
          } else {
             g_Signal            = "PREPARING SELL";
             g_ConfirmCandleOpen = 0;
@@ -2753,7 +2862,8 @@ void EvaluateHAPattern()
                   " BodyMid1=", DoubleToString(bodyMid1s, 5),
                   " BollMid=", DoubleToString(g_BollingerMid1, 5),
                   " BollLower=", DoubleToString(g_BollingerLower1, 5),
-                  isNarrow ? " (need HA low <= BollMid)" : " (need body >= BollMid)");
+                  isNarrow ? " (need HA low <= BollMid)" : " (need body >= BollMid)",
+                  " | Override-check: ", g_BollOverrideReason);
          }
       } else {
          Print("SELL SETUP EXPIRED: Consec=", g_HAConsecCount, " exceeded MaxConsecCandles=", MaxConsecCandles, " — setup reset.");
@@ -2847,13 +2957,22 @@ void EvaluateHAPattern()
       if(g_MTFAligned) confirmed += " | MTF=" + hpMTF;
       if(g_NearBullFVG || g_NearBearFVG) confirmed += " | H1FVG=" + (g_NearBullFVG ? "BULL" : "BEAR");
       if(g_BullOB_High > 0 || g_BearOB_High > 0) confirmed += " | H1OB=" + (g_BullOB_High > 0 ? "BULL" : "BEAR");
+      if(g_BollOverridden) confirmed += " | ⚡BOLL-OVERRIDDEN (" + g_BollOverrideReason + ")";
 
       // --- Compose pending (current blocker) ---
       string pending = "";
-      if(!hpBollOK) {
+      if(!hpBollOK && !g_BollOverridden) {
          pending += "  ✗ [Bollinger] " + hpBollReq + "\n";
          pending += "      Values: " + hpBollStat;
          if(hpNarrow) pending += " | BandWidth=" + DoubleToString(hpBandPips,1) + "pip (NARROW < " + DoubleToString(NarrowBandPips,1) + "p)";
+         // Show override progress even when not yet at threshold
+         if(BollOverrideEnabled) {
+            string ovCheck = "";
+            BollingerOverrideCheck(isBuy ? 1 : -1, ovCheck);
+            pending += "\n      Override-check: " + ovCheck + " (need >= " + IntegerToString(BollOverrideMinScore) + ")";
+         }
+      } else if(g_BollOverridden) {
+         pending += "  ⚡ Bollinger gate OVERRIDDEN — " + g_BollOverrideReason;
       } else {
          pending += "  ✓ Bollinger gate CLEAR";
       }

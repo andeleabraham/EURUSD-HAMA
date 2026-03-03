@@ -194,6 +194,8 @@ input int    MaxDailyTrades     = 3;     // Max trades per day (0 = unlimited)
 input double MaxDailyLossUSD    = 5.0;   // Stop trading after cumulative daily loss exceeds this (0=disabled)
 input int    ConsecLossLimit    = 2;     // After N consecutive SL hits, pause trading
 input int    CooldownBars       = 8;     // Bars to pause after consecutive loss limit hit (8 = 2 hours)
+input int    PostTradeCoolBars  = 2;     // Cool-off bars after ANY trade closes before next entry (2 = 30 min)
+input int    StartupGraceBars   = 1;     // After restart, wait N new bars before allowing entry (re-evaluate)
 input int    NoEntryAfterHour   = 21;    // No new entries after this server hour (0-23, 0=disabled)
 input int    FridayCloseHour    = 20;    // Force close open trades on Friday at this hour (0=disabled)
 
@@ -387,6 +389,8 @@ string g_ZoneLabel    = "UNKNOWN";
 int      g_DailyTradeCount = 0;      // trades opened today
 int      g_ConsecLosses    = 0;      // consecutive SL/hard-loss exits
 datetime g_CooldownUntil   = 0;      // if > 0, no entries until this time
+datetime g_PostTradeCoolUntil = 0;   // if > 0, post-trade cooloff active until this time
+datetime g_StartupGraceUntil = 0;    // if > 0, startup grace period active until this time
 int      g_DailyWins       = 0;      // wins today (for dashboard)
 int      g_DailyLosses     = 0;      // losses today (for dashboard)
 double   g_DailyPnL        = 0.0;    // cumulative P&L today
@@ -533,6 +537,16 @@ int OnInit()
    // Seed zone label and live session bar so dashboard is correct before first tick
    UpdateLiveSessionBar();
    g_ZoneLabel = ClassifyZone(SymbolInfoDouble(_Symbol, SYMBOL_BID));
+
+   // Startup grace period: wait for N new bars before allowing any entry.
+   // This ensures the bot re-evaluates conditions from scratch after restart
+   // instead of immediately firing a cached/recovered setup.
+   if(StartupGraceBars > 0) {
+      g_StartupGraceUntil = TimeCurrent() + (datetime)(StartupGraceBars * 15 * 60);
+      Print("[STARTUP GRACE] Waiting ", StartupGraceBars, " bar(s) before allowing entries (",
+            "until ", TimeToString(g_StartupGraceUntil, TIME_MINUTES), ")");
+   }
+
    UpdateDashboard();
    Print("HA Range Bot v5 initialized. Range H=", g_RangeHigh, " L=", g_RangeLow);
    return INIT_SUCCEEDED;
@@ -3360,7 +3374,9 @@ void EvaluateHAPattern()
       bool hpBiasOK      = isBuy ? (g_TotalBias > -2) : (g_TotalBias < 2);
       bool hpConfOK      = (g_Confidence >= MinConfidence);
       bool hpDailyOK     = (MaxDailyTrades == 0 || g_DailyTradeCount < MaxDailyTrades);
-      bool hpCooldownOK  = !(g_CooldownUntil > 0 && TimeCurrent() < g_CooldownUntil);
+      bool hpCooldownOK  = !(g_CooldownUntil > 0 && TimeCurrent() < g_CooldownUntil)
+                           && !(g_PostTradeCoolUntil > 0 && TimeCurrent() < g_PostTradeCoolUntil)
+                           && !(g_StartupGraceUntil > 0 && TimeCurrent() < g_StartupGraceUntil);
       bool hpTradeOpenOK = !g_TradeOpen;
       bool hpZoneOK      = !(isBuy  && g_ZoneLabel == "UPPER_THIRD" && g_RangeHigh > 0) &&
                            !(!isBuy && g_ZoneLabel == "LOWER_THIRD" && g_RangeLow  > 0);
@@ -3436,7 +3452,16 @@ void EvaluateHAPattern()
       nextGates += " | " + (hpConfOK     ? "✓" : "✗") + " Conf=" + DoubleToString(g_Confidence,1) + "% (min " + DoubleToString(MinConfidence,1) + "%)";
       nextGates += "\n  " + (hpDailyOK   ? "✓" : "✗") + " DailyTrades=" + IntegerToString(g_DailyTradeCount) + "/" + IntegerToString(MaxDailyTrades);
       nextGates += " | " + (hpDailyLossOK? "✓" : "✗") + " DailyPnL=$" + DoubleToString(g_DailyPnL,2) + " (limit=$-" + DoubleToString(MaxDailyLossUSD,2) + ")";
-      nextGates += " | " + (hpCooldownOK ? "✓" : "✗") + " Cooldown=" + (hpCooldownOK ? "none" : TimeToString(g_CooldownUntil, TIME_MINUTES));
+      string cooldownInfo = "none";
+      if(!hpCooldownOK) {
+         if(g_CooldownUntil > 0 && TimeCurrent() < g_CooldownUntil)
+            cooldownInfo = "ConsecLoss→" + TimeToString(g_CooldownUntil, TIME_MINUTES);
+         else if(g_PostTradeCoolUntil > 0 && TimeCurrent() < g_PostTradeCoolUntil)
+            cooldownInfo = "PostTrade→" + TimeToString(g_PostTradeCoolUntil, TIME_MINUTES);
+         else if(g_StartupGraceUntil > 0 && TimeCurrent() < g_StartupGraceUntil)
+            cooldownInfo = "StartupGrace→" + TimeToString(g_StartupGraceUntil, TIME_MINUTES);
+      }
+      nextGates += " | " + (hpCooldownOK ? "✓" : "✗") + " Cooldown=" + cooldownInfo;
       nextGates += " | " + (hpTimeOK     ? "✓" : "✗") + " Time=" + IntegerToString(hpDt.hour) + "h (NoEntryAfter=" + IntegerToString(NoEntryAfterHour) + ")";
       nextGates += "\n  " + (hpForeignOK ? "✓" : "✗") + " ForeignTrades=" + IntegerToString(g_ForeignCountSymbol);
       nextGates += " | " + (hpTradeOpenOK? "✓" : "✗") + " TradeOpen=" + (g_TradeOpen ? "YES" : "no");
@@ -3725,6 +3750,24 @@ void TryEntry()
       Print("COOLDOWN expired — resuming trading (consec losses reset)");
       g_CooldownUntil = 0;
       g_ConsecLosses  = 0;
+   }
+
+   // === POST-TRADE COOLDOWN ===
+   if(g_PostTradeCoolUntil > 0 && TimeCurrent() < g_PostTradeCoolUntil) {
+      return;   // still in post-trade cooloff
+   }
+   if(g_PostTradeCoolUntil > 0 && TimeCurrent() >= g_PostTradeCoolUntil) {
+      Print("[POST-TRADE COOLDOWN] expired — resuming trading");
+      g_PostTradeCoolUntil = 0;
+   }
+
+   // === STARTUP GRACE PERIOD ===
+   if(g_StartupGraceUntil > 0 && TimeCurrent() < g_StartupGraceUntil) {
+      return;   // still in startup grace
+   }
+   if(g_StartupGraceUntil > 0 && TimeCurrent() >= g_StartupGraceUntil) {
+      Print("[STARTUP GRACE] expired — allowing entries");
+      g_StartupGraceUntil = 0;
    }
 
    // === NO ENTRY AFTER HOUR ===
@@ -4406,6 +4449,18 @@ double GetLastClosedDealProfit()
 void RecordTradeResult(double profit)
 {
    g_DailyPnL += profit;
+
+   // Post-trade cooldown: always applied after any trade (win or loss).
+   // Prevents the bot from immediately re-entering the same or opposite setup
+   // before conditions have had time to meaningfully change.
+   if(PostTradeCoolBars > 0) {
+      int coolSecs = PostTradeCoolBars * 15 * 60;
+      g_PostTradeCoolUntil = TimeCurrent() + (datetime)coolSecs;
+      Print("[POST-TRADE COOLDOWN] ", PostTradeCoolBars, " bar(s) cooloff until ",
+            TimeToString(g_PostTradeCoolUntil, TIME_MINUTES),
+            " | P&L=$", DoubleToString(profit,2));
+   }
+
    if(profit >= 0) {
       g_DailyWins++;
       g_ConsecLosses = 0;   // reset streak on any non-loss

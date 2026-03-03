@@ -129,11 +129,11 @@ input double MinConfidence       = 35.0;   // Minimum confidence % to take a tra
 // Default=true blocks it entirely so the bot does not fight a confirmed macro move.
 input bool   MacroBOSHardBlock   = true;   // Block trades against confirmed H4 MacroBOS direction
 //
-// MTF / volume divergence caution: when H4 and H1 disagree (MTF not aligned) OR volume
-// is declining against the price trend, we still take the trade (setup is valid) but
-// lock TP early at DivergenceLockTP to reduce exposure on uncertain setups.
-input bool   DivergenceCautionEnabled = true;  // Cap TP when MTF diverged or volume diverging
-input double DivergenceLockTP    = 1.00;   // TP cap in USD per 0.01 lot for divergence caution trades
+// MTF / volume divergence caution: when H4 and H1 disagree (MTF not aligned) AND volume
+// is declining against the price trend simultaneously, both signals are weak — skip the trade.
+// If only ONE of the two diverges, all other factors still support the trade → full TP.
+input bool   DivergenceCautionEnabled = true;  // Block trade when BOTH MTF diverged AND volume diverging
+input double DivergenceLockTP    = 1.00;   // (legacy — no longer used for capping; reserved for future)
 
 input group "=== RANGE ZONE FILTERS ==="
 // How far inside range boundaries before a trade is allowed (as % of total range)
@@ -3282,7 +3282,7 @@ void EvaluateHAPattern()
       if(!g_MTFAligned)  confirmed += " | ⚠️MTF-DIVERGED";
       if(g_VolDivergence) confirmed += " | ⚠️VOL-DIVERGED";
       if(!g_MTFAligned && g_VolDivergence)
-         confirmed += " → BOTH diverged: TP will be capped at $" + DoubleToString(DivergenceLockTP,2) + "/0.01lot";
+         confirmed += " → BOTH diverged: will BLOCK entry (DivergenceCautionEnabled)";
       else if(!g_MTFAligned || g_VolDivergence)
          confirmed += " → single divergence only — full TP applies";
 
@@ -3979,34 +3979,21 @@ void TryEntry()
       // HUGE_BOLD without CI: use standard TP (structural already the best estimate)
    }
 
-   // === MTF / VOLUME DIVERGENCE CAUTION ===
-   // Conditions: trade is valid but timeframe picture is mixed:
-   //   — MTF diverged: H4 macro and H1 intermediate point in DIFFERENT directions.
-   //   — Vol diverged:  price making a new high/low but tick volume is declining.
-   // Action: take the trade at normal lot size (setup itself is valid) but cap TP at
-   //   DivergenceLockTP ($1.00/0.01 by default) so we bank a small profit and exit
-   //   before the weakness materialises. SL is unchanged.
-   // Exception: mean-reversion trades already target a short move; don't double-cap.
+   // === MTF / VOLUME DIVERGENCE BLOCK ===
+   // Both conditions must fire together to block — either alone is insufficient.
+   //   MTF diverged: H4 macro and H1 intermediate point in DIFFERENT directions.
+   //   Vol diverged: price trending but tick volume declining (exhaustion signal).
+   // When only one diverges, the trade is valid and runs to full TP.
+   // Mean-reversion trades are exempt (they already target a short counter-move).
    g_DivergenceCaution = false;
    if(DivergenceCautionEnabled && !isMeanRev) {
       bool mtfDiverged = !g_MTFAligned;
       bool volDiverged = (UseVolumeAnalysis && g_VolDivergence);
-      // Only cap TP when BOTH signals are weak simultaneously.
-      // If only MTF diverged but structure/volume support the trade → full TP.
-      // If only volume diverged → full TP (isolated volume fade is not decisive).
       if(mtfDiverged && volDiverged) {
-         double capTP = DivergenceLockTP;
-         if(baseTpUSD > capTP) {
-            string divWhy = "";
-            if(mtfDiverged) divWhy += "MTF-diverged ";
-            if(volDiverged) divWhy += "Vol-diverged ";
-            Print("[DIVERGENCE CAUTION] TP locked: $", DoubleToString(baseTpUSD, 2),
-                  " → $", DoubleToString(capTP, 2),
-                  " (", StringTrimRight(divWhy), " — quick-profit mode)");
-            baseTpUSD       = capTP;
-            g_DynamicTP_USD = baseTpUSD;
-            g_DivergenceCaution = true;
-         }
+         Print("TRADE BLOCKED: MTF+Volume both diverged — H4 and H1 disagree AND volume fading.",
+               " Set DivergenceCautionEnabled=false to override.");
+         g_DivergenceCaution = true;
+         return;
       }
    }
 

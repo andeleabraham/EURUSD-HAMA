@@ -3842,9 +3842,10 @@ void TryEntry()
             bool canRelax = inAsian && prevDayAligned && !AsianZoneStrictMode && ciConfirms;
             if(canRelax) {
                g_AsianZoneRelaxed = true;
-               Print("ASIAN ZONE RELAX: zone=", zone, " signal=", g_Signal,
-                     " PrevDayDir=", g_PrevDayLastHourDir,
-                     " CI=OK — entering with CAUTION (standard SL, no zone block).");
+               string _br = "ASIAN ZONE RELAX: zone=" + zone + " signal=" + g_Signal +
+                            " PrevDayDir=" + IntegerToString(g_PrevDayLastHourDir) +
+                            " CI=OK — CAUTION entry";
+               if(_br != g_LastBlockReason) { Print(_br); g_LastBlockReason = _br; }
                // fall through to trade
             } else {
                string reason = "";
@@ -3911,8 +3912,10 @@ void TryEntry()
                } else {
                   string pndMsg = levelBroken ? "level reached, awaiting momentum"
                                               : ("awaiting " + g_ZonePendingLevel + " breakout");
-                  Print("ZONE PENDING: ", pndMsg, " (", barsSince, "/", ZonePendingMaxBars,
-                        " bars elapsed, score=", ctxScore, "/12)");
+                  string _br = "ZONE PENDING: " + pndMsg + " (" + IntegerToString(barsSince) +
+                               "/" + IntegerToString(ZonePendingMaxBars) +
+                               " bars, score=" + IntegerToString(ctxScore) + "/12)";
+                  if(_br != g_LastBlockReason) { Print(_br); g_LastBlockReason = _br; }
                   return;
                }
 
@@ -3932,8 +3935,8 @@ void TryEntry()
                // ── No Fib barrier ahead, or price already at/past level — CAUTION entry ──
                string ctx = "score=" + IntegerToString(ctxScore) + "/12"
                            + (atLvl != "" ? " | at/past " + atLvl : " | no Fib barrier ahead");
-               Print("ZONE CONTEXT OVERRIDE: ", zone, " — ", ctx,
-                     " — CAUTION entry (structural confluence overrides zone filter)");
+               string _br = "ZONE CONTEXT OVERRIDE: " + zone + " — " + ctx + " — CAUTION entry";
+               if(_br != g_LastBlockReason) { Print(_br); g_LastBlockReason = _br; }
                g_ZoneContextUsed = true;
                // fall through to trade
             }

@@ -66,6 +66,7 @@ input int    MaxConsecCandles    = 4;
 // 2 = LATE            — enter in last 5 min of the bar AFTER the confirming candle
 input int    HAEntryMode         = 1;      // 1=Early entry (default), 2=Late entry
 input int    EarlyEntryMins      = 5;      // Minutes window for early entry (5 min on 15M chart)
+input bool   AllowLateEntry      = true;   // Also allow entry after early window closes (until bar closes)
 input int    BollingerPeriod     = 21;     // Bollinger middle-line SMA period (M15)
 
 input group "=== FIBONACCI & PIVOT CONFLUENCE ==="
@@ -2417,31 +2418,28 @@ void TryEntry()
       }
       // Within 5-min window: skip the standard HAEntryMode timing block
    } else if(HAEntryMode == 1) {
-      // EARLY MODE: enter within first EarlyEntryMins of the confirming candle
-      // g_ConfirmCandleOpen is the open of the 2nd (confirming) closed bar
-      // The CURRENT bar (index 0) is the one AFTER the confirming bar — we want
-      // to enter as soon as the confirming candle has just closed and the new bar
-      // opens. So: allow entry in the first EarlyEntryMins seconds of bar 0
-      // BUT only when the confirming candle was also bottomless (strong setup).
-      // If confirming candle had spikes both sides (doji-like HA), skip early entry.
+      // EARLY MODE: prefer entry within first EarlyEntryMins of the current bar.
+      // If AllowLateEntry=true, also accept entry any time while the bar is open.
+      // If confirming candle has double-sided wicks (doji-like), skip early entry.
       bool confirmIsClean = (g_Signal == "BUY INCOMING")
                             ? !IsBottomlessWithTopSpike(1)   // no spike above on bull
                             : !IsToplessWithBottomSpike(1);  // no spike below on bear
 
       if(!confirmIsClean) {
-         // Confirming candle has spikes on both sides — fall back to late entry
+         // Impure confirming candle — only enter in the last 5 min of the bar
          if(secsElapsed < 600) return;
+      } else if(secsElapsed <= EarlyEntryMins * 60) {
+         // Within early window — proceed immediately
+      } else if(AllowLateEntry) {
+         // Past early window but AllowLateEntry=true — enter now (late but valid)
+         Print("LATE ENTRY: ", secsElapsed, "s into bar (early window was ",
+               EarlyEntryMins * 60, "s). Signal=" + g_Signal);
       } else {
-         // Clean confirming candle: allow entry in first EarlyEntryMins
-         if(secsElapsed > EarlyEntryMins * 60) {
-            // Past the early window — still allow late entry as fallback
-            if(secsElapsed < 600) return;
-         }
-         // else: within early window, proceed
+         // AllowLateEntry=false — wait for last 5 min of current bar only
+         if(secsElapsed < 600) return;
       }
    } else {
-      // MODE 2 (default): last 5 minutes of the confirming bar's SUCCESSOR
-      // i.e. enter in last 5 min of the bar after the confirming candle
+      // MODE 2: last 5 minutes of the current bar (confirming candle's successor)
       if(secsElapsed < 600) return;
    }
 
@@ -2886,24 +2884,47 @@ void UpdateDashboard()
    DashLine("01_sess",   "Session : " + session,                                cx, cy, row, lh, corner, clrCyan,       9); row++;
 
    // Entry mode label
-   string modeLabel = (HAEntryMode == 1)
-      ? "EARLY (first " + IntegerToString(EarlyEntryMins) + "min of 2nd candle)"
-      : "LATE  (last 5min of bar after 2nd candle)";
+   string modeLabel;
+   if(HAEntryMode == 1) {
+      modeLabel = AllowLateEntry
+         ? "EARLY+LATE (first " + IntegerToString(EarlyEntryMins) + "min, then any)"
+         : "EARLY only (first " + IntegerToString(EarlyEntryMins) + "min of bar)";
+   } else {
+      modeLabel = "LATE  (last 5min of bar after 2nd candle)";
+   }
    DashLine("01b_emode", "EntryMd : " + modeLabel,                             cx, cy, row, lh, corner, clrAqua,        8); row++;
 
    DashLine("02_sig",    "Signal  : " + g_Signal,                               cx, cy, row, lh, corner, sigColor,     10); row++;
 
-   // Early-entry window countdown when signal is armed
-   if(HAEntryMode == 1 && g_ConfirmCandleOpen > 0 &&
-      (g_Signal == "BUY INCOMING" || g_Signal == "SELL INCOMING")) {
-      datetime barNow   = iTime(_Symbol, PERIOD_M15, 0);
-      int      elapsed  = (int)(TimeCurrent() - barNow);
-      int      window   = EarlyEntryMins * 60;
-      string   winStr   = (elapsed <= window)
-                          ? IntegerToString(window - elapsed) + "s left in early window"
-                          : "Early window closed — late-entry mode";
-      color    winClr   = (elapsed <= window) ? clrLime : clrGray;
-      DashLine("02b_win", "Window  : " + winStr,                                cx, cy, row, lh, corner, winClr,        8); row++;
+   // Entry window status — ALWAYS rendered so Bias row never overlaps this row
+   {
+      string winStr;
+      color  winClr;
+      bool   isSigIncoming = (g_Signal == "BUY INCOMING" || g_Signal == "SELL INCOMING");
+      bool   isSigPrep     = (g_Signal == "PREPARING BUY" || g_Signal == "PREPARING SELL");
+      if(isSigIncoming) {
+         datetime barNow  = iTime(_Symbol, PERIOD_M15, 0);
+         int      elapsed = (int)(TimeCurrent() - barNow);
+         int      window  = EarlyEntryMins * 60;
+         if(elapsed <= window) {
+            winStr = IntegerToString(window - elapsed) + "s left in early window";
+            winClr = clrLime;
+         } else if(AllowLateEntry) {
+            winStr = "Late entry open (+" + IntegerToString(elapsed - window) + "s past early)";
+            winClr = clrYellow;
+         } else {
+            int secsLeft = 900 - elapsed;  // 15-min bar = 900s
+            winStr = "Early closed — last5min in " + IntegerToString(MathMax(0, 600 - elapsed)) + "s";
+            winClr = clrGray;
+         }
+      } else if(isSigPrep) {
+         winStr = "Setup armed — awaiting confirmation";
+         winClr = clrOrange;
+      } else {
+         winStr = "—";
+         winClr = clrDimGray;
+      }
+      DashLine("02b_win", "Window  : " + winStr, cx, cy, row, lh, corner, winClr, 8); row++;
    }
 
    DashLine("03_bias",   "Bias    : " + biasStr + " (" + IntegerToString(g_TotalBias) + ")",

@@ -123,6 +123,17 @@ input bool   UseH4SMC           = true;    // Detect H4-timeframe FVGs and Order
 input double H4FVGMinGapPips    = 20.0;    // Min gap in pips for H4 FVG detection (major imbalances; H1 threshold is 10p)
 input int    H4OBScanBars       = 40;      // H4 bars to scan for order blocks (~6.7 days of history)
 input double MinConfidence       = 35.0;   // Minimum confidence % to take a trade (0-100)
+//
+// MacroBOS hard block: when the H4 trend has broken structure (g_MacroBOS=true),
+// taking a trade in the OPPOSITE direction is a high-risk counter-trend bet.
+// Default=true blocks it entirely so the bot does not fight a confirmed macro move.
+input bool   MacroBOSHardBlock   = true;   // Block trades against confirmed H4 MacroBOS direction
+//
+// MTF / volume divergence caution: when H4 and H1 disagree (MTF not aligned) OR volume
+// is declining against the price trend, we still take the trade (setup is valid) but
+// lock TP early at DivergenceLockTP to reduce exposure on uncertain setups.
+input bool   DivergenceCautionEnabled = true;  // Cap TP when MTF diverged or volume diverging
+input double DivergenceLockTP    = 1.00;   // TP cap in USD per 0.01 lot for divergence caution trades
 
 input group "=== RANGE ZONE FILTERS ==="
 // How far inside range boundaries before a trade is allowed (as % of total range)
@@ -294,6 +305,7 @@ int    g_SweepDir       = 0;                 // 1=bullish sweep (swept low), -1=
 string g_VolumeState   = "NORMAL";           // "HIGH" / "ABOVE_AVG" / "NORMAL" / "LOW"
 double g_VolRatio      = 1.0;               // current vol / average vol
 bool   g_VolDivergence = false;              // price trending but volume declining
+bool   g_DivergenceCaution = false;          // true when TP was capped due to MTF/volume divergence
 
 // Order Blocks (institutional entry zones on H1)
 double g_BullOB_High = 0, g_BullOB_Low = 0;   // last bear candle before bull impulse
@@ -3257,6 +3269,20 @@ void EvaluateHAPattern()
                       + "b elapsed)";
       else if(g_ZoneContextUsed)
          confirmed += " | 🟡ZONE-CONTEXT-OVERRIDE (ZoneStrictness=" + IntegerToString(ZoneStrictness) + ")";
+      // Macro BOS direction check
+      if(g_MacroBOS && UseMacroStructure) {
+         bool macroOpp = (trD ==  1 && g_MacroStructLabel == "BEARISH") ||
+                         (trD == -1 && g_MacroStructLabel == "BULLISH");
+         if(macroOpp && MacroBOSHardBlock)
+            confirmed += " | ❌MacroBOS=" + g_MacroStructLabel + " — will BLOCK entry";
+         else if(macroOpp)
+            confirmed += " | ⚠️MacroBOS=" + g_MacroStructLabel + " opposes (block disabled)";
+      }
+      // MTF / volume divergence flag
+      if(!g_MTFAligned)  confirmed += " | ⚠️MTF-DIVERGED";
+      if(g_VolDivergence) confirmed += " | ⚠️VOL-DIVERGED";
+      if(!g_MTFAligned || g_VolDivergence)
+         confirmed += " → TP will be capped at $" + DoubleToString(DivergenceLockTP,2) + "/0.01lot if DivCaution";
 
       // --- Compose pending (current blocker) ---
       string pending = "";
@@ -3855,6 +3881,22 @@ void TryEntry()
    if(tradeDir == 1  && !canBuy)  { Print("BUY blocked by STRONG BEAR bias (", g_TotalBias, ")");  return; }
    if(tradeDir == -1 && !canSell) { Print("SELL blocked by STRONG BULL bias (", g_TotalBias, ")"); return; }
 
+   // === MACRO BOS DIRECTIONAL BLOCK ===
+   // When H4 structure has broken (g_MacroBOS=true), a trade against that macro direction
+   // is a counter-trend bet against an already-confirmed institutional move.
+   // Example: MacroStruct=BEARISH + MacroBOS=true → refuse BUY signals.
+   if(MacroBOSHardBlock && g_MacroBOS && UseMacroStructure) {
+      bool macroOpposes = (tradeDir ==  1 && g_MacroStructLabel == "BEARISH") ||
+                          (tradeDir == -1 && g_MacroStructLabel == "BULLISH");
+      if(macroOpposes) {
+         Print("TRADE BLOCKED: MacroBOS=", g_MacroStructLabel,
+               " (H4 structure confirmed) — refusing ",
+               (tradeDir == 1 ? "BUY" : "SELL"),
+               " counter-macro trade. Set MacroBOSHardBlock=false to override.");
+         return;
+      }
+   }
+
    // === FIB / PIVOT CONFLUENCE (check BEFORE tier calc) ===
    g_NearLevel = "";
    if(UseFibPivot) {
@@ -3935,6 +3977,34 @@ void TryEntry()
       // HUGE_BOLD without CI: use standard TP (structural already the best estimate)
    }
 
+   // === MTF / VOLUME DIVERGENCE CAUTION ===
+   // Conditions: trade is valid but timeframe picture is mixed:
+   //   — MTF diverged: H4 macro and H1 intermediate point in DIFFERENT directions.
+   //   — Vol diverged:  price making a new high/low but tick volume is declining.
+   // Action: take the trade at normal lot size (setup itself is valid) but cap TP at
+   //   DivergenceLockTP ($1.00/0.01 by default) so we bank a small profit and exit
+   //   before the weakness materialises. SL is unchanged.
+   // Exception: mean-reversion trades already target a short move; don't double-cap.
+   g_DivergenceCaution = false;
+   if(DivergenceCautionEnabled && !isMeanRev) {
+      bool mtfDiverged = !g_MTFAligned;
+      bool volDiverged = (UseVolumeAnalysis && g_VolDivergence);
+      if(mtfDiverged || volDiverged) {
+         double capTP = DivergenceLockTP;
+         if(baseTpUSD > capTP) {
+            string divWhy = "";
+            if(mtfDiverged) divWhy += "MTF-diverged ";
+            if(volDiverged) divWhy += "Vol-diverged ";
+            Print("[DIVERGENCE CAUTION] TP locked: $", DoubleToString(baseTpUSD, 2),
+                  " → $", DoubleToString(capTP, 2),
+                  " (", StringTrimRight(divWhy), " — quick-profit mode)");
+            baseTpUSD       = capTP;
+            g_DynamicTP_USD = baseTpUSD;
+            g_DivergenceCaution = true;
+         }
+      }
+   }
+
    // Scale SL/TP by lot size
    double slUSD = g_DynamicSL_USD * scale;
    double tpUSD = baseTpUSD * scale;
@@ -3949,6 +4019,7 @@ void TryEntry()
    string tag = isMeanRev ? (tradeDir==1 ? "MRV_BUY" : "MRV_SELL")
                           : (tradeDir==1 ? "HA_BUY_v6" : "HA_SELL_v6");
    if(HAEntryMode == 1) tag = tag + "_E";
+   if(g_DivergenceCaution)  tag = tag + "_DV";   // divergence-caution marker
    tag = tag + "_C" + confStr
              + "_SL" + DoubleToString(g_DynamicSL_USD, 2)
              + "_TP" + DoubleToString(g_DynamicTP_USD, 2);

@@ -49,6 +49,19 @@ input int    LondonEndHour    = 16;
 input int    NewYorkStartHour = 13;
 input int    NewYorkEndHour   = 21;
 
+input group "=== ASIAN SESSION MOMENTUM ==="
+// When the LAST HOUR of the previous trading day moved strongly in a direction,
+// Asian-session signals aligned with that direction get a confidence bonus and
+// the zone filter can be relaxed (trade is allowed outside the normal LOWER/UPPER thirds).
+// This reflects the tendency for Asian price action to continue the close-of-day bias
+// before the London open resets the order flow.
+input bool   AsianPrevDayMomEnabled = true;   // Enable prev-day last-hour momentum for Asian session
+input double AsianMomentumBonusPts  = 6.0;    // Confidence bonus when aligned (add-only, never penalises)
+input bool   AsianZoneStrictMode    = false;  // false=RELAX zone filter when momentum aligned; true=always enforce zones
+// RELAX mode: when prev-day momentum aligns with signal AND multiple factors agree,
+// the standard zone block (UPPER_THIRD for buy / LOWER_THIRD for sell) is lifted in Asian hours.
+// The trade is entered with standard (not narrowed) SL and a logged CAUTION note.
+
 input group "=== MANUAL RANGE OVERRIDE ==="
 input bool   UseManualRange   = false;
 input double ManualRangeHigh  = 0.0;
@@ -206,6 +219,10 @@ double   g_BollingerUpper1 = 0;     // upper band bar 1 (for narrow-band detecti
 double   g_BollingerLower1 = 0;     // lower band bar 1
 double   g_BollingerUpper2 = 0;     // upper band bar 2
 double   g_BollingerLower2 = 0;     // lower band bar 2
+
+// Prev-day last-hour momentum (for Asian session zone relaxation)
+int      g_PrevDayLastHourDir  = 0;    // +1 = prev day last hour was bullish, -1 = bearish, 0 = unknown
+bool     g_AsianZoneRelaxed    = false; // true = zone filter currently relaxed due to Asian momentum alignment
 
 // Mean reversion two-candle state machine
 bool     g_MRVArmed       = false;
@@ -534,6 +551,21 @@ void OnTick()
       SetActiveRange();
       RecalcBias();
       CalcFibPivotLevels();   // recalc on every new bar
+
+      // Prev-day last-hour direction — recalc once per day during Asian session
+      if(AsianPrevDayMomEnabled) {
+         MqlDateTime bdT;
+         TimeToStruct(barTime, bdT);
+         bool inAsian = (bdT.hour >= AsianStartHour && bdT.hour < AsianEndHour);
+         // Recalc on the first bar of Asian session (hour == AsianStartHour, minute == 0)
+         // or on bot start (g_PrevDayLastHourDir == 0 and we are currently in Asian session)
+         if((bdT.hour == AsianStartHour && bdT.min == 0) ||
+            (inAsian && g_PrevDayLastHourDir == 0))
+            CalcPrevDayLastHourDir();
+         // Reset outside Asian session so it is recalculated fresh each new day
+         if(!inAsian)
+            g_AsianZoneRelaxed = false;
+      }
 
       // Market structure analysis (runs on new bar only — uses confirmed bars)
       if(UseSwingStructure)  DetectSwingStructure();
@@ -891,6 +923,43 @@ void ComputeATR()
       g_CIHigh = mid + ATRMultiplierCI * g_ATR;
       g_CILow  = mid - ATRMultiplierCI * g_ATR;
    }
+}
+
+//+------------------------------------------------------------------+
+//| PREV-DAY LAST-HOUR DIRECTION                                     |
+//| Reads the last 4 M15 bars of the previous trading day and        |
+//| determines net direction: +1 = bullish close, -1 = bearish,     |
+//| 0 = flat/unknown.  Stored in g_PrevDayLastHourDir.              |
+//| Called once per day on the first new bar after midnight.         |
+//+------------------------------------------------------------------+
+void CalcPrevDayLastHourDir()
+{
+   g_PrevDayLastHourDir = 0;
+
+   MqlDateTime today;
+   TimeToStruct(TimeCurrent(), today);
+   datetime todayStart   = (datetime)(TimeCurrent() - (today.hour * 3600 + today.min * 60 + today.sec));
+   datetime prevDayEnd   = todayStart - 1;   // last second of yesterday
+
+   // Find the M15 bar that was live at the end of yesterday
+   int endShift = iBarShift(_Symbol, PERIOD_M15, prevDayEnd, false);
+   if(endShift < 0) return;
+
+   // Last hour = 4 M15 bars; walk startShift bars back from the end bar
+   int startShift = endShift + 3;   // 4 bars total (endShift..startShift, inclusive)
+   if(startShift > 200) return;
+
+   double firstOpen  = iOpen (_Symbol, PERIOD_M15, startShift);
+   double lastClose  = iClose(_Symbol, PERIOD_M15, endShift);
+   if(firstOpen <= 0 || lastClose <= 0) return;
+
+   double movePips = (lastClose - firstOpen) / _Point / 10.0;
+   if(movePips >= 3.0)       g_PrevDayLastHourDir = 1;    // last hour closed bullish
+   else if(movePips <= -3.0) g_PrevDayLastHourDir = -1;   // last hour closed bearish
+
+   Print("PrevDayLastHour: open=", DoubleToString(firstOpen, 5),
+         " close=", DoubleToString(lastClose, 5),
+         " move=", DoubleToString(movePips, 1), "pip → dir=", g_PrevDayLastHourDir);
 }
 
 //+------------------------------------------------------------------+
@@ -1767,6 +1836,21 @@ double CalcConfidence(int tradeDir, string zone, bool isMeanRev, bool isSideways
       conf += keyHourBonus;
    }
 
+   // --- 14. ASIAN SESSION PREV-DAY MOMENTUM ALIGNMENT (0-6) ---
+   // During the Asian session, the last hour of the previous trading day often
+   // acts as a directional hint — institutional carry-over before London resets flow.
+   // Boost confidence when the signal aligns with that close-of-day direction.
+   // Never penalises; only adds when in Asian session and prev-day dir is known.
+   double asianMomBonus = 0;
+   if(AsianPrevDayMomEnabled && g_PrevDayLastHourDir != 0) {
+      MqlDateTime adt; TimeToStruct(TimeCurrent(), adt);
+      bool inAsian = (adt.hour >= AsianStartHour && adt.hour < AsianEndHour);
+      if(inAsian && tradeDir == g_PrevDayLastHourDir) {
+         asianMomBonus = AsianMomentumBonusPts;
+         conf += asianMomBonus;
+      }
+   }
+
    // --- PENALTIES ---
    if(isSideways)  conf -= 8.0;   // choppy market = unreliable signals
    if(isMeanRev)   conf -= 3.0;   // MRV = limited runway, lower confidence
@@ -1800,6 +1884,8 @@ double CalcConfidence(int tradeDir, string zone, bool isMeanRev, bool isSideways
          " ATR:", DoubleToString(atrPips, 1), "pip",
          " Sess:", (isOverlap ? "OVERLAP" : isLondon ? "LONDON" : isNY ? "NY" : "OTHER"),
          " KeyHr:", (keyHourBonus > 0 ? "+" + DoubleToString(keyHourBonus,1) : "0"), "@", dt.hour, ":", dt.min,
+         " AsianMom:", (asianMomBonus > 0 ? "+" + DoubleToString(asianMomBonus,1) : "0"),
+         " PrevDayDir:", g_PrevDayLastHourDir,
          " Zone:", zone,
          " Cnfl:", (nearLevel == "" ? "none" : nearLevel+lvlType),
          " Struct:", g_StructureLabel, (g_BOS ? " BOS" : ""), (g_CHoCH ? " CHoCH" : ""),
@@ -2553,15 +2639,77 @@ void TryEntry()
    else if(isMeanRev)   tradeDir = meanRevDir;
 
    // === ZONE FILTERS FOR TREND TRADES ===
+   // Standard rule: avoid UPPER_THIRD for buys (near range high = mean-reversion risk)
+   //                and LOWER_THIRD for sells (near range low = bounce risk).
+   //
+   // ASIAN SESSION RELAXATION (AsianZoneStrictMode = false, default):
+   //   When the last hour of the previous trading day moved in the SAME direction as
+   //   the current signal, the zone filter is lifted during Asian hours.
+   //   This reflects institutional carry-over bias before the London reset.
+   //   The trade is logged as CAUTION and uses the standard (not narrowed) SL.
+   //
+   //   Additional CI validation: even in relax mode, the Bollinger band position is
+   //   cross-checked — for a buy the HA high must reach at least the upper band,
+   //   and for a sell the HA low must reach at least the lower band, confirming
+   //   that price is genuinely pushing into the (unfavorable) zone rather than drifting.
+
+   g_AsianZoneRelaxed = false;
    if(isTrendSignal && !isMeanRev) {
-      // Avoid UPPER_THIRD for buys and LOWER_THIRD for sells — those are against mean reversion
-      if(tradeDir == 1 && zone == "UPPER_THIRD" && g_RangeHigh > 0) {
-         Print("BUY skipped: in UPPER_THIRD (mean reversion risk near range high)");
-         return;
-      }
-      if(tradeDir == -1 && zone == "LOWER_THIRD" && g_RangeLow > 0) {
-         Print("SELL skipped: in LOWER_THIRD (mean reversion risk near range low)");
-         return;
+      MqlDateTime zdt; TimeToStruct(TimeCurrent(), zdt);
+      bool inAsian = (zdt.hour >= AsianStartHour && zdt.hour < AsianEndHour);
+
+      // Determine whether we would normally block this trade
+      bool wouldBlock = (tradeDir == 1  && zone == "UPPER_THIRD" && g_RangeHigh > 0) ||
+                        (tradeDir == -1 && zone == "LOWER_THIRD" && g_RangeLow  > 0);
+
+      if(wouldBlock) {
+         // Asian relax conditions:
+         // 1. In Asian session
+         // 2. Prev-day last hour moved in the same direction (carry-over bias)
+         // 3. AsianZoneStrictMode = false (default)
+         // 4. CI band confirmation: price is genuinely pushing into the zone
+         //    BUY into UPPER_THIRD: HA high >= Bollinger upper band (breakout momentum, not drift)
+         //    SELL into LOWER_THIRD: HA low <= Bollinger lower band
+         bool prevDayAligned = (AsianPrevDayMomEnabled && g_PrevDayLastHourDir == tradeDir);
+
+         // CI (Confidence-Interval) range check using Bollinger bands as proxy
+         // For buy in upper third: at least the wick reached above upper band — real push
+         // For sell in lower third: at least the wick reached below lower band — real push
+         bool ciConfirms = false;
+         if(tradeDir == 1 && g_BollingerUpper1 > 0) {
+            double haO1z, haH1z, haL1z, haC1z;
+            CalcHA(1, haO1z, haH1z, haL1z, haC1z);
+            ciConfirms = (haH1z >= g_BollingerUpper1);   // high reached or exceeded upper band
+         } else if(tradeDir == -1 && g_BollingerLower1 > 0) {
+            double haO1z, haH1z, haL1z, haC1z;
+            CalcHA(1, haO1z, haH1z, haL1z, haC1z);
+            ciConfirms = (haL1z <= g_BollingerLower1);   // low reached or exceeded lower band
+         } else {
+            ciConfirms = true;   // no band data — don't block on CI
+         }
+
+         bool canRelax = inAsian && prevDayAligned && !AsianZoneStrictMode && ciConfirms;
+
+         if(canRelax) {
+            g_AsianZoneRelaxed = true;
+            Print("ASIAN ZONE RELAX: zone=", zone,
+                  " signal=", g_Signal,
+                  " PrevDayDir=", g_PrevDayLastHourDir,
+                  " CI=OK — entering with CAUTION (standard SL, no zone block).");
+            // Do NOT return — allow the trade to proceed
+         } else {
+            // Block as normal, but explain why relax was not granted
+            string reason = "";
+            if(!inAsian)           reason = "not in Asian session";
+            else if(!prevDayAligned) reason = "prev-day dir not aligned (" + IntegerToString(g_PrevDayLastHourDir) + ")";
+            else if(AsianZoneStrictMode) reason = "StrictMode=true";
+            else if(!ciConfirms)   reason = "CI band not confirmed (price not pushing into zone)";
+            if(tradeDir == 1)
+               Print("BUY skipped: UPPER_THIRD zone (" + reason + ")");
+            else
+               Print("SELL skipped: LOWER_THIRD zone (" + reason + ")");
+            return;
+         }
       }
    }
 
@@ -3068,6 +3216,22 @@ void UpdateDashboard()
    DashLine("04b_zone",  "Zone    : " + g_ZoneLabel,                            cx, cy, row, lh, corner, zoneClr,       9); row++;
    bool sw = IsSideways();
    DashLine("04c_sw",    "Sideways: " + (sw ? "YES (tight lock)" : "No"),       cx, cy, row, lh, corner, sw?clrOrange:clrGray, 9); row++;
+
+   // Asian session prev-day momentum status
+   if(AsianPrevDayMomEnabled) {
+      MqlDateTime _adt; TimeToStruct(TimeCurrent(), _adt);
+      bool _inAsian = (_adt.hour >= AsianStartHour && _adt.hour < AsianEndHour);
+      if(_inAsian) {
+         string _pdLabel = (g_PrevDayLastHourDir == 1)  ? "BULL (buy bias carry)"
+                         : (g_PrevDayLastHourDir == -1) ? "BEAR (sell bias carry)"
+                         :                                "flat / unknown";
+         color  _pdClr   = (g_PrevDayLastHourDir == 1)  ? clrLime
+                         : (g_PrevDayLastHourDir == -1) ? clrTomato : clrGray;
+         DashLine("04e_pdm", "PrevDHr : " + _pdLabel +
+                             (g_AsianZoneRelaxed ? "  [ZONE RELAX]" : ""),
+                             cx, cy, row, lh, corner, g_AsianZoneRelaxed ? clrYellow : _pdClr, 8); row++;
+      }
+   }
    row++;
 
    string rhStr = (g_RangeHigh > 0) ? DoubleToString(g_RangeHigh, 5) : "N/A";

@@ -321,6 +321,7 @@ string g_VolumeState   = "NORMAL";           // "HIGH" / "ABOVE_AVG" / "NORMAL" 
 double g_VolRatio      = 1.0;               // current vol / average vol
 bool   g_VolDivergence = false;              // price trending but volume declining
 bool   g_DivergenceCaution = false;          // true when TP was capped due to MTF/volume divergence
+string g_LastBlockReason   = "";             // last TryEntry block message — only print when it changes
 
 // Macro Trend Ride state
 bool   g_MacroTrendRide  = false;  // true when MacroBOS trend-ride conditions are met on this bar
@@ -3978,8 +3979,16 @@ void TryEntry()
    // === BIAS FILTER ===
    bool canBuy  = (g_TotalBias > -2);   // block BUY when STRONG BEAR (bias <= -2)
    bool canSell = (g_TotalBias <  2);   // block SELL when STRONG BULL (bias >= +2)
-   if(tradeDir == 1  && !canBuy)  { Print("BUY blocked by STRONG BEAR bias (", g_TotalBias, ")");  return; }
-   if(tradeDir == -1 && !canSell) { Print("SELL blocked by STRONG BULL bias (", g_TotalBias, ")"); return; }
+   if(tradeDir == 1  && !canBuy)  {
+      string _br = "BUY blocked by STRONG BEAR bias (" + IntegerToString(g_TotalBias) + ")";
+      if(_br != g_LastBlockReason) { Print(_br); g_LastBlockReason = _br; }
+      return;
+   }
+   if(tradeDir == -1 && !canSell) {
+      string _br = "SELL blocked by STRONG BULL bias (" + IntegerToString(g_TotalBias) + ")";
+      if(_br != g_LastBlockReason) { Print(_br); g_LastBlockReason = _br; }
+      return;
+   }
 
    // === MACRO BOS DIRECTIONAL BLOCK ===
    // When H4 structure has broken (g_MacroBOS=true), a trade against that macro direction
@@ -3989,10 +3998,12 @@ void TryEntry()
       bool macroOpposes = (tradeDir ==  1 && g_MacroStructLabel == "BEARISH") ||
                           (tradeDir == -1 && g_MacroStructLabel == "BULLISH");
       if(macroOpposes) {
-         Print("TRADE BLOCKED: MacroBOS=", g_MacroStructLabel,
-               " (H4 structure confirmed) — refusing ",
-               (tradeDir == 1 ? "BUY" : "SELL"),
-               " counter-macro trade. Set MacroBOSHardBlock=false to override.");
+         string _br = "TRADE BLOCKED: MacroBOS=" + g_MacroStructLabel +
+                      " — refusing " + (tradeDir == 1 ? "BUY" : "SELL") + " counter-macro trade";
+         if(_br != g_LastBlockReason) {
+            Print(_br, " (H4 structure confirmed). Set MacroBOSHardBlock=false to override.");
+            g_LastBlockReason = _br;
+         }
          return;
       }
    }
@@ -4120,8 +4131,12 @@ void TryEntry()
       bool mtfDiverged = !g_MTFAligned;
       bool volDiverged = (UseVolumeAnalysis && g_VolDivergence);
       if(mtfDiverged && volDiverged) {
-         Print("TRADE BLOCKED: MTF+Volume both diverged — H4 and H1 disagree AND volume fading.",
-               " Set DivergenceCautionEnabled=false to override.");
+         string _br = "TRADE BLOCKED: MTF+Volume both diverged";
+         if(_br != g_LastBlockReason) {
+            Print(_br, " — H4 and H1 disagree AND volume fading.",
+                  " Set DivergenceCautionEnabled=false to override.");
+            g_LastBlockReason = _br;
+         }
          g_DivergenceCaution = true;
          return;
       }
@@ -4148,6 +4163,7 @@ void TryEntry()
              + "_TP" + DoubleToString(g_DynamicTP_USD, 2);
 
    // === EXECUTE ===
+   g_LastBlockReason = "";   // block cleared — trade is actually firing
    bool ok = false;
    if(tradeDir == 1) {
       double sl = NormalizeDouble(ask - slDist, _Digits);

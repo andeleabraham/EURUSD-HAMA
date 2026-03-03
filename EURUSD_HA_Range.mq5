@@ -3281,8 +3281,10 @@ void EvaluateHAPattern()
       // MTF / volume divergence flag
       if(!g_MTFAligned)  confirmed += " | ⚠️MTF-DIVERGED";
       if(g_VolDivergence) confirmed += " | ⚠️VOL-DIVERGED";
-      if(!g_MTFAligned || g_VolDivergence)
-         confirmed += " → TP will be capped at $" + DoubleToString(DivergenceLockTP,2) + "/0.01lot if DivCaution";
+      if(!g_MTFAligned && g_VolDivergence)
+         confirmed += " → BOTH diverged: TP will be capped at $" + DoubleToString(DivergenceLockTP,2) + "/0.01lot";
+      else if(!g_MTFAligned || g_VolDivergence)
+         confirmed += " → single divergence only — full TP applies";
 
       // --- Compose pending (current blocker) ---
       string pending = "";
@@ -3989,7 +3991,10 @@ void TryEntry()
    if(DivergenceCautionEnabled && !isMeanRev) {
       bool mtfDiverged = !g_MTFAligned;
       bool volDiverged = (UseVolumeAnalysis && g_VolDivergence);
-      if(mtfDiverged || volDiverged) {
+      // Only cap TP when BOTH signals are weak simultaneously.
+      // If only MTF diverged but structure/volume support the trade → full TP.
+      // If only volume diverged → full TP (isolated volume fade is not decisive).
+      if(mtfDiverged && volDiverged) {
          double capTP = DivergenceLockTP;
          if(baseTpUSD > capTP) {
             string divWhy = "";

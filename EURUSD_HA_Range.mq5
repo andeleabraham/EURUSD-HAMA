@@ -135,6 +135,21 @@ input bool   MacroBOSHardBlock   = true;   // Block trades against confirmed H4 
 input bool   DivergenceCautionEnabled = true;  // Block trade when BOTH MTF diverged AND volume diverging
 input double DivergenceLockTP    = 1.00;   // (legacy — no longer used for capping; reserved for future)
 
+input group "=== MACRO TREND RIDE ==="
+// When H4 structure has broken structure (MacroBOS confirmed), a large intraday move often follows
+// in the BOS direction — typically 80-120+ pips within the London/NY session.
+// Example: BEARISH BOS at 1.16950 → move to 1.15950 by 14:00-15:00.
+// This mode enters WITH the BOS when HA candles confirm the trend is underway,
+// using a wider SL ($2.75/0.01) and targeting the next major HTF level (up to $8).
+// Asian session is blocked: Asia often makes a small counter-BOS move before the
+// real continuation begins at London open. Wait for non-Asian confirmation.
+input bool   MacroTrendRideEnabled  = true;   // Enable MacroBOS intraday trend-ride entries
+input int    MacroTrendMinScore     = 5;      // Min ZoneContextScore (0-12) — higher = more selective
+input double MacroTrendSL_USD       = 2.75;   // SL per 0.01 lot (wider space for trend volatility)
+input double MacroTrendMinTP_USD    = 4.00;   // Floor TP per 0.01 lot (minimum target for a trend ride)
+input double MacroTrendMaxTP_USD    = 8.00;   // Ceiling TP per 0.01 lot (cap at realistic intraday range)
+input bool   MacroTrendAsianBlock   = true;   // Block during Asian session (wait for London/NY momentum)
+
 input group "=== RANGE ZONE FILTERS ==="
 // How far inside range boundaries before a trade is allowed (as % of total range)
 input double MidZonePct       = 0.30;   // Mid zone = middle 30% of range (15% each side of mid)
@@ -306,6 +321,11 @@ string g_VolumeState   = "NORMAL";           // "HIGH" / "ABOVE_AVG" / "NORMAL" 
 double g_VolRatio      = 1.0;               // current vol / average vol
 bool   g_VolDivergence = false;              // price trending but volume declining
 bool   g_DivergenceCaution = false;          // true when TP was capped due to MTF/volume divergence
+
+// Macro Trend Ride state
+bool   g_MacroTrendRide  = false;  // true when MacroBOS trend-ride conditions are met on this bar
+int    g_MacroTrendDir   = 0;      // 1=bullish ride (long), -1=bearish ride (short)
+int    g_MacroTrendScore = 0;      // ZoneContextScore captured at time of detection (0-12)
 
 // Order Blocks (institutional entry zones on H1)
 double g_BullOB_High = 0, g_BullOB_Low = 0;   // last bear candle before bull impulse
@@ -655,13 +675,14 @@ void OnTick()
       if(UseH4SMC)           { DetectH4OrderBlocks(); DetectH4FairValueGaps(); DrawH4SMCZones(); }
 
       EvaluateHAPattern();
+      CheckMacroTrendRide();   // must run after EvaluateHAPattern (uses g_HAConsecCount, g_MacroBOS, etc.)
    }
 
-   // Fire TryEntry when trend signal active OR mean reversion setup exists
+   // Fire TryEntry when trend signal active, mean reversion qualifies, OR macro trend ride armed
    if(!g_TradeOpen) {
       bool hasTrendSig = (g_Signal == "BUY INCOMING" || g_Signal == "SELL INCOMING");
       bool hasMeanRev  = (MeanReversionSetup() != 0);
-      if(hasTrendSig || hasMeanRev) TryEntry();
+      if(hasTrendSig || hasMeanRev || g_MacroTrendRide) TryEntry();
    }
 
    // Keep range fresh every tick (g_TodayHigh/Low grows on each tick)
@@ -2683,6 +2704,147 @@ int LiveHAConsecTotal()
 //| Position sizing still uses normal SL/TP — no extra risk taken.  |
 //+------------------------------------------------------------------+
 //+------------------------------------------------------------------+
+//| MACRO TREND RIDE DETECTION                                       |
+//| Fires when H4 BOS is confirmed and HA candles align in the BOS  |
+//| direction with sufficient structural confluence score (0-12).   |
+//| Used to capture large intraday trend moves (80-120+ pips) that  |
+//| follow a confirmed macro structural break.                       |
+//| Sets g_MacroTrendRide / g_MacroTrendDir / g_MacroTrendScore.    |
+//+------------------------------------------------------------------+
+void CheckMacroTrendRide()
+{
+   g_MacroTrendRide  = false;
+   g_MacroTrendDir   = 0;
+   g_MacroTrendScore = 0;
+
+   if(!MacroTrendRideEnabled || !UseMacroStructure) return;
+   if(!g_MacroBOS) return;
+   if(g_MacroStructLabel == "RANGING") return;
+
+   int bosDir = (g_MacroStructLabel == "BULLISH") ? 1 : -1;
+
+   // Do not fire if a regular trend signal is pointing the OPPOSITE direction
+   // (that would mean HA state machine and macro disagree — let state machine win)
+   if(g_Signal == "BUY INCOMING"  && bosDir == -1) return;
+   if(g_Signal == "SELL INCOMING" && bosDir ==  1) return;
+
+   // Asian session block: Asia tends to fake a counter-BOS move before London open
+   if(MacroTrendAsianBlock) {
+      MqlDateTime mdt; TimeToStruct(TimeCurrent(), mdt);
+      if(mdt.hour >= AsianStartHour && mdt.hour < AsianEndHour) return;
+   }
+
+   // HA candle confirmation: the last 2 closed bars must both agree with BOS direction
+   double haO1, haH1, haL1, haC1;
+   double haO2, haH2, haL2, haC2;
+   CalcHA(1, haO1, haH1, haL1, haC1);
+   CalcHA(2, haO2, haH2, haL2, haC2);
+   bool ha1ok = (bosDir == 1) ? (haC1 > haO1) : (haC1 < haO1);
+   bool ha2ok = (bosDir == 1) ? (haC2 > haO2) : (haC2 < haO2);
+   if(!ha1ok || !ha2ok) return;
+
+   // Bar 1 must be a clean directional candle (bottomless bull / topless bear)
+   // This ensures entry is on momentum, not a doji or mixed candle
+   bool cleanBar = (bosDir == 1) ? IsBottomless(1) : IsTopless(1);
+   if(!cleanBar) return;
+
+   // Structural confluence score (reuses ZoneContextScore)
+   int score = ZoneContextScore(bosDir);
+   if(score < MacroTrendMinScore) return;
+
+   // Safety: bail if BOTH MTF and volume are diverging simultaneously
+   if(DivergenceCautionEnabled) {
+      bool mtfDiv = !g_MTFAligned;
+      bool volDiv = (UseVolumeAnalysis && g_VolDivergence);
+      if(mtfDiv && volDiv) {
+         Print("[MACRO TREND RIDE] Blocked: BOTH MTF+Vol diverged (score=", score, "/12)");
+         return;
+      }
+   }
+
+   g_MacroTrendRide  = true;
+   g_MacroTrendDir   = bosDir;
+   g_MacroTrendScore = score;
+   Print("[MACRO TREND RIDE] Armed: ", g_MacroStructLabel, " BOS",
+         " HA:", IntegerToString(g_HAConsecCount), "consec",
+         " Score:", score, "/12",
+         " Vol:", g_VolumeState,
+         " MTF:", (g_MTFAligned ? "ALIGNED" : "diverged"),
+         " Session:", (MacroTrendAsianBlock ? "non-Asian" : "any"));
+}
+
+//+------------------------------------------------------------------+
+//| MACRO TREND RIDE DETECTION                                       |
+//| Fires when H4 BOS is confirmed and HA candles align in the BOS  |
+//| direction with sufficient structural confluence (ZoneContextScore|
+//| 0-12). Used to capture 80-120+ pip intraday trend moves that    |
+//| follow a confirmed macro structural break.                       |
+//| Sets g_MacroTrendRide / g_MacroTrendDir / g_MacroTrendScore.    |
+//+------------------------------------------------------------------+
+void CheckMacroTrendRide()
+{
+   g_MacroTrendRide  = false;
+   g_MacroTrendDir   = 0;
+   g_MacroTrendScore = 0;
+
+   if(!MacroTrendRideEnabled || !UseMacroStructure) return;
+   if(!g_MacroBOS) return;
+   if(g_MacroStructLabel == "RANGING") return;
+
+   int bosDir = (g_MacroStructLabel == "BULLISH") ? 1 : -1;
+
+   // Do not fire if regular HA signal is pointing the OPPOSITE direction
+   // (that would mean HA state machine and macro disagree — let state machine resolve first)
+   if(g_Signal == "BUY INCOMING"  && bosDir == -1) return;
+   if(g_Signal == "SELL INCOMING" && bosDir ==  1) return;
+
+   // Asian session block
+   // Asia often makes a small counter-BOS fake move before the real London continuation starts
+   if(MacroTrendAsianBlock) {
+      MqlDateTime mdt; TimeToStruct(TimeCurrent(), mdt);
+      if(mdt.hour >= AsianStartHour && mdt.hour < AsianEndHour) return;
+   }
+
+   // HA confirmation: the last 2 closed bars must both be in the BOS direction
+   double haO1, haH1, haL1, haC1;
+   double haO2, haH2, haL2, haC2;
+   CalcHA(1, haO1, haH1, haL1, haC1);
+   CalcHA(2, haO2, haH2, haL2, haC2);
+   bool ha1ok = (bosDir == 1) ? (haC1 > haO1) : (haC1 < haO1);
+   bool ha2ok = (bosDir == 1) ? (haC2 > haO2) : (haC2 < haO2);
+   if(!ha1ok || !ha2ok) return;
+
+   // Bar-1 must be a clean candle: bottomless/bull or topless/bear (no shadow in direction)
+   // Filter out dojis and mixed candles — only ride obvious momentum
+   bool cleanBar = (bosDir == 1) ? IsBottomless(1) : IsTopless(1);
+   if(!cleanBar) return;
+
+   // ZoneContextScore confirms structural strength (MTF, volume, liquidity, OB, etc.)
+   int score = ZoneContextScore(bosDir);
+   if(score < MacroTrendMinScore) return;
+
+   // Safety: refuse entry if BOTH indicators diverge (same rule as regular entries)
+   if(DivergenceCautionEnabled) {
+      bool mtfDiv = !g_MTFAligned;
+      bool volDiv = (UseVolumeAnalysis && g_VolDivergence);
+      if(mtfDiv && volDiv) {
+         Print("[MACRO TREND RIDE] Blocked: MTF+Vol both diverged (score=", score, "/12)");
+         return;
+      }
+   }
+
+   g_MacroTrendRide  = true;
+   g_MacroTrendDir   = bosDir;
+   g_MacroTrendScore = score;
+   Print("[MACRO TREND RIDE] Armed: ", g_MacroStructLabel, " BOS",
+         " HAConsec=", g_HAConsecCount,
+         " Score=", score, "/12",
+         " Vol=", g_VolumeState,
+         " MTF=", (g_MTFAligned ? "ALIGNED" : "diverged"),
+         " dir=", (bosDir == 1 ? "BULL" : "BEAR"));
+}
+
+//+------------------------------------------------------------------+
 //| LEVEL BREAK DETECTION                                            |
 //| Returns how many M15 bars ago price last broke through a key    |
 //| structural level in 'tradeDir'. Sets g_LevelBreakLabel.         |
@@ -3615,14 +3777,18 @@ void TryEntry()
    bool isTrendSignal = (g_Signal == "BUY INCOMING" || g_Signal == "SELL INCOMING");
    int  meanRevDir    = MeanReversionSetup();
    bool isMeanRev     = (meanRevDir != 0 && !isTrendSignal);
+   bool isMacroTrend  = (g_MacroTrendRide && g_MacroTrendDir != 0 && MacroTrendRideEnabled);
 
-   if(!isTrendSignal && !isMeanRev) return;
+   if(!isTrendSignal && !isMeanRev && !isMacroTrend) return;
 
    // === ENTRY TIMING based on HAEntryMode, or MRV 5-minute window ===
    datetime barTime   = iTime(_Symbol, PERIOD_M15, 0);
    int secsElapsed    = (int)(TimeCurrent() - barTime);
 
-   if(isMeanRev) {
+   if(isMacroTrend && !isTrendSignal && !isMeanRev) {
+      // Macro trend ride: high-conviction structural entry — accept any time during the bar.
+      // H4 BOS is confirmed, HA momentum is aligned, score is gated. No tight timing window.
+   } else if(isMeanRev) {
       // MRV: 5-minute entry window from the bar that opened after the 2nd confirming candle
       if(secsElapsed > 5 * 60) {
          g_MRVArmed = false; g_MRVConfirmOpen = 0;
@@ -3658,7 +3824,7 @@ void TryEntry()
    // HA consecutive candle guard — include the forming bar (bar 0) in the count
    // so we never enter late when the live candle is already the 4th+ in a row
    int liveConsec = LiveHAConsecTotal();
-   if(liveConsec > MaxConsecCandles) {
+   if(liveConsec > MaxConsecCandles && !isMacroTrend) {
       g_Signal = "WAITING"; g_HABullSetup = false; g_HABearSetup = false;
       return;
    }
@@ -3678,8 +3844,9 @@ void TryEntry()
 
    // === DETERMINE DIRECTION ===
    int tradeDir = 0; // 1=buy, -1=sell
-   if(isTrendSignal)    tradeDir = (g_Signal == "BUY INCOMING") ? 1 : -1;
-   else if(isMeanRev)   tradeDir = meanRevDir;
+   if(isTrendSignal)       tradeDir = (g_Signal == "BUY INCOMING") ? 1 : -1;
+   else if(isMeanRev)      tradeDir = meanRevDir;
+   else if(isMacroTrend)   tradeDir = g_MacroTrendDir;
 
    // === ZONE FILTERS FOR TREND TRADES ===
    // Standard rule: avoid UPPER_THIRD for buys (near range high = mean-reversion risk)
@@ -3698,7 +3865,7 @@ void TryEntry()
 
    g_AsianZoneRelaxed = false;
    g_ZoneContextUsed  = false;
-   if(isTrendSignal && !isMeanRev) {
+   if(isTrendSignal && !isMeanRev && !isMacroTrend) {
       MqlDateTime zdt; TimeToStruct(TimeCurrent(), zdt);
       bool inAsian = (zdt.hour >= AsianStartHour && zdt.hour < AsianEndHour);
 
@@ -3979,14 +4146,46 @@ void TryEntry()
       // HUGE_BOLD without CI: use standard TP (structural already the best estimate)
    }
 
+   // === MACRO TREND RIDE SL/TP OVERRIDE ===
+   // Fires when CheckMacroTrendRide() armed the setup this bar.
+   // Widens SL to give the trend room to breathe and targets the next HTF level
+   // (Fib / Pivot / SwingH/L) clamped to [MacroTrendMinTP_USD, MacroTrendMaxTP_USD].
+   // This override runs AFTER the BOLD TIER block so it always wins on SL/TP.
+   if(isMacroTrend) {
+      g_DynamicSL_USD = MacroTrendSL_USD;   // wider SL ($2.75 vs normal $2.50)
+
+      // Find the next key HTF level ahead of price in the trade direction
+      double htfTarget = FindNextTargetLevel(price, tradeDir);
+      double htfTP = 0;
+      if(htfTarget > 0) {
+         double htfDist = MathAbs(htfTarget - price);
+         double htfPips = htfDist / _Point / 10.0;   // convert points → pips
+         htfTP = htfPips * 0.10;                     // $0.10/pip/0.01lot for EURUSD
+      }
+
+      // Clamp: if HTF level is within range, use it; else cap at MacroTrendMaxTP_USD
+      if(htfTP >= MacroTrendMinTP_USD)
+         baseTpUSD = MathMin(htfTP, MacroTrendMaxTP_USD);
+      else
+         baseTpUSD = MacroTrendMaxTP_USD;   // HTF close or missing — use full cap
+
+      g_DynamicTP_USD = baseTpUSD;
+      Print("[MACRO TREND RIDE] SL=$", DoubleToString(MacroTrendSL_USD,2),
+            " TP=$", DoubleToString(baseTpUSD,2),
+            htfTarget > 0 ? " HTFtarget=" + DoubleToString(htfTarget,5) : " (no HTF level, using cap)",
+            " Score=", g_MacroTrendScore, "/12");
+   }
+
    // === MTF / VOLUME DIVERGENCE BLOCK ===
    // Both conditions must fire together to block — either alone is insufficient.
    //   MTF diverged: H4 macro and H1 intermediate point in DIFFERENT directions.
    //   Vol diverged: price trending but tick volume declining (exhaustion signal).
    // When only one diverges, the trade is valid and runs to full TP.
    // Mean-reversion trades are exempt (they already target a short counter-move).
+   // Macro trend rides are exempt: CheckMacroTrendRide() already refused to arm when
+   // both MTF+Vol diverge, so isMacroTrend=true guarantees at most one divergence.
    g_DivergenceCaution = false;
-   if(DivergenceCautionEnabled && !isMeanRev) {
+   if(DivergenceCautionEnabled && !isMeanRev && !isMacroTrend) {
       bool mtfDiverged = !g_MTFAligned;
       bool volDiverged = (UseVolumeAnalysis && g_VolDivergence);
       if(mtfDiverged && volDiverged) {
@@ -4008,9 +4207,10 @@ void TryEntry()
 
    // Build comment tag with confidence and SL/TP for recovery
    string confStr = IntegerToString((int)MathRound(confidence));
-   string tag = isMeanRev ? (tradeDir==1 ? "MRV_BUY" : "MRV_SELL")
-                          : (tradeDir==1 ? "HA_BUY_v6" : "HA_SELL_v6");
-   if(HAEntryMode == 1) tag = tag + "_E";
+   string tag = isMacroTrend  ? (tradeDir==1 ? "MACRO_RIDE_BUY" : "MACRO_RIDE_SELL")
+                : isMeanRev    ? (tradeDir==1 ? "MRV_BUY"        : "MRV_SELL")
+                               : (tradeDir==1 ? "HA_BUY_v6"      : "HA_SELL_v6");
+   if(HAEntryMode == 1 || isMacroTrend) tag = tag + "_E";
    if(g_DivergenceCaution)  tag = tag + "_DV";   // divergence-caution marker
    tag = tag + "_C" + confStr
              + "_SL" + DoubleToString(g_DynamicSL_USD, 2)
@@ -4495,6 +4695,17 @@ void UpdateDashboard()
                                      "MTF diverged";
       DashLine("10bn_mtf", "MTF     : " + mtfStr,
                cx, cy, row, lh, corner, mtfClr, g_BoldBet ? 10 : 9); row++;
+
+      // Macro Trend Ride status row
+      if(MacroTrendRideEnabled) {
+         color  rideClr = g_MacroTrendRide ? clrGold : clrDimGray;
+         string rideStr = g_MacroTrendRide
+                          ? (g_MacroTrendDir==1 ? "BULL RIDE" : "BEAR RIDE") +
+                            " ARMED  Score=" + IntegerToString(g_MacroTrendScore) + "/12"
+                          : "trend ride: no setup";
+         DashLine("10bo_ride", "TrendRide: " + rideStr,
+                  cx, cy, row, lh, corner, rideClr, 9); row++;
+      }
    }
 
    color volClr = (g_VolumeState == "HIGH" || g_VolumeState == "ABOVE_AVG") ? clrLime :

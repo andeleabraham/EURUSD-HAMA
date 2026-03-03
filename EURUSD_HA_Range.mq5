@@ -327,6 +327,7 @@ string g_LastBlockReason   = "";             // last TryEntry block message — 
 bool   g_MacroTrendRide  = false;  // true when MacroBOS trend-ride conditions are met on this bar
 int    g_MacroTrendDir   = 0;      // 1=bullish ride (long), -1=bearish ride (short)
 int    g_MacroTrendScore = 0;      // ZoneContextScore captured at time of detection (0-12)
+int    g_BoldRejectConsec = 0;      // last consec count that printed a BOLD REJECTED (throttle)
 
 // Order Blocks (institutional entry zones on H1)
 double g_BullOB_High = 0, g_BullOB_Low = 0;   // last bear candle before bull impulse
@@ -3025,6 +3026,7 @@ void EvaluateHAPattern()
       g_HABearSetup        = false;
       g_ConfirmCandleOpen  = 0;
       g_BoldTier           = "NORMAL";   // fresh arm — reset tier
+      g_BoldRejectConsec   = 0;           // new setup — clear throttle
       g_BollOverridden     = false;
       g_BollOverrideReason = "";
       g_ZonePending        = false;
@@ -3130,16 +3132,19 @@ void EvaluateHAPattern()
                didReset            = false;
                Print("[SMALL BOLD BUY] MaxConsec exceeded — SMALL_BOLD (capped TP): ", tierInfo);
             } else {
-               Print("[TREND BOLD REJECTED-BUY] Insufficient score/level break — hard reset. ", tierInfo);
+               if(g_HAConsecCount != g_BoldRejectConsec) {
+                  Print("[TREND BOLD REJECTED-BUY] Insufficient score/level break — staying armed. ", tierInfo);
+                  g_BoldRejectConsec = g_HAConsecCount;
+               }
             }
          }
          if(didReset) {
-            Print("BUY SETUP EXPIRED: Consec=", g_HAConsecCount, " exceeded MaxConsecCandles=", MaxConsecCandles, " — setup reset.");
-            g_BoldTier        = "NORMAL";
-            g_ZonePending     = false;
-            g_ZoneContextUsed = false;
-            g_Signal          = "WAITING";
-            g_HABullSetup     = false;
+            // Stay armed with setup live — re-evaluate on the next bar when fresh
+            // data (new level break, improved score, etc.) may qualify for BOLD.
+            // Don't disarm g_HABullSetup — that causes a re-arm/reject spam loop.
+            // A color-flip (bear bar) will properly disarm via the direction-change reset below.
+            g_BoldTier          = "NORMAL";
+            g_Signal            = "PREPARING BUY";
             g_ConfirmCandleOpen = 0;
          }
       }
@@ -3151,6 +3156,7 @@ void EvaluateHAPattern()
       g_HABullSetup        = false;
       g_ConfirmCandleOpen  = 0;
       g_BoldTier           = "NORMAL";   // fresh arm — reset tier
+      g_BoldRejectConsec   = 0;           // new setup — clear throttle
       g_BollOverridden     = false;
       g_BollOverrideReason = "";
       g_ZonePending        = false;
@@ -3247,16 +3253,15 @@ void EvaluateHAPattern()
                didReset            = false;
                Print("[SMALL BOLD SELL] MaxConsec exceeded — SMALL_BOLD (capped TP): ", tierInfo);
             } else {
-               Print("[TREND BOLD REJECTED-SELL] Insufficient score/level break — hard reset. ", tierInfo);
+               if(g_HAConsecCount != g_BoldRejectConsec) {
+                  Print("[TREND BOLD REJECTED-SELL] Insufficient score/level break — staying armed. ", tierInfo);
+                  g_BoldRejectConsec = g_HAConsecCount;
+               }
             }
          }
          if(didReset) {
-            Print("SELL SETUP EXPIRED: Consec=", g_HAConsecCount, " exceeded MaxConsecCandles=", MaxConsecCandles, " — setup reset.");
-            g_BoldTier        = "NORMAL";
-            g_ZonePending     = false;
-            g_ZoneContextUsed = false;
-            g_Signal          = "WAITING";
-            g_HABearSetup     = false;
+            g_BoldTier          = "NORMAL";
+            g_Signal            = "PREPARING SELL";
             g_ConfirmCandleOpen = 0;
          }
       }
@@ -3754,9 +3759,11 @@ void TryEntry()
    }
 
    // HA consecutive candle guard — include the forming bar (bar 0) in the count
-   // so we never enter late when the live candle is already the 4th+ in a row
+   // so we never enter late when the live candle is already the 4th+ in a row.
+   // Exempt BOLD tiers (EvaluateHAPattern already approved the extended count)
+   // and Macro Trend Rides (structural breakout, not pattern count limited).
    int liveConsec = LiveHAConsecTotal();
-   if(liveConsec > MaxConsecCandles && !isMacroTrend) {
+   if(liveConsec > MaxConsecCandles && !isMacroTrend && g_BoldTier == "NORMAL") {
       g_Signal = "WAITING"; g_HABullSetup = false; g_HABearSetup = false;
       return;
    }

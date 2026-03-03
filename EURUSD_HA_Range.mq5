@@ -4523,29 +4523,47 @@ void UpdateDashboard()
    int corner = DashboardCorner;
    int lh     = 14;  // pixels per line
    int row    = 0;
+   int rx     = cx + 345;   // right-column X offset
 
-   // --- Background panel created FIRST so all labels (created after) render on top ---
+   // --- Background panels created FIRST so all labels render on top ---
    // MT5 renders foreground objects in creation order: oldest = bottom, newest = top.
-   // By creating the panel before any DashLine calls, it is always beneath the text.
    {
       int    bgPad  = 5;
       int    bgW    = 340;
       int    bgX    = MathMax(0, cx - bgPad);
       int    bgY    = MathMax(0, cy - bgPad);
-      string bgName = DASH_PREFIX + "BG_panel";
+      string bgName = DASH_PREFIX + "BG_panel_L";
       if(ObjectFind(0, bgName) < 0) {
          ObjectCreate(0, bgName, OBJ_RECTANGLE_LABEL, 0, 0, 0);
          ObjectSetInteger(0, bgName, OBJPROP_CORNER,     corner);
          ObjectSetInteger(0, bgName, OBJPROP_XDISTANCE,  bgX);
          ObjectSetInteger(0, bgName, OBJPROP_YDISTANCE,  bgY);
          ObjectSetInteger(0, bgName, OBJPROP_XSIZE,       bgW);
-         ObjectSetInteger(0, bgName, OBJPROP_YSIZE,       900);  // generous initial height; corrected at end
+         ObjectSetInteger(0, bgName, OBJPROP_YSIZE,       900);
          ObjectSetInteger(0, bgName, OBJPROP_BGCOLOR,     C'8,12,28');
          ObjectSetInteger(0, bgName, OBJPROP_BORDER_TYPE, BORDER_FLAT);
          ObjectSetInteger(0, bgName, OBJPROP_COLOR,        C'60,80,120');
          ObjectSetInteger(0, bgName, OBJPROP_BACK,         false);
          ObjectSetInteger(0, bgName, OBJPROP_ZORDER,       0);
          ObjectSetInteger(0, bgName, OBJPROP_SELECTABLE,   false);
+      }
+      // Right-column panel
+      int    bgWR   = 310;
+      int    bgXR   = MathMax(0, rx - bgPad);
+      string bgNameR = DASH_PREFIX + "BG_panel_R";
+      if(ObjectFind(0, bgNameR) < 0) {
+         ObjectCreate(0, bgNameR, OBJ_RECTANGLE_LABEL, 0, 0, 0);
+         ObjectSetInteger(0, bgNameR, OBJPROP_CORNER,     corner);
+         ObjectSetInteger(0, bgNameR, OBJPROP_XDISTANCE,  bgXR);
+         ObjectSetInteger(0, bgNameR, OBJPROP_YDISTANCE,  bgY);
+         ObjectSetInteger(0, bgNameR, OBJPROP_XSIZE,       bgWR);
+         ObjectSetInteger(0, bgNameR, OBJPROP_YSIZE,       900);
+         ObjectSetInteger(0, bgNameR, OBJPROP_BGCOLOR,     C'8,12,28');
+         ObjectSetInteger(0, bgNameR, OBJPROP_BORDER_TYPE, BORDER_FLAT);
+         ObjectSetInteger(0, bgNameR, OBJPROP_COLOR,        C'60,80,120');
+         ObjectSetInteger(0, bgNameR, OBJPROP_BACK,         false);
+         ObjectSetInteger(0, bgNameR, OBJPROP_ZORDER,       0);
+         ObjectSetInteger(0, bgNameR, OBJPROP_SELECTABLE,   false);
       }
    }
 
@@ -4876,104 +4894,201 @@ void UpdateDashboard()
    DashLine("13_consec", "HA Consec: " + consecStr + liveExtra,
                                                                                  cx, cy, row, lh, corner, consecClr,    9); row++;
 
-   // --- Foreign trade awareness ---
-   if(g_ForeignCountSymbol > 0) {
-      string fStr = IntegerToString(g_ForeignCountSymbol) + " foreign on " + _Symbol
-                    + " (" + DoubleToString(g_ForeignLotsSymbol, 2) + " lots)";
-      DashLine("13c_fgn",  "FOREIGN : " + fStr,                                 cx, cy, row, lh, corner, clrOrangeRed, 9); row++;
-      DashLine("13d_fgnd", "  " + g_ForeignSummary,                             cx, cy, row, lh, corner, clrOrange,    8); row++;
-      if(RespectForeignTrades)
-         DashLine("13e_fgnw", "  >> Bot PAUSED (one-trade rule)",               cx, cy, row, lh, corner, clrRed,       8); row++;
-   } else if(g_ForeignCountTotal > 0) {
-      string fAllStr = IntegerToString(g_ForeignCountTotal) + " foreign on other pairs";
-      DashLine("13c_fgn",  "Foreign : " + fAllStr,                              cx, cy, row, lh, corner, clrGray,      8); row++;
-      DashLine("13d_fgnd", "",                                                   cx, cy, row, lh, corner, clrGray,      8); row++;
-      DashLine("13e_fgnw", "",                                                   cx, cy, row, lh, corner, clrGray,      8); row++;
-   } else {
-      DashLine("13c_fgn",  "Foreign : none",                                    cx, cy, row, lh, corner, clrGray,      8); row++;
-      DashLine("13d_fgnd", "",                                                   cx, cy, row, lh, corner, clrGray,      8); row++;
-      DashLine("13e_fgnw", "",                                                   cx, cy, row, lh, corner, clrGray,      8); row++;
-   }
-   row++;
-
-   color  tColor   = g_TradeOpen ? clrLime : clrGray;
-   DashLine("14_trade",  "Trade   : " + (g_TradeOpen ? "OPEN" : "NONE"),        cx, cy, row, lh, corner, tColor,        9); row++;
-
-   if(g_TradeOpen) {
-      string modeStr  = g_IsMeanRev ? "MEAN REV" : (g_IsNearMid ? "MID-validated" : "TREND");
-      color  modeClr  = g_IsMeanRev ? clrGold : (g_IsNearMid ? clrOrange : clrLime);
-      DashLine("14b_mode", "Mode    : " + modeStr,                              cx, cy, row, lh, corner, modeClr,       9); row++;
-
-      // Confidence + dynamic SL/TP display
-      string confLabel = "Conf " + DoubleToString(g_Confidence, 0) + "%";
-      color  confClr = (g_Confidence >= 80) ? clrGold : (g_Confidence >= 65) ? clrCyan : clrSilver;
-      DashLine("14b2_conf", confLabel +
-               "  SL:$" + DoubleToString(g_ScaledSLUSD, 2) +
-               "  TP:$" + DoubleToString(g_ScaledTPUSD, 2) +
-               "  Lock:$" + DoubleToString(g_ScaledLockUSD, 2) +
-               "  Trail:$" + DoubleToString(g_ScaledTrailUSD, 2),               cx, cy, row, lh, corner, confClr,       8); row++;
-
-      if(g_NearLevel != "")
-         DashLine("14d_lvl", "Cnfl    : " + g_NearLevel,                        cx, cy, row, lh, corner, clrGold,       9); row++;
-
-      // Hold bar display — simple max hold (no graduated cutoffs)
-      DashLine("14c_bars", "Hold    : " + IntegerToString(g_OpenBarCount) + "/" + IntegerToString(MaxHoldBars) + " bars",
-                                                                                 cx, cy, row, lh, corner, clrWhite,      9); row++;
-      double hardLoss  = MaxLossUSD * g_CurrentLot / 0.01;
-      DashLine("14e_cap",  "MaxLoss : -$" + DoubleToString(hardLoss,2) + " cap",
-                                                                                 cx, cy, row, lh, corner, clrTomato,     9); row++;
-      string lockStr = g_ProfitLocked
-                       ? "LOCKED  peak:$" + DoubleToString(g_PeakProfit, 2)
-                       : "Watch  lock@$" + DoubleToString(g_ScaledLockUSD, 2);
-      color  lColor  = g_ProfitLocked ? clrLime : clrOrange;
-      DashLine("15_lock", "Lock    : " + lockStr,                               cx, cy, row, lh, corner, lColor,        9); row++;
-   }
-
-   if(GeoPoliticsNote != "") { row++;
-      DashLine("16_geo",  "Geo : " + GeoPoliticsNote,                           cx, cy, row, lh, corner, clrLightGray,  8); row++;
-   }
-   if(NewsNote != "") {
-      DashLine("17_news", "News: " + NewsNote,                                  cx, cy, row, lh, corner, clrLightGray,  8); row++;
-   }
-
-   // --- Daily trading stats ---
-   row++;
-   string dayStatsStr = "W:" + IntegerToString(g_DailyWins) +
-                        " L:" + IntegerToString(g_DailyLosses) +
-                        " P&L:$" + DoubleToString(g_DailyPnL, 2) +
-                        " (" + IntegerToString(g_DailyTradeCount) + "/" +
-                        (MaxDailyTrades > 0 ? IntegerToString(MaxDailyTrades) : "∞") + " trades)";
-   color dayClr = g_DailyPnL > 0 ? clrLime : g_DailyPnL < 0 ? clrRed : clrGray;
-   DashLine("18_dstat", "Today   : " + dayStatsStr,                             cx, cy, row, lh, corner, dayClr,        8); row++;
-
-   // Cooldown / consecutive loss warning
-   if(MaxDailyLossUSD > 0 && g_DailyPnL <= -MaxDailyLossUSD) {
-      DashLine("18b_cool", "DAILY LOSS CAP HIT: -$" + DoubleToString(MathAbs(g_DailyPnL),2) + " (max -$" + DoubleToString(MaxDailyLossUSD,2) + ") — NO MORE TRADES",
-                                                                                 cx, cy, row, lh, corner, clrRed,       8); row++;
-   } else if(g_CooldownUntil > 0 && TimeCurrent() < g_CooldownUntil) {
-      int secsLeft = (int)(g_CooldownUntil - TimeCurrent());
-      DashLine("18b_cool", "COOLDOWN: " + IntegerToString(secsLeft/60) + "m " +
-               IntegerToString(secsLeft%60) + "s (" + IntegerToString(g_ConsecLosses) + " consec losses)",
-                                                                                 cx, cy, row, lh, corner, clrRed,       8); row++;
-   } else if(g_ConsecLosses > 0) {
-      DashLine("18b_cool", "ConsecL : " + IntegerToString(g_ConsecLosses) + "/" + IntegerToString(ConsecLossLimit) + " before cooldown",
-                                                                                 cx, cy, row, lh, corner, clrOrange,    8); row++;
-   } else {
-      DashLine("18b_cool", "",                                                   cx, cy, row, lh, corner, clrGray,      8); row++;
-   }
-
-   // --- Update panel position and exact height to match final row count ---
+   // --- Left panel sizing (finalize height) ---
    {
       int    bgPad  = 5;
       int    bgW    = 340;
       int    bgH    = row * lh + bgPad * 2;
       int    bgX    = MathMax(0, cx - bgPad);
       int    bgY    = MathMax(0, cy - bgPad);
-      string bgName = DASH_PREFIX + "BG_panel";
+      string bgName = DASH_PREFIX + "BG_panel_L";
       ObjectSetInteger(0, bgName, OBJPROP_CORNER,    corner);
       ObjectSetInteger(0, bgName, OBJPROP_XDISTANCE, bgX);
       ObjectSetInteger(0, bgName, OBJPROP_YDISTANCE, bgY);
       ObjectSetInteger(0, bgName, OBJPROP_XSIZE,      bgW);
+      ObjectSetInteger(0, bgName, OBJPROP_YSIZE,      bgH);
+   }
+
+   // ======================================================================
+   //  RIGHT COLUMN — Trade Status, Foreign Trades, Daily Stats, Cooldowns
+   // ======================================================================
+   int rowR = 0;
+
+   DashLine("R_title", "[ TRADE & STATS ]",  rx, cy, rowR, lh, corner, clrWhite, 10); rowR++;
+   rowR++;
+
+   // --- Trade Status (ALL rows ALWAYS rendered — prevents label overlap) ---
+   {
+      color  tColor  = g_TradeOpen ? clrLime : clrGray;
+      DashLine("R_trade", "Trade   : " + (g_TradeOpen ? "OPEN" : "NONE"),
+               rx, cy, rowR, lh, corner, tColor, 9); rowR++;
+
+      if(g_TradeOpen) {
+         string modeStr = g_IsMeanRev ? "MEAN REV" : (g_IsNearMid ? "MID-validated" : "TREND");
+         color  modeClr = g_IsMeanRev ? clrGold : (g_IsNearMid ? clrOrange : clrLime);
+         DashLine("R_mode", "Mode    : " + modeStr, rx, cy, rowR, lh, corner, modeClr, 9);
+      } else {
+         DashLine("R_mode", "Mode    : ---", rx, cy, rowR, lh, corner, clrDimGray, 9);
+      }
+      rowR++;
+
+      if(g_TradeOpen) {
+         string confLbl = "Conf " + DoubleToString(g_Confidence, 0) + "%";
+         color  cClr = (g_Confidence >= 80) ? clrGold : (g_Confidence >= 65) ? clrCyan : clrSilver;
+         DashLine("R_sltp", confLbl +
+                  "  SL:$" + DoubleToString(g_ScaledSLUSD, 2) +
+                  "  TP:$" + DoubleToString(g_ScaledTPUSD, 2),
+                  rx, cy, rowR, lh, corner, cClr, 8);
+      } else {
+         DashLine("R_sltp", "SL / TP : ---", rx, cy, rowR, lh, corner, clrDimGray, 8);
+      }
+      rowR++;
+
+      if(g_TradeOpen) {
+         DashLine("R_lktr", "Lock:$" + DoubleToString(g_ScaledLockUSD, 2) +
+                  "  Trail:$" + DoubleToString(g_ScaledTrailUSD, 2),
+                  rx, cy, rowR, lh, corner, clrAqua, 8);
+      } else {
+         DashLine("R_lktr", "Lock/Tr : ---", rx, cy, rowR, lh, corner, clrDimGray, 8);
+      }
+      rowR++;
+
+      if(g_TradeOpen && g_NearLevel != "") {
+         DashLine("R_cnfl", "Cnfl    : " + g_NearLevel, rx, cy, rowR, lh, corner, clrGold, 9);
+      } else {
+         DashLine("R_cnfl", "Cnfl    : ---", rx, cy, rowR, lh, corner, clrDimGray, 9);
+      }
+      rowR++;
+
+      if(g_TradeOpen) {
+         DashLine("R_hold", "Hold    : " + IntegerToString(g_OpenBarCount) + "/" +
+                  IntegerToString(MaxHoldBars) + " bars",
+                  rx, cy, rowR, lh, corner, clrWhite, 9);
+      } else {
+         DashLine("R_hold", "Hold    : ---", rx, cy, rowR, lh, corner, clrDimGray, 9);
+      }
+      rowR++;
+
+      if(g_TradeOpen) {
+         double hardLoss = MaxLossUSD * g_CurrentLot / 0.01;
+         DashLine("R_cap", "MaxLoss : -$" + DoubleToString(hardLoss, 2) + " cap",
+                  rx, cy, rowR, lh, corner, clrTomato, 9);
+      } else {
+         DashLine("R_cap", "MaxLoss : ---", rx, cy, rowR, lh, corner, clrDimGray, 9);
+      }
+      rowR++;
+
+      if(g_TradeOpen) {
+         string lockStr = g_ProfitLocked
+                          ? "LOCKED  peak:$" + DoubleToString(g_PeakProfit, 2)
+                          : "Watch  lock@$" + DoubleToString(g_ScaledLockUSD, 2);
+         color  lColor  = g_ProfitLocked ? clrLime : clrOrange;
+         DashLine("R_lock", "Lock    : " + lockStr, rx, cy, rowR, lh, corner, lColor, 9);
+      } else {
+         DashLine("R_lock", "Lock    : ---", rx, cy, rowR, lh, corner, clrDimGray, 9);
+      }
+      rowR++;
+   }
+   rowR++;
+
+   // --- Foreign Trades ---
+   DashLine("R_fhdr", "--- FOREIGN ---", rx, cy, rowR, lh, corner, clrSilver, 8); rowR++;
+   if(g_ForeignCountSymbol > 0) {
+      string fStr = IntegerToString(g_ForeignCountSymbol) + " on " + _Symbol
+                    + " (" + DoubleToString(g_ForeignLotsSymbol, 2) + " lots)";
+      DashLine("R_fgn",  "Foreign : " + fStr, rx, cy, rowR, lh, corner, clrOrangeRed, 8);
+   } else if(g_ForeignCountTotal > 0) {
+      DashLine("R_fgn",  "Foreign : " + IntegerToString(g_ForeignCountTotal) + " other pairs",
+               rx, cy, rowR, lh, corner, clrGray, 8);
+   } else {
+      DashLine("R_fgn",  "Foreign : none", rx, cy, rowR, lh, corner, clrGray, 8);
+   }
+   rowR++;
+
+   if(g_ForeignCountSymbol > 0) {
+      DashLine("R_fgnd", "  " + g_ForeignSummary, rx, cy, rowR, lh, corner, clrOrange, 7);
+   } else {
+      DashLine("R_fgnd", "", rx, cy, rowR, lh, corner, clrGray, 7);
+   }
+   rowR++;
+
+   if(g_ForeignCountSymbol > 0 && RespectForeignTrades) {
+      DashLine("R_fgnw", "  >> Bot PAUSED (one-trade rule)", rx, cy, rowR, lh, corner, clrRed, 8);
+   } else {
+      DashLine("R_fgnw", "", rx, cy, rowR, lh, corner, clrGray, 8);
+   }
+   rowR++;
+   rowR++;
+
+   // --- Daily Stats ---
+   DashLine("R_shdr", "--- DAILY STATS ---", rx, cy, rowR, lh, corner, clrWhite, 9); rowR++;
+   {
+      string dayStatsStr = "W:" + IntegerToString(g_DailyWins) +
+                           " L:" + IntegerToString(g_DailyLosses) +
+                           " P&L:$" + DoubleToString(g_DailyPnL, 2) +
+                           " (" + IntegerToString(g_DailyTradeCount) + "/" +
+                           (MaxDailyTrades > 0 ? IntegerToString(MaxDailyTrades) : "inf") + ")";
+      color dayClr = g_DailyPnL > 0 ? clrLime : g_DailyPnL < 0 ? clrRed : clrGray;
+      DashLine("R_dstat", "Today   : " + dayStatsStr, rx, cy, rowR, lh, corner, dayClr, 8); rowR++;
+   }
+
+   // Cooldowns (all slots always rendered — blank when inactive)
+   if(MaxDailyLossUSD > 0 && g_DailyPnL <= -MaxDailyLossUSD) {
+      DashLine("R_cool", "LOSS CAP -$" + DoubleToString(MathAbs(g_DailyPnL),2) + " STOPPED",
+               rx, cy, rowR, lh, corner, clrRed, 8);
+   } else if(g_CooldownUntil > 0 && TimeCurrent() < g_CooldownUntil) {
+      int secsLeft = (int)(g_CooldownUntil - TimeCurrent());
+      DashLine("R_cool", "COOLDOWN " + IntegerToString(secsLeft/60) + "m" +
+               IntegerToString(secsLeft%60) + "s (" + IntegerToString(g_ConsecLosses) + " consec)",
+               rx, cy, rowR, lh, corner, clrRed, 8);
+   } else if(g_ConsecLosses > 0) {
+      DashLine("R_cool", "ConsecL : " + IntegerToString(g_ConsecLosses) + "/" +
+               IntegerToString(ConsecLossLimit),
+               rx, cy, rowR, lh, corner, clrOrange, 8);
+   } else {
+      DashLine("R_cool", "", rx, cy, rowR, lh, corner, clrGray, 8);
+   }
+   rowR++;
+
+   if(g_PostTradeCoolUntil > 0 && TimeCurrent() < g_PostTradeCoolUntil) {
+      int ptSecs = (int)(g_PostTradeCoolUntil - TimeCurrent());
+      DashLine("R_ptcool", "PostTrd : " + IntegerToString(ptSecs/60) + "m " +
+               IntegerToString(ptSecs%60) + "s cooloff",
+               rx, cy, rowR, lh, corner, clrOrange, 8);
+   } else {
+      DashLine("R_ptcool", "", rx, cy, rowR, lh, corner, clrGray, 8);
+   }
+   rowR++;
+
+   if(g_StartupGraceUntil > 0 && TimeCurrent() < g_StartupGraceUntil) {
+      int sgSecs = (int)(g_StartupGraceUntil - TimeCurrent());
+      DashLine("R_grace", "Grace   : " + IntegerToString(sgSecs/60) + "m " +
+               IntegerToString(sgSecs%60) + "s startup",
+               rx, cy, rowR, lh, corner, clrYellow, 8);
+   } else {
+      DashLine("R_grace", "", rx, cy, rowR, lh, corner, clrGray, 8);
+   }
+   rowR++;
+
+   // Geo & News notes (always rendered)
+   rowR++;
+   DashLine("R_geo",  GeoPoliticsNote != "" ? "Geo : " + GeoPoliticsNote : "",
+            rx, cy, rowR, lh, corner, GeoPoliticsNote != "" ? clrLightGray : clrGray, 8); rowR++;
+   DashLine("R_news", NewsNote != "" ? "News: " + NewsNote : "",
+            rx, cy, rowR, lh, corner, NewsNote != "" ? clrLightGray : clrGray, 8); rowR++;
+
+   // --- Right panel sizing ---
+   {
+      int    bgPad  = 5;
+      int    bgWR   = 310;
+      int    bgH    = rowR * lh + bgPad * 2;
+      int    bgXR   = MathMax(0, rx - bgPad);
+      int    bgY    = MathMax(0, cy - bgPad);
+      string bgName = DASH_PREFIX + "BG_panel_R";
+      ObjectSetInteger(0, bgName, OBJPROP_CORNER,    corner);
+      ObjectSetInteger(0, bgName, OBJPROP_XDISTANCE, bgXR);
+      ObjectSetInteger(0, bgName, OBJPROP_YDISTANCE, bgY);
+      ObjectSetInteger(0, bgName, OBJPROP_XSIZE,      bgWR);
       ObjectSetInteger(0, bgName, OBJPROP_YSIZE,      bgH);
    }
 }

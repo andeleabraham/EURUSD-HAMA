@@ -3018,6 +3018,32 @@ void EvaluateHAPattern()
    // Count consecutive same-color candles ending at bar 1
    g_HAConsecCount = CountConsecutive(1, dir1);
 
+   // === COLD-START RECOVERY ===
+   // After restart all state is lost. If we have a consecutive chain of same-
+   // direction candles and one of them (not necessarily bar 1) was the original
+   // arming candle (bottomless/topless), re-arm the setup so the state machine
+   // can pick up where it left off.  Only runs once — the first time both
+   // setups are disarmed and we have at least 2 consecutive bars.
+   if(!g_HABullSetup && !g_HABearSetup && g_Signal == "WAITING"
+      && dir1 != 0 && g_HAConsecCount >= 2) {
+      for(int ri = 1; ri <= g_HAConsecCount && ri <= TrendBoldHardCap; ri++) {
+         if(dir1 == 1 && IsBottomless(ri)) {
+            g_HABullSetup = true;
+            g_Signal      = "PREPARING BUY";
+            Print("[STARTUP RECOVERY] Re-armed BUY setup from bar ", ri,
+                  " (bottomless bull). Consec=", g_HAConsecCount, "/", MaxConsecCandles);
+            break;
+         }
+         if(dir1 == -1 && IsTopless(ri)) {
+            g_HABearSetup = true;
+            g_Signal      = "PREPARING SELL";
+            Print("[STARTUP RECOVERY] Re-armed SELL setup from bar ", ri,
+                  " (topless bear). Consec=", g_HAConsecCount, "/", MaxConsecCandles);
+            break;
+         }
+      }
+   }
+
    // === BUY SETUP STATE MACHINE ===
    // Step 1: bottomless bull → arm the setup (only if NOT already armed)
    // A 2nd/3rd consecutive bottomless candle falls to Step 2 as confirmation.

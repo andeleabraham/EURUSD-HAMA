@@ -1,11 +1,10 @@
 //+------------------------------------------------------------------+
-//|  EURUSD Heiken Ashi Range Bot v5.0                               |
-//|  Fixes: unified $2 lock/$1.75 max-loss, early entry default,    |
-//|  range uses prior full-day H/L, zone NONE no longer blocks,     |
-//|  mid-range trades fully validated before entry, smarter close   |
+//|  EURUSD Heiken Ashi Range Bot v6.23                              |
+//|  CHoCH/BOS persistence, price-break CHoCH, multi-OB tracking,  |
+//|  FVG 50% CE fill, H1+H4 FVG overlap confluence, confidence v17 |
 //+------------------------------------------------------------------+
 #property copyright   "EURUSD HA Range Bot"
-#property version     "5.00"
+#property version     "6.23"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -291,6 +290,11 @@ double g_SwingLow1  = 0, g_SwingLow2  = 0;  // two most recent swing lows (H1)
 string g_StructureLabel = "RANGING";          // "BULLISH" / "BEARISH" / "RANGING"
 bool   g_BOS         = false;                // Break of Structure on this bar
 bool   g_CHoCH       = false;                // Change of Character (trend reversal)
+datetime g_BOSTime   = 0;                    // when BOS was last detected (persists BOS_PERSIST_BARS H1 bars)
+datetime g_CHoCHTime = 0;                    // when CHoCH was last detected
+int      g_BOSPersistBars   = 4;             // persist BOS/CHoCH for N H1 bars (~4h)
+bool     g_BOSActive  = false;               // true while within persistence window
+bool     g_CHoCHActive = false;              // true while within persistence window
 
 // Macro (higher-TF) structure — H4/D1 — gives the overall directional map
 double g_MacroSwingHigh1 = 0, g_MacroSwingHigh2 = 0;  // two most recent macro swing highs
@@ -298,6 +302,10 @@ double g_MacroSwingLow1  = 0, g_MacroSwingLow2  = 0;  // two most recent macro s
 string g_MacroStructLabel = "RANGING";                 // "BULLISH" / "BEARISH" / "RANGING"
 bool   g_MacroBOS   = false;                           // Macro Break of Structure
 bool   g_MacroCHoCH = false;                           // Macro Change of Character (major reversal signal)
+datetime g_MacroBOSTime   = 0;                         // when Macro BOS was last detected
+datetime g_MacroCHoCHTime = 0;                         // when Macro CHoCH was last detected
+bool     g_MacroBOSActive  = false;                    // true while within persistence window
+bool     g_MacroCHoCHActive = false;                   // true while within persistence window
 bool   g_MTFAligned = false;   // true when macro (H4) and intermediate (H1) agree on direction
 bool   g_BoldBet    = false;   // true when MTF aligned + FVG or OB present + HA valid
 bool   g_BollOverridden     = false;  // true when Bollinger gate was bypassed by confluence override
@@ -331,11 +339,20 @@ int    g_MacroTrendDir   = 0;      // 1=bullish ride (long), -1=bearish ride (sh
 int    g_MacroTrendScore = 0;      // ZoneContextScore captured at time of detection (0-12)
 int    g_BoldRejectConsec = 0;      // last consec count that printed a BOLD REJECTED (throttle)
 
-// Order Blocks (institutional entry zones on H1)
-double g_BullOB_High = 0, g_BullOB_Low = 0;   // last bear candle before bull impulse
-double g_BearOB_High = 0, g_BearOB_Low = 0;   // last bull candle before bear impulse
-datetime g_BullOB_Time = 0;                    // H1 bar time of bull OB candle
-datetime g_BearOB_Time = 0;                    // H1 bar time of bear OB candle
+// Order Blocks (institutional entry zones on H1) — up to 3 per direction
+struct OBZone {
+   double high;
+   double low;
+   datetime created;
+   bool   mitigated;   // true once price closed through the zone
+};
+OBZone g_BullOBs[3];   int g_BullOBCount = 0;   // demand zones (nearest-first)
+OBZone g_BearOBs[3];   int g_BearOBCount = 0;   // supply zones (nearest-first)
+// Legacy aliases for backward compat (point to nearest active OB)
+double g_BullOB_High = 0, g_BullOB_Low = 0;
+double g_BearOB_High = 0, g_BearOB_Low = 0;
+datetime g_BullOB_Time = 0;
+datetime g_BearOB_Time = 0;
 
 // Fair Value Gaps (FVG) — M15 imbalance zones
 struct FVGZone {
@@ -343,7 +360,8 @@ struct FVGZone {
    double low;        // lower edge of gap
    int    dir;        // 1=bullish FVG (gap up), -1=bearish FVG (gap down)
    datetime created;  // when detected
-   bool   filled;     // true once price has traded through the gap
+   bool   filled;     // true once price has traded through the CE (50% midpoint)
+   ENUM_TIMEFRAMES tf;  // timeframe this FVG was detected on
 };
 FVGZone g_FVGs[];                          // active FVG array
 int     g_FVGCount        = 0;             // number of active FVGs
@@ -352,6 +370,8 @@ bool    g_NearBearFVG     = false;         // price near a bearish FVG (expect r
 double  g_NearestFVGHigh  = 0;             // nearest FVG zone high
 double  g_NearestFVGLow   = 0;             // nearest FVG zone low
 int     g_NearestFVGDir   = 0;             // direction of nearest FVG
+bool    g_FVGOverlapBullish = false;        // H1 + H4 bullish FVGs overlap = strong demand
+bool    g_FVGOverlapBearish = false;        // H1 + H4 bearish FVGs overlap = strong supply
 
 // H4 Order Blocks (macro supply/demand zones — major institutional footprints spanning days)
 double g_H4BullOB_High = 0, g_H4BullOB_Low = 0;  // H4 demand zone (bull OB)
@@ -689,6 +709,9 @@ void OnTick()
       if(UseLiquiditySweep)  DetectLiquiditySweep();
       if(UseFairValueGaps)   { DetectFairValueGaps(); DrawFVGZones(); }
       if(UseH4SMC)           { DetectH4OrderBlocks(); DetectH4FairValueGaps(); DrawH4SMCZones(); }
+
+      // --- FVG H1+H4 overlap confluence detection ---
+      DetectFVGOverlap();
 
       EvaluateHAPattern();
       CheckMacroTrendRide();   // must run after EvaluateHAPattern (uses g_HAConsecCount, g_MacroBOS, etc.)
@@ -1111,6 +1134,12 @@ void CalcBollinger()
 //| Scans H1 bars for swing highs/lows using a 3-bar left/right     |
 //| confirmation.  Determines overall structure (bullish HH/HL,      |
 //| bearish LH/LL, or ranging) and flags BOS / CHoCH events.        |
+//| v6.23 improvements:                                              |
+//|  - 2-pip min swing distance (was 1 pip) — filters noise          |
+//|  - Price-break CHoCH: bearish trend → price breaks above last LH |
+//|    = bullish CHoCH confirmed, and vice versa                     |
+//|  - BOS/CHoCH persist for g_BOSPersistBars H1 bars (~4h)         |
+//|    so confidence scorer doesn't miss one-tick events             |
 //+------------------------------------------------------------------+
 void DetectSwingStructure()
 {
@@ -1151,30 +1180,64 @@ void DetectSwingStructure()
    g_SwingLow2  = (slCount >= 2) ? swingLows[1]  : 0;
 
    string prevStructure = g_StructureLabel;
-   g_BOS   = false;
-   g_CHoCH = false;
+
+   // --- Persistence decay: check if previous BOS/CHoCH events have expired ---
+   datetime h1BarTime = iTime(_Symbol, PERIOD_H1, 0);
+   if(g_BOSTime > 0 && h1BarTime - g_BOSTime > g_BOSPersistBars * PeriodSeconds(PERIOD_H1))
+      g_BOSActive = false;
+   if(g_CHoCHTime > 0 && h1BarTime - g_CHoCHTime > g_BOSPersistBars * PeriodSeconds(PERIOD_H1))
+      g_CHoCHActive = false;
+
+   // Fresh detection this tick (may re-trigger or upgrade)
+   bool freshBOS   = false;
+   bool freshCHoCH = false;
 
    if(shCount >= 2 && slCount >= 2)
    {
-      // 10-point tolerance (1 pip) to avoid noise
-      bool HH = (g_SwingHigh1 > g_SwingHigh2 + _Point * 10);
-      bool HL = (g_SwingLow1  > g_SwingLow2  + _Point * 10);
-      bool LH = (g_SwingHigh1 < g_SwingHigh2 - _Point * 10);
-      bool LL = (g_SwingLow1  < g_SwingLow2  - _Point * 10);
+      // 20-point tolerance (2 pips) to avoid noise — was 1 pip which was too tight
+      double tol = _Point * 20;
+      bool HH = (g_SwingHigh1 > g_SwingHigh2 + tol);
+      bool HL = (g_SwingLow1  > g_SwingLow2  + tol);
+      bool LH = (g_SwingHigh1 < g_SwingHigh2 - tol);
+      bool LL = (g_SwingLow1  < g_SwingLow2  - tol);
 
       if(HH && HL)       g_StructureLabel = "BULLISH";
       else if(LH && LL)  g_StructureLabel = "BEARISH";
       else                g_StructureLabel = "RANGING";
 
-      // BOS: live price breaks the most recent swing in trend direction
       double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-      if(g_StructureLabel == "BULLISH" && bid > g_SwingHigh1)  g_BOS = true;
-      if(g_StructureLabel == "BEARISH" && bid < g_SwingLow1)   g_BOS = true;
 
-      // CHoCH: structure just flipped direction
-      if(prevStructure == "BULLISH"  && g_StructureLabel == "BEARISH") g_CHoCH = true;
-      if(prevStructure == "BEARISH"  && g_StructureLabel == "BULLISH") g_CHoCH = true;
+      // --- BOS: live price breaks the most recent swing in trend direction ---
+      if(g_StructureLabel == "BULLISH" && bid > g_SwingHigh1) freshBOS = true;
+      if(g_StructureLabel == "BEARISH" && bid < g_SwingLow1)  freshBOS = true;
+
+      // --- Classic CHoCH: HH/HL ↔ LH/LL pattern flip ---
+      if(prevStructure == "BULLISH"  && g_StructureLabel == "BEARISH") freshCHoCH = true;
+      if(prevStructure == "BEARISH"  && g_StructureLabel == "BULLISH") freshCHoCH = true;
+
+      // --- Price-break CHoCH (ICT concept): price breaks a swing in the OPPOSITE
+      //     direction to the previous trend, confirming the character change.
+      //     Bearish trend: price breaks above the most recent Lower High = bull CHoCH
+      //     Bullish trend: price breaks below the most recent Higher Low = bear CHoCH
+      if(prevStructure == "BEARISH" && shCount >= 1 && bid > g_SwingHigh1)
+         freshCHoCH = true;   // was bearish, now breaking above swing high
+      if(prevStructure == "BULLISH" && slCount >= 1 && bid < g_SwingLow1)
+         freshCHoCH = true;   // was bullish, now breaking below swing low
    }
+
+   // --- Apply persistence: fresh events set timestamp + activate ---
+   if(freshBOS) {
+      g_BOSTime   = h1BarTime;
+      g_BOSActive = true;
+   }
+   if(freshCHoCH) {
+      g_CHoCHTime   = h1BarTime;
+      g_CHoCHActive = true;
+   }
+
+   // Expose to confidence scorer & other consumers
+   g_BOS   = g_BOSActive;
+   g_CHoCH = g_CHoCHActive;
 }
 
 //+------------------------------------------------------------------+
@@ -1226,24 +1289,50 @@ void DetectMacroStructure()
 
    string prevMacro = g_MacroStructLabel;
 
+   // --- Persistence decay for macro BOS/CHoCH ---
+   datetime h4BarTime = iTime(_Symbol, MacroStructTF, 0);
+   int macroPersistBars = 2;   // persist for 2 H4 bars (~8h)
+   if(g_MacroBOSTime > 0 && h4BarTime - g_MacroBOSTime > macroPersistBars * PeriodSeconds(MacroStructTF))
+      g_MacroBOSActive = false;
+   if(g_MacroCHoCHTime > 0 && h4BarTime - g_MacroCHoCHTime > macroPersistBars * PeriodSeconds(MacroStructTF))
+      g_MacroCHoCHActive = false;
+
+   bool freshMacroBOS   = false;
+   bool freshMacroCHoCH = false;
+
    if(shCount >= 2 && slCount >= 2)
    {
-      bool HH = (g_MacroSwingHigh1 > g_MacroSwingHigh2 + _Point * 10);
-      bool HL = (g_MacroSwingLow1  > g_MacroSwingLow2  + _Point * 10);
-      bool LH = (g_MacroSwingHigh1 < g_MacroSwingHigh2 - _Point * 10);
-      bool LL = (g_MacroSwingLow1  < g_MacroSwingLow2  - _Point * 10);
+      // 2-pip tolerance (was 1 pip)
+      double tol = _Point * 20;
+      bool HH = (g_MacroSwingHigh1 > g_MacroSwingHigh2 + tol);
+      bool HL = (g_MacroSwingLow1  > g_MacroSwingLow2  + tol);
+      bool LH = (g_MacroSwingHigh1 < g_MacroSwingHigh2 - tol);
+      bool LL = (g_MacroSwingLow1  < g_MacroSwingLow2  - tol);
 
       if(HH && HL)      g_MacroStructLabel = "BULLISH";
       else if(LH && LL) g_MacroStructLabel = "BEARISH";
       else              g_MacroStructLabel = "RANGING";
 
       double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-      if(g_MacroStructLabel == "BULLISH" && bid > g_MacroSwingHigh1) g_MacroBOS = true;
-      if(g_MacroStructLabel == "BEARISH" && bid < g_MacroSwingLow1)  g_MacroBOS = true;
+      if(g_MacroStructLabel == "BULLISH" && bid > g_MacroSwingHigh1) freshMacroBOS = true;
+      if(g_MacroStructLabel == "BEARISH" && bid < g_MacroSwingLow1)  freshMacroBOS = true;
 
-      if(prevMacro == "BULLISH" && g_MacroStructLabel == "BEARISH") g_MacroCHoCH = true;
-      if(prevMacro == "BEARISH" && g_MacroStructLabel == "BULLISH") g_MacroCHoCH = true;
+      // Classic CHoCH: pattern flip
+      if(prevMacro == "BULLISH" && g_MacroStructLabel == "BEARISH") freshMacroCHoCH = true;
+      if(prevMacro == "BEARISH" && g_MacroStructLabel == "BULLISH") freshMacroCHoCH = true;
+
+      // Price-break CHoCH on macro TF
+      if(prevMacro == "BEARISH" && shCount >= 1 && bid > g_MacroSwingHigh1)
+         freshMacroCHoCH = true;
+      if(prevMacro == "BULLISH" && slCount >= 1 && bid < g_MacroSwingLow1)
+         freshMacroCHoCH = true;
    }
+
+   // Apply persistence
+   if(freshMacroBOS)   { g_MacroBOSTime   = h4BarTime; g_MacroBOSActive   = true; }
+   if(freshMacroCHoCH) { g_MacroCHoCHTime = h4BarTime; g_MacroCHoCHActive = true; }
+   g_MacroBOS   = g_MacroBOSActive;
+   g_MacroCHoCH = g_MacroCHoCHActive;
 
    // === MTF ALIGNMENT ===
    // Both macro (H4) and intermediate (H1) structure agree on direction.
@@ -1415,26 +1504,47 @@ void AnalyzeVolume()
 }
 
 //+------------------------------------------------------------------+
-//| ORDER BLOCK DETECTION (H1)                                        |
+//| ORDER BLOCK DETECTION (H1) — v6.23 multi-OB + invalidation      |
 //| Scans H1 bars for strong impulse moves (3+ consecutive bars,     |
 //| 12+ pips).  The last opposing candle before the impulse is the   |
 //| "order block" — a zone where institutional orders were placed.   |
-//| Price often returns to these zones for high-quality entries.     |
+//| v6.23: tracks up to 3 OBs per direction (nearest to price first)|
+//|        marks mitigated when H1 candle CLOSES through the zone    |
 //+------------------------------------------------------------------+
 void DetectOrderBlocks()
 {
-   g_BullOB_High = 0;  g_BullOB_Low = 0;  g_BullOB_Time = 0;
-   g_BearOB_High = 0;  g_BearOB_Low = 0;  g_BearOB_Time = 0;
+   // --- Step 1: mark existing OBs as mitigated if price closed through them ---
+   double lastClose = iClose(_Symbol, PERIOD_H1, 1);  // last completed H1 candle close
+   for(int b = 0; b < g_BullOBCount; b++) {
+      if(!g_BullOBs[b].mitigated && lastClose < g_BullOBs[b].low)
+         g_BullOBs[b].mitigated = true;   // price closed below demand zone = invalidated
+   }
+   for(int b = 0; b < g_BearOBCount; b++) {
+      if(!g_BearOBs[b].mitigated && lastClose > g_BearOBs[b].high)
+         g_BearOBs[b].mitigated = true;   // price closed above supply zone = invalidated
+   }
 
-   int    scanBars   = OBScanBars;  // H1 bars to look back
-   int    impulseLen = 3;           // min consecutive H1 candles forming an impulse
-   double minImpulse = 12.0;        // min total impulse size in pips
-   double minBody    = OBMinBodyPips * _Point * 10.0;  // min OB candle body in price
+   // Compress mitigated entries
+   int wIdx = 0;
+   for(int b = 0; b < g_BullOBCount; b++) {
+      if(!g_BullOBs[b].mitigated) { if(wIdx != b) g_BullOBs[wIdx] = g_BullOBs[b]; wIdx++; }
+   }
+   g_BullOBCount = wIdx;
+   wIdx = 0;
+   for(int b = 0; b < g_BearOBCount; b++) {
+      if(!g_BearOBs[b].mitigated) { if(wIdx != b) g_BearOBs[wIdx] = g_BearOBs[b]; wIdx++; }
+   }
+   g_BearOBCount = wIdx;
 
-   // --- BULLISH ORDER BLOCK: bearish H1 candle before a bullish impulse ---
-   for(int i = impulseLen; i < scanBars; i++)
+   // --- Step 2: scan for new OBs (only if we have room) ---
+   int    scanBars   = OBScanBars;
+   int    impulseLen = 3;
+   double minImpulse = 12.0;
+   double minBody    = OBMinBodyPips * _Point * 10.0;
+
+   // --- BULLISH ORDER BLOCKS (demand zones) ---
+   for(int i = impulseLen; i < scanBars && g_BullOBCount < 3; i++)
    {
-      // All bars from i down to i-impulseLen+1 must be bullish
       bool allBull = true;
       for(int j = 0; j < impulseLen; j++) {
          int idx = i - j;
@@ -1445,26 +1555,34 @@ void DetectOrderBlocks()
       }
       if(!allBull) continue;
 
-      // Impulse must be at least minImpulse pips
       double impOpen  = iOpen (_Symbol, PERIOD_H1, i);
       double impClose = iClose(_Symbol, PERIOD_H1, i - impulseLen + 1);
       if((impClose - impOpen) / _Point / 10.0 < minImpulse) continue;
 
-      // OB candle = bar just before the impulse
       int ob = i + 1;
       if(ob >= scanBars) continue;
       double obO = iOpen (_Symbol, PERIOD_H1, ob);
       double obC = iClose(_Symbol, PERIOD_H1, ob);
-      if(obC >= obO) continue;                  // must be bearish
-      if((obO - obC) < minBody) continue;       // body too small = not a real OB
-      g_BullOB_High = obO;
-      g_BullOB_Low  = obC;
-      g_BullOB_Time = iTime(_Symbol, PERIOD_H1, ob);
-      break;
+      if(obC >= obO) continue;
+      if((obO - obC) < minBody) continue;
+
+      // Check not already tracked
+      datetime obTime = iTime(_Symbol, PERIOD_H1, ob);
+      bool exists = false;
+      for(int b = 0; b < g_BullOBCount; b++) {
+         if(g_BullOBs[b].created == obTime) { exists = true; break; }
+      }
+      if(exists) continue;
+
+      g_BullOBs[g_BullOBCount].high      = obO;
+      g_BullOBs[g_BullOBCount].low       = obC;
+      g_BullOBs[g_BullOBCount].created   = obTime;
+      g_BullOBs[g_BullOBCount].mitigated = false;
+      g_BullOBCount++;
    }
 
-   // --- BEARISH ORDER BLOCK: bullish H1 candle before a bearish impulse ---
-   for(int i = impulseLen; i < scanBars; i++)
+   // --- BEARISH ORDER BLOCKS (supply zones) ---
+   for(int i = impulseLen; i < scanBars && g_BearOBCount < 3; i++)
    {
       bool allBear = true;
       for(int j = 0; j < impulseLen; j++) {
@@ -1484,12 +1602,48 @@ void DetectOrderBlocks()
       if(ob >= scanBars) continue;
       double obO = iOpen (_Symbol, PERIOD_H1, ob);
       double obC = iClose(_Symbol, PERIOD_H1, ob);
-      if(obC <= obO) continue;                  // must be bullish
-      if((obC - obO) < minBody) continue;       // body too small = not a real OB
-      g_BearOB_High = obC;
-      g_BearOB_Low  = obO;
-      g_BearOB_Time = iTime(_Symbol, PERIOD_H1, ob);
-      break;
+      if(obC <= obO) continue;
+      if((obC - obO) < minBody) continue;
+
+      datetime obTime = iTime(_Symbol, PERIOD_H1, ob);
+      bool exists = false;
+      for(int b = 0; b < g_BearOBCount; b++) {
+         if(g_BearOBs[b].created == obTime) { exists = true; break; }
+      }
+      if(exists) continue;
+
+      g_BearOBs[g_BearOBCount].high      = obC;
+      g_BearOBs[g_BearOBCount].low       = obO;
+      g_BearOBs[g_BearOBCount].created   = obTime;
+      g_BearOBs[g_BearOBCount].mitigated = false;
+      g_BearOBCount++;
+   }
+
+   // --- Step 3: set legacy aliases to the OB nearest current price ---
+   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   g_BullOB_High = 0; g_BullOB_Low = 0; g_BullOB_Time = 0;
+   g_BearOB_High = 0; g_BearOB_Low = 0; g_BearOB_Time = 0;
+   double bestBullDist = 99999, bestBearDist = 99999;
+
+   for(int b = 0; b < g_BullOBCount; b++) {
+      double mid = (g_BullOBs[b].high + g_BullOBs[b].low) / 2.0;
+      double dist = MathAbs(bid - mid);
+      if(dist < bestBullDist) {
+         bestBullDist  = dist;
+         g_BullOB_High = g_BullOBs[b].high;
+         g_BullOB_Low  = g_BullOBs[b].low;
+         g_BullOB_Time = g_BullOBs[b].created;
+      }
+   }
+   for(int b = 0; b < g_BearOBCount; b++) {
+      double mid = (g_BearOBs[b].high + g_BearOBs[b].low) / 2.0;
+      double dist = MathAbs(bid - mid);
+      if(dist < bestBearDist) {
+         bestBearDist  = dist;
+         g_BearOB_High = g_BearOBs[b].high;
+         g_BearOB_Low  = g_BearOBs[b].low;
+         g_BearOB_Time = g_BearOBs[b].created;
+      }
    }
 }
 
@@ -1503,15 +1657,17 @@ void DetectOrderBlocks()
 //+------------------------------------------------------------------+
 void DetectFairValueGaps()
 {
-   // Mark existing FVGs as filled if price has traded through them
+   // Mark existing FVGs as filled using CE (Consequent Encroachment = 50% midpoint)
+   // ICT concept: FVG is truly "filled" only when price reaches the midpoint, not just the edge
    double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
    for(int f = 0; f < g_FVGCount; f++) {
       if(g_FVGs[f].filled) continue;
-      // Bullish FVG filled when price drops into the gap
-      if(g_FVGs[f].dir == 1 && bid <= g_FVGs[f].high && bid >= g_FVGs[f].low)
+      double ce = (g_FVGs[f].high + g_FVGs[f].low) / 2.0;  // Consequent Encroachment level
+      // Bullish FVG filled when price drops to CE or below
+      if(g_FVGs[f].dir == 1 && bid <= ce)
          g_FVGs[f].filled = true;
-      // Bearish FVG filled when price rises into the gap
-      if(g_FVGs[f].dir == -1 && bid >= g_FVGs[f].low && bid <= g_FVGs[f].high)
+      // Bearish FVG filled when price rises to CE or above
+      if(g_FVGs[f].dir == -1 && bid >= ce)
          g_FVGs[f].filled = true;
       // Expire FVGs: H1/H4 gaps persist longer than M15 gaps
       int expiryHours = (FVGTimeframe >= PERIOD_H4) ? 5*24 : (FVGTimeframe >= PERIOD_H1) ? 5*24 : 48;
@@ -1608,6 +1764,7 @@ void AddFVG(double high, double low, int dir, datetime created)
    g_FVGs[g_FVGCount].dir     = dir;
    g_FVGs[g_FVGCount].created = created;
    g_FVGs[g_FVGCount].filled  = false;
+   g_FVGs[g_FVGCount].tf      = FVGTimeframe;
    g_FVGCount++;
 }
 
@@ -1797,12 +1954,13 @@ void DetectH4FairValueGaps()
 {
    double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
 
-   // Mark filled / expired
+   // Mark filled using CE (Consequent Encroachment = 50% midpoint) / expired
    for(int f = 0; f < g_H4FVGCount; f++) {
       if(g_H4FVGs[f].filled) continue;
-      if(g_H4FVGs[f].dir == 1  && bid <= g_H4FVGs[f].high && bid >= g_H4FVGs[f].low)
+      double ce = (g_H4FVGs[f].high + g_H4FVGs[f].low) / 2.0;
+      if(g_H4FVGs[f].dir == 1  && bid <= ce)
          g_H4FVGs[f].filled = true;
-      if(g_H4FVGs[f].dir == -1 && bid >= g_H4FVGs[f].low  && bid <= g_H4FVGs[f].high)
+      if(g_H4FVGs[f].dir == -1 && bid >= ce)
          g_H4FVGs[f].filled = true;
       // H4 FVGs expire after 14 calendar days
       if(TimeCurrent() - g_H4FVGs[f].created > 14 * 24 * 3600)
@@ -1839,6 +1997,7 @@ void DetectH4FairValueGaps()
             g_H4FVGs[g_H4FVGCount].dir     = 1;
             g_H4FVGs[g_H4FVGCount].created = gapTime;
             g_H4FVGs[g_H4FVGCount].filled  = false;
+            g_H4FVGs[g_H4FVGCount].tf      = PERIOD_H4;
             g_H4FVGCount++;
          }
       }
@@ -1861,6 +2020,7 @@ void DetectH4FairValueGaps()
             g_H4FVGs[g_H4FVGCount].dir     = -1;
             g_H4FVGs[g_H4FVGCount].created = gapTime;
             g_H4FVGs[g_H4FVGCount].filled  = false;
+            g_H4FVGs[g_H4FVGCount].tf      = PERIOD_H4;
             g_H4FVGCount++;
          }
       }
@@ -1896,6 +2056,37 @@ void DetectH4FairValueGaps()
          g_NearestH4FVGDir  = g_H4FVGs[f].dir;
          if(g_H4FVGs[f].dir == 1)  g_NearBullH4FVG = true;
          if(g_H4FVGs[f].dir == -1) g_NearBearH4FVG = true;
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| FVG OVERLAP DETECTION — H1 + H4 confluence                      |
+//| When an unfilled H1 FVG zone overlaps an unfilled H4 FVG zone   |
+//| in the same direction, it signals a very strong imbalance area   |
+//| (institutional confluence across timeframes).                    |
+//+------------------------------------------------------------------+
+void DetectFVGOverlap()
+{
+   g_FVGOverlapBullish = false;
+   g_FVGOverlapBearish = false;
+
+   // Check every H1 FVG against every H4 FVG for zone overlap in same direction
+   for(int h1 = 0; h1 < g_FVGCount; h1++) {
+      if(g_FVGs[h1].filled) continue;
+      for(int h4 = 0; h4 < g_H4FVGCount; h4++) {
+         if(g_H4FVGs[h4].filled) continue;
+         if(g_FVGs[h1].dir != g_H4FVGs[h4].dir) continue;
+
+         // Two zones overlap if: one's low < other's high AND one's high > other's low
+         bool overlaps = (g_FVGs[h1].low < g_H4FVGs[h4].high && g_FVGs[h1].high > g_H4FVGs[h4].low);
+         if(!overlaps) continue;
+
+         if(g_FVGs[h1].dir == 1)  g_FVGOverlapBullish = true;
+         if(g_FVGs[h1].dir == -1) g_FVGOverlapBearish = true;
+
+         // Once both are found, no need to keep checking
+         if(g_FVGOverlapBullish && g_FVGOverlapBearish) return;
       }
    }
 }
@@ -2331,6 +2522,10 @@ double CalcConfidence(int tradeDir, string zone, bool isMeanRev, bool isSideways
                   DoubleToString(g_BullOB_Low,5), "-", DoubleToString(g_BullOB_High,5), "]");
          }
       }
+
+      // Multi-OB cluster bonus: 2+ active OBs in trade direction = institutional stacking
+      if(tradeDir == 1  && g_BullOBCount >= 2) conf += 3.0;
+      if(tradeDir == -1 && g_BearOBCount >= 2) conf += 3.0;
    }
 
    // --- 12. FAIR VALUE GAP (0-10) ---
@@ -2433,6 +2628,14 @@ double CalcConfidence(int tradeDir, string zone, bool isMeanRev, bool isSideways
       if(tradeDir == 1  && nearH4BearZone && !nearH4BullZone) h4smcBonus -= 5.0;
       if(tradeDir == -1 && nearH4BullZone && !nearH4BearZone) h4smcBonus -= 5.0;
       conf += h4smcBonus;
+   }
+
+   // --- FACTOR 17 — FVG H1+H4 OVERLAP CONFLUENCE (0-6) ---
+   // When an unfilled H1 FVG overlaps an unfilled H4 FVG in the same direction,
+   // both timeframes show the same institutional imbalance = highest conviction zone.
+   if(UseFairValueGaps && UseH4SMC) {
+      if(tradeDir == 1  && g_FVGOverlapBullish) conf += 6.0;
+      if(tradeDir == -1 && g_FVGOverlapBearish) conf += 6.0;
    }
 
    // --- PENALTIES ---

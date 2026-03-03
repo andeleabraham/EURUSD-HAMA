@@ -101,6 +101,9 @@ input bool   UseDailyPivot       = true;   // Include daily pivot S1/R1/PP in co
 
 input group "=== MARKET STRUCTURE (Smart Money Concepts) ==="
 input bool   UseSwingStructure   = true;   // Detect H1 swing highs/lows for BOS/CHoCH
+input bool   UseMacroStructure   = true;   // Detect higher-TF swing structure (H4/D1) for macro bias
+input ENUM_TIMEFRAMES MacroStructTF = PERIOD_H4; // Higher timeframe to use for macro structure
+input double BoldBetMinConf      = 55.0;   // Min confidence % to trigger a bold-bet entry (MTF + FVG/OB aligned)
 input bool   UseOrderBlocks      = true;   // Detect H1 institutional order blocks
 input double OBMinBodyPips       = 8.0;    // Minimum OB candle body size in pips (filters doji/tiny OBs)
 input int    OBScanBars          = 60;     // H1 bars to scan (~2.5 days; was 30)
@@ -235,6 +238,15 @@ double g_SwingLow1  = 0, g_SwingLow2  = 0;  // two most recent swing lows (H1)
 string g_StructureLabel = "RANGING";          // "BULLISH" / "BEARISH" / "RANGING"
 bool   g_BOS         = false;                // Break of Structure on this bar
 bool   g_CHoCH       = false;                // Change of Character (trend reversal)
+
+// Macro (higher-TF) structure — H4/D1 — gives the overall directional map
+double g_MacroSwingHigh1 = 0, g_MacroSwingHigh2 = 0;  // two most recent macro swing highs
+double g_MacroSwingLow1  = 0, g_MacroSwingLow2  = 0;  // two most recent macro swing lows
+string g_MacroStructLabel = "RANGING";                 // "BULLISH" / "BEARISH" / "RANGING"
+bool   g_MacroBOS   = false;                           // Macro Break of Structure
+bool   g_MacroCHoCH = false;                           // Macro Change of Character (major reversal signal)
+bool   g_MTFAligned = false;   // true when macro (H4) and intermediate (H1) agree on direction
+bool   g_BoldBet    = false;   // true when MTF aligned + FVG or OB present + HA valid
 
 // Liquidity Sweep detection
 bool   g_LiquiditySweep = false;             // price swept a key level and reversed
@@ -569,6 +581,7 @@ void OnTick()
 
       // Market structure analysis (runs on new bar only — uses confirmed bars)
       if(UseSwingStructure)  DetectSwingStructure();
+      if(UseMacroStructure)  { DetectMacroStructure(); DrawMacroStructureLevels(); }
       if(UseOrderBlocks)   { DetectOrderBlocks(); DrawOBZones(); }
       if(UseVolumeAnalysis)  AnalyzeVolume();
       if(UseLiquiditySweep)  DetectLiquiditySweep();
@@ -1058,6 +1071,138 @@ void DetectSwingStructure()
       if(prevStructure == "BULLISH"  && g_StructureLabel == "BEARISH") g_CHoCH = true;
       if(prevStructure == "BEARISH"  && g_StructureLabel == "BULLISH") g_CHoCH = true;
    }
+}
+
+//+------------------------------------------------------------------+
+//| MACRO STRUCTURE DETECTION (H4/configurable TF)                   |
+//| Same HH/HL / LH/LL algorithm as DetectSwingStructure but on a   |
+//| higher timeframe to get the overall directional map.             |
+//| Populates g_MacroStructLabel, g_MacroBOS, g_MacroCHoCH.         |
+//| Also computes g_MTFAligned (H4 and H1 agree) and g_BoldBet flag.|
+//+------------------------------------------------------------------+
+void DetectMacroStructure()
+{
+   g_MacroBOS   = false;
+   g_MacroCHoCH = false;
+   g_MTFAligned = false;
+   g_BoldBet    = false;
+
+   int lookback = 2;   // H4 bars each side (2 bars = 8 hrs — broad swing confirmation)
+   int scanBars = 40;  // H4 bars to scan (~6.7 days — enough for 2-3 full swing cycles)
+
+   double macroHighs[], macroLows[];
+   ArrayResize(macroHighs, 6);
+   ArrayResize(macroLows,  6);
+   int shCount = 0, slCount = 0;
+
+   for(int i = lookback; i < scanBars - lookback && (shCount < 4 || slCount < 4); i++)
+   {
+      double h = iHigh(_Symbol, MacroStructTF, i);
+      double l = iLow (_Symbol, MacroStructTF, i);
+
+      bool isSH = true;
+      for(int j = 1; j <= lookback; j++) {
+         if(iHigh(_Symbol, MacroStructTF, i - j) >= h ||
+            iHigh(_Symbol, MacroStructTF, i + j) >= h) { isSH = false; break; }
+      }
+      if(isSH && shCount < 4) macroHighs[shCount++] = h;
+
+      bool isSL = true;
+      for(int j = 1; j <= lookback; j++) {
+         if(iLow(_Symbol, MacroStructTF, i - j) <= l ||
+            iLow(_Symbol, MacroStructTF, i + j) <= l) { isSL = false; break; }
+      }
+      if(isSL && slCount < 4) macroLows[slCount++] = l;
+   }
+
+   g_MacroSwingHigh1 = (shCount >= 1) ? macroHighs[0] : 0;
+   g_MacroSwingHigh2 = (shCount >= 2) ? macroHighs[1] : 0;
+   g_MacroSwingLow1  = (slCount >= 1) ? macroLows[0]  : 0;
+   g_MacroSwingLow2  = (slCount >= 2) ? macroLows[1]  : 0;
+
+   string prevMacro = g_MacroStructLabel;
+
+   if(shCount >= 2 && slCount >= 2)
+   {
+      bool HH = (g_MacroSwingHigh1 > g_MacroSwingHigh2 + _Point * 10);
+      bool HL = (g_MacroSwingLow1  > g_MacroSwingLow2  + _Point * 10);
+      bool LH = (g_MacroSwingHigh1 < g_MacroSwingHigh2 - _Point * 10);
+      bool LL = (g_MacroSwingLow1  < g_MacroSwingLow2  - _Point * 10);
+
+      if(HH && HL)      g_MacroStructLabel = "BULLISH";
+      else if(LH && LL) g_MacroStructLabel = "BEARISH";
+      else              g_MacroStructLabel = "RANGING";
+
+      double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+      if(g_MacroStructLabel == "BULLISH" && bid > g_MacroSwingHigh1) g_MacroBOS = true;
+      if(g_MacroStructLabel == "BEARISH" && bid < g_MacroSwingLow1)  g_MacroBOS = true;
+
+      if(prevMacro == "BULLISH" && g_MacroStructLabel == "BEARISH") g_MacroCHoCH = true;
+      if(prevMacro == "BEARISH" && g_MacroStructLabel == "BULLISH") g_MacroCHoCH = true;
+   }
+
+   // === MTF ALIGNMENT ===
+   // Both macro (H4) and intermediate (H1) structure agree on direction.
+   // This is the highest-conviction structural state — price has momentum on two timeframes.
+   bool h1Bull = (g_StructureLabel == "BULLISH");
+   bool h1Bear = (g_StructureLabel == "BEARISH");
+   bool h4Bull = (g_MacroStructLabel == "BULLISH");
+   bool h4Bear = (g_MacroStructLabel == "BEARISH");
+   g_MTFAligned = (h1Bull && h4Bull) || (h1Bear && h4Bear);
+
+   // === BOLD BET FLAG ===
+   // Strongest setup: MTF aligned + at least one SMC confirmation (FVG or OB)
+   // Signal direction must match macro direction — checked later in TryEntry/CalcConfidence.
+   bool hasSMC = (g_NearBullFVG || g_NearBearFVG || g_BullOB_High > 0 || g_BearOB_High > 0);
+   bool hasBOS = (g_BOS || g_MacroBOS);  // recent break of structure on either TF
+   g_BoldBet = g_MTFAligned && (hasSMC || hasBOS);
+
+   Print("MACRO STRUCT: ", g_MacroStructLabel,
+         " H1:",     g_StructureLabel,
+         " MTF:",    (g_MTFAligned ? "ALIGNED" : "diverged"),
+         " BoldBet:", (g_BoldBet ? "YES" : "no"),
+         " MacroBOS:", g_MacroBOS, " MacroCHoCH:", g_MacroCHoCH,
+         " MacroSH=", DoubleToString(g_MacroSwingHigh1,5),
+         " MacroSL=", DoubleToString(g_MacroSwingLow1,5));
+}
+
+//+------------------------------------------------------------------+
+//| DRAW MACRO STRUCTURE LEVELS ON CHART                             |
+//| Draws horizontal lines at the most recent macro swing high/low   |
+//| so the trader can see the structural map at a glance.            |
+//+------------------------------------------------------------------+
+void DrawMacroStructureLevels()
+{
+   string shName = "HABOT_MACRO_SH";
+   string slName = "HABOT_MACRO_SL";
+
+   // Macro Swing High — drawn as a dashed red horizontal line
+   if(g_MacroSwingHigh1 > 0) {
+      if(ObjectFind(0, shName) < 0)
+         ObjectCreate(0, shName, OBJ_HLINE, 0, 0, g_MacroSwingHigh1);
+      ObjectSetDouble (0, shName, OBJPROP_PRICE,     g_MacroSwingHigh1);
+      ObjectSetInteger(0, shName, OBJPROP_COLOR,     clrTomato);
+      ObjectSetInteger(0, shName, OBJPROP_STYLE,     STYLE_DASH);
+      ObjectSetInteger(0, shName, OBJPROP_WIDTH,     2);
+      ObjectSetString (0, shName, OBJPROP_TOOLTIP,   "Macro Swing High (" + EnumToString(MacroStructTF) + ") " + DoubleToString(g_MacroSwingHigh1, 5));
+      ObjectSetInteger(0, shName, OBJPROP_SELECTABLE, false);
+      ObjectSetInteger(0, shName, OBJPROP_BACK,      true);
+   }
+
+   // Macro Swing Low — drawn as a dashed lime horizontal line
+   if(g_MacroSwingLow1 > 0) {
+      if(ObjectFind(0, slName) < 0)
+         ObjectCreate(0, slName, OBJ_HLINE, 0, 0, g_MacroSwingLow1);
+      ObjectSetDouble (0, slName, OBJPROP_PRICE,     g_MacroSwingLow1);
+      ObjectSetInteger(0, slName, OBJPROP_COLOR,     clrSpringGreen);
+      ObjectSetInteger(0, slName, OBJPROP_STYLE,     STYLE_DASH);
+      ObjectSetInteger(0, slName, OBJPROP_WIDTH,     2);
+      ObjectSetString (0, slName, OBJPROP_TOOLTIP,   "Macro Swing Low (" + EnumToString(MacroStructTF) + ") " + DoubleToString(g_MacroSwingLow1, 5));
+      ObjectSetInteger(0, slName, OBJPROP_SELECTABLE, false);
+      ObjectSetInteger(0, slName, OBJPROP_BACK,      true);
+   }
+
+   ChartRedraw(0);
 }
 
 //+------------------------------------------------------------------+
@@ -1851,6 +1996,32 @@ double CalcConfidence(int tradeDir, string zone, bool isMeanRev, bool isSideways
       }
    }
 
+   // --- 15. MULTI-TIMEFRAME (MTF) STRUCTURE ALIGNMENT (0-12) ---
+   // When both the macro (H4) and intermediate (H1) structure label agree with
+   // the trade direction, the setup has strong institutional support on two timeframes.
+   // This is the highest structural conviction state in the model.
+   //   +8  : H4 and H1 both aligned with tradeDir (MTFAligned)
+   //   +4  : Macro structure alone aligns (H1 may be RANGING)
+   //   +4  : Bold-bet flag (MTF aligned + FVG or OB or BOS present)
+   //   +0  : Counter-macro (no penalty — H1 is already penalised in Factor 8)
+   //   CHoCH on macro TF = reversal signal — additional bonus if tradeDir matches new macro direction
+   double mtfBonus = 0;
+   bool macroAlignedWithTrade = (tradeDir == 1  && g_MacroStructLabel == "BULLISH") ||
+                                 (tradeDir == -1 && g_MacroStructLabel == "BEARISH");
+   if(UseMacroStructure) {
+      if(g_MTFAligned && macroAlignedWithTrade) {
+         mtfBonus += 8.0;   // highest conviction: both TFs agree
+         if(g_BoldBet) mtfBonus += 4.0;   // + SMC confirmation on top
+      } else if(macroAlignedWithTrade) {
+         mtfBonus += 4.0;   // macro agrees but H1 is neutral/RANGING
+      }
+      // Macro BOS in trade direction = recent structural break confirming continuation
+      if(g_MacroBOS && macroAlignedWithTrade) mtfBonus += 2.0;
+      // Macro CHoCH that just switched to trade direction = fresh reversal confirmed on H4
+      if(g_MacroCHoCH && macroAlignedWithTrade) mtfBonus += 3.0;
+      conf += mtfBonus;
+   }
+
    // --- PENALTIES ---
    if(isSideways)  conf -= 8.0;   // choppy market = unreliable signals
    if(isMeanRev)   conf -= 3.0;   // MRV = limited runway, lower confidence
@@ -1886,6 +2057,9 @@ double CalcConfidence(int tradeDir, string zone, bool isMeanRev, bool isSideways
          " KeyHr:", (keyHourBonus > 0 ? "+" + DoubleToString(keyHourBonus,1) : "0"), "@", dt.hour, ":", dt.min,
          " AsianMom:", (asianMomBonus > 0 ? "+" + DoubleToString(asianMomBonus,1) : "0"),
          " PrevDayDir:", g_PrevDayLastHourDir,
+         " MTF:", (g_MTFAligned ? "ALIGNED" : "div"), " +", DoubleToString(mtfBonus,1),
+         " Macro:", g_MacroStructLabel, (g_MacroBOS ? " MacroBOS" : ""), (g_MacroCHoCH ? " MacroCHoCH" : ""),
+         " BoldBet:", g_BoldBet,
          " Zone:", zone,
          " Cnfl:", (nearLevel == "" ? "none" : nearLevel+lvlType),
          " Struct:", g_StructureLabel, (g_BOS ? " BOS" : ""), (g_CHoCH ? " CHoCH" : ""),
@@ -2718,6 +2892,9 @@ void TryEntry()
    //   1. HA pattern must be clean (no double-sided wicks on confirming candle)
    //   2. ATR must show there is momentum (recent bar range > 30% of ATR)
    //   3. Price must be moving TOWARD the favorable third (not stalling at mid)
+   // BOLD BET EXCEPTION: when g_BoldBet is true (MTF aligned + FVG/OB present)
+   //   the exhaustion check (consec >= 3) is lifted — we trust the macro map over
+   //   the mid-zone caution. The trade is logged as [BOLD BET].
    bool midZoneValidated = true;
    if(zone == "MID_ZONE" && isTrendSignal) {
       // Check confirming candle is clean
@@ -2735,9 +2912,18 @@ void TryEntry()
          return;
       }
       // Check HA consecutive — mid zone with 3+ same candles (including forming) = exhaustion
-      if(liveConsec >= 3) {
+      // Bold-bet exception: if MTF aligned + SMC present, bypass the exhaustion block
+      bool macroMatchesTrade = (tradeDir == 1 && g_MacroStructLabel == "BULLISH") ||
+                                (tradeDir == -1 && g_MacroStructLabel == "BEARISH");
+      bool boldBetActive = g_BoldBet && macroMatchesTrade && (g_Confidence >= BoldBetMinConf);
+      if(liveConsec >= 3 && !boldBetActive) {
          Print("MID_ZONE trade skipped: ", liveConsec, " consecutive HA candles incl live (exhausted at mid)");
          return;
+      } else if(liveConsec >= 3 && boldBetActive) {
+         Print("[BOLD BET] MID_ZONE exhaustion override: MTF=", g_MacroStructLabel,
+               " H1=", g_StructureLabel, " FVG=", g_NearBullFVG || g_NearBearFVG,
+               " OB=", (g_BullOB_High > 0 || g_BearOB_High > 0),
+               " Conf=", DoubleToString(g_Confidence,1), "% — taking bold position");
       }
    }
 
@@ -3280,6 +3466,24 @@ void UpdateDashboard()
    else
       DashLine("10b2_sw",  "",                                                   cx, cy, row, lh, corner, clrGray, 8);
    row++;
+
+   // --- H4 Macro Structure & MTF Alignment ---
+   if(UseMacroStructure) {
+      color  macroClr   = (g_MacroStructLabel == "BULLISH") ? clrLime :
+                          (g_MacroStructLabel == "BEARISH") ? clrRed  : clrGray;
+      string macroExtra = g_MacroBOS   ? " [MacroBOS]"   :
+                          g_MacroCHoCH ? " [MacroCHoCH]" : "";
+      DashLine("10bm_macro", "MacroStr: " + g_MacroStructLabel + macroExtra +
+               " (" + EnumToString(MacroStructTF) + ")",
+               cx, cy, row, lh, corner, macroClr, 9); row++;
+      color  mtfClr = g_BoldBet    ? clrGold :
+                      g_MTFAligned ? clrAqua : clrDimGray;
+      string mtfStr = g_BoldBet    ? "BOLD BET [H4+H1+SMC aligned]" :
+                      g_MTFAligned ? "MTF ALIGNED [H4+H1 agree]"    :
+                                     "MTF diverged";
+      DashLine("10bn_mtf", "MTF     : " + mtfStr,
+               cx, cy, row, lh, corner, mtfClr, g_BoldBet ? 10 : 9); row++;
+   }
 
    color volClr = (g_VolumeState == "HIGH" || g_VolumeState == "ABOVE_AVG") ? clrLime :
                   (g_VolumeState == "LOW") ? clrRed : clrGray;

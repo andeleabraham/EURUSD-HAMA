@@ -112,6 +112,9 @@ input bool   UseLiquiditySweep   = true;   // Detect stop-hunt sweeps at key lev
 input bool            UseFairValueGaps = true;      // Detect and display Fair Value Gaps
 input ENUM_TIMEFRAMES FVGTimeframe     = PERIOD_H1;  // Timeframe for FVG detection (H1 recommended)
 input double          FVGMinGapPips    = 10.0;       // Minimum gap size in pips to qualify (3-pip M15 gaps = noise)
+input bool   UseH4SMC           = true;    // Detect H4-timeframe FVGs and Order Blocks (macro supply/demand map)
+input double H4FVGMinGapPips    = 20.0;    // Min gap in pips for H4 FVG detection (major imbalances; H1 threshold is 10p)
+input int    H4OBScanBars       = 40;      // H4 bars to scan for order blocks (~6.7 days of history)
 input double MinConfidence       = 35.0;   // Minimum confidence % to take a trade (0-100)
 
 input group "=== RANGE ZONE FILTERS ==="
@@ -279,6 +282,23 @@ bool    g_NearBearFVG     = false;         // price near a bearish FVG (expect r
 double  g_NearestFVGHigh  = 0;             // nearest FVG zone high
 double  g_NearestFVGLow   = 0;             // nearest FVG zone low
 int     g_NearestFVGDir   = 0;             // direction of nearest FVG
+
+// H4 Order Blocks (macro supply/demand zones — major institutional footprints spanning days)
+double g_H4BullOB_High = 0, g_H4BullOB_Low = 0;  // H4 demand zone (bull OB)
+double g_H4BearOB_High = 0, g_H4BearOB_Low = 0;  // H4 supply zone (bear OB)
+datetime g_H4BullOB_Time = 0;
+datetime g_H4BearOB_Time = 0;
+bool   g_NearH4BullOB = false;    // price inside / within 15 pips of H4 demand zone
+bool   g_NearH4BearOB = false;    // price inside / within 15 pips of H4 supply zone
+
+// H4 Fair Value Gaps (macro imbalance zones — unfilled demand/supply from days-old moves)
+FVGZone g_H4FVGs[];
+int     g_H4FVGCount      = 0;
+bool    g_NearBullH4FVG   = false;  // price near a bullish H4 FVG (macro demand)
+bool    g_NearBearH4FVG   = false;  // price near a bearish H4 FVG (macro supply)
+double  g_NearestH4FVGHigh = 0;
+double  g_NearestH4FVGLow  = 0;
+int     g_NearestH4FVGDir  = 0;
 
 // Confidence model output (replaces tier system)
 double g_Confidence       = 0;             // 0-100% confidence score for current setup
@@ -586,6 +606,7 @@ void OnTick()
       if(UseVolumeAnalysis)  AnalyzeVolume();
       if(UseLiquiditySweep)  DetectLiquiditySweep();
       if(UseFairValueGaps)   { DetectFairValueGaps(); DrawFVGZones(); }
+      if(UseH4SMC)           { DetectH4OrderBlocks(); DetectH4FairValueGaps(); DrawH4SMCZones(); }
 
       EvaluateHAPattern();
    }
@@ -1153,7 +1174,8 @@ void DetectMacroStructure()
    // === BOLD BET FLAG ===
    // Strongest setup: MTF aligned + at least one SMC confirmation (FVG or OB)
    // Signal direction must match macro direction — checked later in TryEntry/CalcConfidence.
-   bool hasSMC = (g_NearBullFVG || g_NearBearFVG || g_BullOB_High > 0 || g_BearOB_High > 0);
+   bool hasSMC = (g_NearBullFVG || g_NearBearFVG || g_BullOB_High > 0 || g_BearOB_High > 0 ||
+                  g_NearBullH4FVG || g_NearBearH4FVG || g_H4BullOB_High > 0 || g_H4BearOB_High > 0);
    bool hasBOS = (g_BOS || g_MacroBOS);  // recent break of structure on either TF
    g_BoldBet = g_MTFAligned && (hasSMC || hasBOS);
 
@@ -1600,6 +1622,292 @@ void DrawFVGZones()
 }
 
 //+------------------------------------------------------------------+
+//| H4 ORDER BLOCK DETECTION                                         |
+//| Detects major institutional demand/supply zones on H4.           |
+//| H4 OBs represent multi-day price memory — the strongest zones.  |
+//| Demand zone = bearish H4 candle just before a bullish impulse.   |
+//| Supply zone = bullish H4 candle just before a bearish impulse.   |
+//+------------------------------------------------------------------+
+void DetectH4OrderBlocks()
+{
+   g_H4BullOB_High = 0;  g_H4BullOB_Low = 0;  g_H4BullOB_Time = 0;
+   g_H4BearOB_High = 0;  g_H4BearOB_Low = 0;  g_H4BearOB_Time = 0;
+   g_NearH4BullOB  = false;
+   g_NearH4BearOB  = false;
+
+   int    scanBars   = H4OBScanBars;
+   int    impulseLen = 2;              // 2 H4 bars = 8-hour move
+   double minImpulse = 20.0;          // min 20-pip impulse on H4
+   double minBody    = 15.0 * _Point * 10.0;  // min 15-pip OB body
+   double proxPips   = 15.0 * _Point * 10.0;  // "near" = within 15 pips
+   double bid        = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+
+   // --- BULLISH ORDER BLOCK: bearish H4 candle just before bullish impulse ---
+   for(int i = impulseLen; i < scanBars; i++)
+   {
+      bool allBull = true;
+      for(int j = 0; j < impulseLen; j++) {
+         int idx = i - j;
+         if(idx < 1) { allBull = false; break; }
+         if(iClose(_Symbol, PERIOD_H4, idx) <= iOpen(_Symbol, PERIOD_H4, idx)) {
+            allBull = false; break;
+         }
+      }
+      if(!allBull) continue;
+      double impOpen  = iOpen (_Symbol, PERIOD_H4, i);
+      double impClose = iClose(_Symbol, PERIOD_H4, i - impulseLen + 1);
+      if((impClose - impOpen) / _Point / 10.0 < minImpulse) continue;
+      int ob = i + 1;
+      if(ob >= scanBars) continue;
+      double obO = iOpen (_Symbol, PERIOD_H4, ob);
+      double obC = iClose(_Symbol, PERIOD_H4, ob);
+      if(obC >= obO) continue;
+      if((obO - obC) < minBody) continue;
+      g_H4BullOB_High = obO;
+      g_H4BullOB_Low  = obC;
+      g_H4BullOB_Time = iTime(_Symbol, PERIOD_H4, ob);
+      break;
+   }
+
+   // --- BEARISH ORDER BLOCK: bullish H4 candle just before bearish impulse ---
+   for(int i = impulseLen; i < scanBars; i++)
+   {
+      bool allBear = true;
+      for(int j = 0; j < impulseLen; j++) {
+         int idx = i - j;
+         if(idx < 1) { allBear = false; break; }
+         if(iClose(_Symbol, PERIOD_H4, idx) >= iOpen(_Symbol, PERIOD_H4, idx)) {
+            allBear = false; break;
+         }
+      }
+      if(!allBear) continue;
+      double impOpen  = iOpen (_Symbol, PERIOD_H4, i);
+      double impClose = iClose(_Symbol, PERIOD_H4, i - impulseLen + 1);
+      if((impOpen - impClose) / _Point / 10.0 < minImpulse) continue;
+      int ob = i + 1;
+      if(ob >= scanBars) continue;
+      double obO = iOpen (_Symbol, PERIOD_H4, ob);
+      double obC = iClose(_Symbol, PERIOD_H4, ob);
+      if(obC <= obO) continue;
+      if((obC - obO) < minBody) continue;
+      g_H4BearOB_High = obC;
+      g_H4BearOB_Low  = obO;
+      g_H4BearOB_Time = iTime(_Symbol, PERIOD_H4, ob);
+      break;
+   }
+
+   // Proximity: is price currently inside or touching an H4 OB zone?
+   if(g_H4BullOB_High > 0)
+      g_NearH4BullOB = (bid >= g_H4BullOB_Low - proxPips && bid <= g_H4BullOB_High + proxPips);
+   if(g_H4BearOB_High > 0)
+      g_NearH4BearOB = (bid >= g_H4BearOB_Low - proxPips && bid <= g_H4BearOB_High + proxPips);
+}
+
+//+------------------------------------------------------------------+
+//| H4 FAIR VALUE GAP DETECTION                                      |
+//| Detects major imbalance zones on H4: 3-candle gap structure.    |
+//| H4 FVGs = unfilled institutional orders spanning multi-day moves.|
+//| Bullish H4 FVG: bar3.low > bar1.high (gap up = macro demand).   |
+//| Bearish H4 FVG: bar3.high < bar1.low (gap down = macro supply). |
+//+------------------------------------------------------------------+
+void DetectH4FairValueGaps()
+{
+   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+
+   // Mark filled / expired
+   for(int f = 0; f < g_H4FVGCount; f++) {
+      if(g_H4FVGs[f].filled) continue;
+      if(g_H4FVGs[f].dir == 1  && bid <= g_H4FVGs[f].high && bid >= g_H4FVGs[f].low)
+         g_H4FVGs[f].filled = true;
+      if(g_H4FVGs[f].dir == -1 && bid >= g_H4FVGs[f].low  && bid <= g_H4FVGs[f].high)
+         g_H4FVGs[f].filled = true;
+      // H4 FVGs expire after 14 calendar days
+      if(TimeCurrent() - g_H4FVGs[f].created > 14 * 24 * 3600)
+         g_H4FVGs[f].filled = true;
+   }
+
+   // Scan ~10 trading days on H4 (60 bars)
+   int    scanBars = MathMin((10 * 24 * 60) / 240, 200);
+   double minGap   = H4FVGMinGapPips * _Point * 10;
+   double tol      = 2.0 * _Point * 10;
+
+   for(int i = 2; i < scanBars; i++)
+   {
+      double bar1_high = iHigh(_Symbol, PERIOD_H4, i + 1);
+      double bar1_low  = iLow (_Symbol, PERIOD_H4, i + 1);
+      double bar3_high = iHigh(_Symbol, PERIOD_H4, i - 1);
+      double bar3_low  = iLow (_Symbol, PERIOD_H4, i - 1);
+
+      // Bullish H4 FVG
+      if(bar3_low > bar1_high + minGap) {
+         double   gapHigh = bar3_low;
+         double   gapLow  = bar1_high;
+         datetime gapTime = iTime(_Symbol, PERIOD_H4, i);
+         bool exists = false;
+         for(int f = 0; f < g_H4FVGCount; f++) {
+            if(g_H4FVGs[f].dir == 1 &&
+               MathAbs(g_H4FVGs[f].high - gapHigh) < tol &&
+               MathAbs(g_H4FVGs[f].low  - gapLow)  < tol) { exists = true; break; }
+         }
+         if(!exists) {
+            if(g_H4FVGCount >= ArraySize(g_H4FVGs)) ArrayResize(g_H4FVGs, g_H4FVGCount + 10);
+            g_H4FVGs[g_H4FVGCount].high    = gapHigh;
+            g_H4FVGs[g_H4FVGCount].low     = gapLow;
+            g_H4FVGs[g_H4FVGCount].dir     = 1;
+            g_H4FVGs[g_H4FVGCount].created = gapTime;
+            g_H4FVGs[g_H4FVGCount].filled  = false;
+            g_H4FVGCount++;
+         }
+      }
+
+      // Bearish H4 FVG
+      if(bar3_high < bar1_low - minGap) {
+         double   gapHigh = bar1_low;
+         double   gapLow  = bar3_high;
+         datetime gapTime = iTime(_Symbol, PERIOD_H4, i);
+         bool exists = false;
+         for(int f = 0; f < g_H4FVGCount; f++) {
+            if(g_H4FVGs[f].dir == -1 &&
+               MathAbs(g_H4FVGs[f].high - gapHigh) < tol &&
+               MathAbs(g_H4FVGs[f].low  - gapLow)  < tol) { exists = true; break; }
+         }
+         if(!exists) {
+            if(g_H4FVGCount >= ArraySize(g_H4FVGs)) ArrayResize(g_H4FVGs, g_H4FVGCount + 10);
+            g_H4FVGs[g_H4FVGCount].high    = gapHigh;
+            g_H4FVGs[g_H4FVGCount].low     = gapLow;
+            g_H4FVGs[g_H4FVGCount].dir     = -1;
+            g_H4FVGs[g_H4FVGCount].created = gapTime;
+            g_H4FVGs[g_H4FVGCount].filled  = false;
+            g_H4FVGCount++;
+         }
+      }
+   }
+
+   // Compress filled entries
+   int writeIdx = 0;
+   for(int f = 0; f < g_H4FVGCount; f++) {
+      if(!g_H4FVGs[f].filled) {
+         if(writeIdx != f) g_H4FVGs[writeIdx] = g_H4FVGs[f];
+         writeIdx++;
+      }
+   }
+   g_H4FVGCount = writeIdx;
+
+   // Proximity check
+   g_NearBullH4FVG    = false;
+   g_NearBearH4FVG    = false;
+   g_NearestH4FVGHigh = 0;
+   g_NearestH4FVGLow  = 0;
+   g_NearestH4FVGDir  = 0;
+   double nearestDist = 99999;
+   double proxPips    = 15.0 * _Point * 10;   // 15-pip proximity for H4 zones
+
+   for(int f = 0; f < g_H4FVGCount; f++) {
+      double mid    = (g_H4FVGs[f].high + g_H4FVGs[f].low) / 2.0;
+      double dist   = MathAbs(bid - mid);
+      bool   inside = (bid >= g_H4FVGs[f].low - proxPips && bid <= g_H4FVGs[f].high + proxPips);
+      if(inside && dist < nearestDist) {
+         nearestDist        = dist;
+         g_NearestH4FVGHigh = g_H4FVGs[f].high;
+         g_NearestH4FVGLow  = g_H4FVGs[f].low;
+         g_NearestH4FVGDir  = g_H4FVGs[f].dir;
+         if(g_H4FVGs[f].dir == 1)  g_NearBullH4FVG = true;
+         if(g_H4FVGs[f].dir == -1) g_NearBearH4FVG = true;
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| DRAW H4 SMC ZONES on chart                                       |
+//| H4 OBs = bold filled rectangles (ForestGreen / DarkRed).        |
+//| H4 FVGs = filled rectangles (MediumBlue / DarkViolet).          |
+//| Drawn behind price with thicker borders to distinguish from H1.  |
+//+------------------------------------------------------------------+
+void DrawH4SMCZones()
+{
+   // Remove old H4 OB zones
+   for(int i = ObjectsTotal(0, 0) - 1; i >= 0; i--) {
+      string oname = ObjectName(0, i, 0);
+      if(StringFind(oname, "HABOT_H4OB_") == 0)
+         ObjectDelete(0, oname);
+   }
+
+   datetime tEnd = TimeCurrent() + 3600 * 8;   // extend 8 hours right
+
+   // --- H4 Demand Zone (Bull OB) ---
+   if(g_H4BullOB_High > 0 && g_H4BullOB_Time > 0) {
+      string name = "HABOT_H4OB_BULL";
+      if(ObjectFind(0, name) < 0)
+         ObjectCreate(0, name, OBJ_RECTANGLE, 0, g_H4BullOB_Time, g_H4BullOB_High, tEnd, g_H4BullOB_Low);
+      else {
+         ObjectSetInteger(0, name, OBJPROP_TIME,  0, g_H4BullOB_Time);
+         ObjectSetDouble (0, name, OBJPROP_PRICE, 0, g_H4BullOB_High);
+         ObjectSetInteger(0, name, OBJPROP_TIME,  1, tEnd);
+         ObjectSetDouble (0, name, OBJPROP_PRICE, 1, g_H4BullOB_Low);
+      }
+      ObjectSetInteger(0, name, OBJPROP_COLOR,     clrForestGreen);
+      ObjectSetInteger(0, name, OBJPROP_STYLE,     STYLE_SOLID);
+      ObjectSetInteger(0, name, OBJPROP_WIDTH,     2);
+      ObjectSetInteger(0, name, OBJPROP_FILL,      true);
+      ObjectSetInteger(0, name, OBJPROP_BACK,      true);
+      ObjectSetInteger(0, name, OBJPROP_SELECTABLE,false);
+      ObjectSetString (0, name, OBJPROP_TEXT,      "H4 Demand Zone (Bull OB)");
+   }
+
+   // --- H4 Supply Zone (Bear OB) ---
+   if(g_H4BearOB_High > 0 && g_H4BearOB_Time > 0) {
+      string name = "HABOT_H4OB_BEAR";
+      if(ObjectFind(0, name) < 0)
+         ObjectCreate(0, name, OBJ_RECTANGLE, 0, g_H4BearOB_Time, g_H4BearOB_High, tEnd, g_H4BearOB_Low);
+      else {
+         ObjectSetInteger(0, name, OBJPROP_TIME,  0, g_H4BearOB_Time);
+         ObjectSetDouble (0, name, OBJPROP_PRICE, 0, g_H4BearOB_High);
+         ObjectSetInteger(0, name, OBJPROP_TIME,  1, tEnd);
+         ObjectSetDouble (0, name, OBJPROP_PRICE, 1, g_H4BearOB_Low);
+      }
+      ObjectSetInteger(0, name, OBJPROP_COLOR,     clrDarkRed);
+      ObjectSetInteger(0, name, OBJPROP_STYLE,     STYLE_SOLID);
+      ObjectSetInteger(0, name, OBJPROP_WIDTH,     2);
+      ObjectSetInteger(0, name, OBJPROP_FILL,      true);
+      ObjectSetInteger(0, name, OBJPROP_BACK,      true);
+      ObjectSetInteger(0, name, OBJPROP_SELECTABLE,false);
+      ObjectSetString (0, name, OBJPROP_TEXT,      "H4 Supply Zone (Bear OB)");
+   }
+
+   // Remove old H4 FVG zones
+   for(int i = ObjectsTotal(0, 0) - 1; i >= 0; i--) {
+      string oname = ObjectName(0, i, 0);
+      if(StringFind(oname, "HABOT_H4FVG_") == 0)
+         ObjectDelete(0, oname);
+   }
+
+   // --- H4 FVG zones ---
+   for(int f = 0; f < g_H4FVGCount; f++) {
+      string   name = "HABOT_H4FVG_" + IntegerToString(f);
+      datetime t1   = g_H4FVGs[f].created;
+      datetime t2   = TimeCurrent() + 3600 * 2;
+      if(ObjectFind(0, name) < 0)
+         ObjectCreate(0, name, OBJ_RECTANGLE, 0, t1, g_H4FVGs[f].high, t2, g_H4FVGs[f].low);
+      else {
+         ObjectSetInteger(0, name, OBJPROP_TIME,  0, t1);
+         ObjectSetDouble (0, name, OBJPROP_PRICE, 0, g_H4FVGs[f].high);
+         ObjectSetInteger(0, name, OBJPROP_TIME,  1, t2);
+         ObjectSetDouble (0, name, OBJPROP_PRICE, 1, g_H4FVGs[f].low);
+      }
+      color h4fvgClr = (g_H4FVGs[f].dir == 1) ? clrMediumBlue : clrDarkViolet;
+      ObjectSetInteger(0, name, OBJPROP_COLOR,     h4fvgClr);
+      ObjectSetInteger(0, name, OBJPROP_STYLE,     STYLE_SOLID);
+      ObjectSetInteger(0, name, OBJPROP_WIDTH,     2);
+      ObjectSetInteger(0, name, OBJPROP_FILL,      true);
+      ObjectSetInteger(0, name, OBJPROP_BACK,      true);
+      ObjectSetInteger(0, name, OBJPROP_SELECTABLE,false);
+      ObjectSetString (0, name, OBJPROP_TEXT,      (g_H4FVGs[f].dir == 1 ? "H4 Bull FVG" : "H4 Bear FVG"));
+   }
+
+   ChartRedraw(0);
+}
+
+//+------------------------------------------------------------------+
 //| HEIKEN ASHI CALCULATION for bar at index idx                     |
 //+------------------------------------------------------------------+
 void CalcHA(int idx, double &haO, double &haH, double &haL, double &haC)
@@ -2022,6 +2330,28 @@ double CalcConfidence(int tradeDir, string zone, bool isMeanRev, bool isSideways
       conf += mtfBonus;
    }
 
+   // --- FACTOR 16 — H4 FVG & Order Blocks (macro supply/demand confluences) ---
+   // H4 zones represent multi-day institutional memory: the strongest SMC confirmation.
+   // Being at an H4 demand/supply zone with MTF alignment = highest-conviction setup.
+   // FVG + OB cluster at the same H4 level adds an extra "coin-cluster" bonus.
+   double h4smcBonus = 0;
+   if(UseH4SMC) {
+      bool nearH4BullZone = g_NearBullH4FVG || g_NearH4BullOB;
+      bool nearH4BearZone = g_NearBearH4FVG || g_NearH4BearOB;
+      if(tradeDir == 1  && nearH4BullZone) {
+         h4smcBonus += 10.0;
+         if(g_NearBullH4FVG && g_NearH4BullOB) h4smcBonus += 4.0;  // FVG+OB cluster
+      }
+      if(tradeDir == -1 && nearH4BearZone) {
+         h4smcBonus += 10.0;
+         if(g_NearBearH4FVG && g_NearH4BearOB) h4smcBonus += 4.0;  // FVG+OB cluster
+      }
+      // Counter-zone: H4 supply sitting above a buy = real danger; penalise
+      if(tradeDir == 1  && nearH4BearZone && !nearH4BullZone) h4smcBonus -= 5.0;
+      if(tradeDir == -1 && nearH4BullZone && !nearH4BearZone) h4smcBonus -= 5.0;
+      conf += h4smcBonus;
+   }
+
    // --- PENALTIES ---
    if(isSideways)  conf -= 8.0;   // choppy market = unreliable signals
    if(isMeanRev)   conf -= 3.0;   // MRV = limited runway, lower confidence
@@ -2067,6 +2397,9 @@ double CalcConfidence(int tradeDir, string zone, bool isMeanRev, bool isSideways
          " Sweep:", (g_LiquiditySweep ? g_SweepLevel : "none"),
          " OB:", (nearOB ? "YES" : "no"),
          " FVG:", (nearFVG ? (g_NearestFVGDir == 1 ? "BULL" : "BEAR") : "none"),
+         " H4SMC:", (UseH4SMC ? (h4smcBonus != 0 ? DoubleToString(h4smcBonus,1) : "0") : "off"),
+         " H4FVG:", (g_NearBullH4FVG ? "BULL" : g_NearBearH4FVG ? "BEAR" : "none"),
+         " H4OB:",  (g_NearH4BullOB  ? "BULL" : g_NearH4BearOB  ? "BEAR" : "none"),
          " Bias:", g_TotalBias,
          " MRV:", isMeanRev, " Side:", isSideways);
 
@@ -3520,6 +3853,31 @@ void UpdateDashboard()
       DashLine("10f_fvg",  "FVG     : " + fvgStr,                               cx, cy, row, lh, corner, fvgClr, 8); row++;
    } else {
       DashLine("10f_fvg",  "",                                                   cx, cy, row, lh, corner, clrGray, 8); row++;
+   }
+
+   // --- H4 Supply/Demand: Order Blocks & FVGs (macro zones) ---
+   if(UseH4SMC) {
+      // H4 Order Block row
+      string h4obLine = "";
+      if(g_H4BullOB_High > 0)
+         h4obLine += "D:" + DoubleToString(g_H4BullOB_Low,5) + "-" + DoubleToString(g_H4BullOB_High,5);
+      if(g_H4BearOB_High > 0) {
+         if(h4obLine != "") h4obLine += "  ";
+         h4obLine += "S:" + DoubleToString(g_H4BearOB_Low,5) + "-" + DoubleToString(g_H4BearOB_High,5);
+      }
+      color h4obClr = g_NearH4BullOB ? clrLimeGreen : g_NearH4BearOB ? clrTomato : clrDimGray;
+      DashLine("10g_h4ob", "H4 OB   : " + (h4obLine != "" ? h4obLine : "none"),
+               cx, cy, row, lh, corner, h4obClr, g_NearH4BullOB||g_NearH4BearOB ? 9 : 7); row++;
+
+      // H4 FVG row
+      string h4fvgStr = IntegerToString(g_H4FVGCount) + " active";
+      if(g_NearBullH4FVG || g_NearBearH4FVG) {
+         h4fvgStr += " | Near: " + (g_NearBullH4FVG ? "BULL" : "BEAR") + " H4FVG " +
+                     DoubleToString(g_NearestH4FVGLow,5) + "-" + DoubleToString(g_NearestH4FVGHigh,5);
+      }
+      color h4fvgClr = g_NearBullH4FVG ? clrCornflowerBlue : g_NearBearH4FVG ? clrMediumOrchid : clrGray;
+      DashLine("10h_h4fvg", "H4 FVG  : " + h4fvgStr,
+               cx, cy, row, lh, corner, h4fvgClr, g_NearBullH4FVG||g_NearBearH4FVG ? 9 : 7); row++;
    }
 
    // --- Confidence Score (live, recalculated from current signals) ---

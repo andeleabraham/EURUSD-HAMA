@@ -1,10 +1,10 @@
 //+------------------------------------------------------------------+
-//|  EURUSD Heiken Ashi Range Bot v6.23a                             |
-//|  TryEntry diagnostics: all silent gates now print block reason   |
-//|  once per bar. PREPARING expiry, session cutoff reset, consec>=1 |
+//|  EURUSD Heiken Ashi Range Bot v6.24a                             |
+//|  Live bar fast-track: pre-qualify all gates during PREPARING,   |
+//|  enter on forming bar when HA body + Bollinger already aligned   |
 //+------------------------------------------------------------------+
 #property copyright   "EURUSD HA Range Bot"
-#property version     "6.23"
+#property version     "6.24"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -393,6 +393,7 @@ int     g_NearestH4FVGDir  = 0;
 
 // Confidence model output (replaces tier system)
 double g_Confidence       = 0;             // 0-100% confidence score for current setup
+string g_ConfBreakdown    = "";            // per-factor score breakdown for audit logs
 double g_DynamicSL_USD    = 2.0;           // structural SL for current setup (per 0.01 lot)
 double g_DynamicTP_USD    = 3.6;           // calculated TP = SL × RRRatio (per 0.01 lot)
 
@@ -414,6 +415,9 @@ datetime g_PostTradeCoolUntil = 0;   // if > 0, post-trade cooloff active until 
 datetime g_StartupGraceUntil = 0;    // if > 0, startup grace period active until this time
 datetime g_LastBlockPrintBar = 0;    // throttle TryEntry block diagnostics to once per M15 bar
 datetime g_PrepStartTime     = 0;    // time when PREPARING state was first armed (for PrepMaxBars expiry)
+bool     g_PreflightBullOK  = false; // all downstream TryEntry gates are green for a BUY
+bool     g_PreflightBearOK  = false; // all downstream TryEntry gates are green for a SELL
+string   g_PreflightBlocker = "";    // first failing gate during pre-flight (for diagnostic)
 int      g_DailyWins       = 0;      // wins today (for dashboard)
 int      g_DailyLosses     = 0;      // losses today (for dashboard)
 double   g_DailyPnL        = 0.0;    // cumulative P&L today
@@ -722,6 +726,49 @@ void OnTick()
 
    // Fire TryEntry when trend signal active, mean reversion qualifies, OR macro trend ride armed
    if(!g_TradeOpen) {
+      // === LIVE BAR FAST-TRACK ===
+      // When PREPARING and all downstream gates are already green (pre-flight), monitor
+      // the forming bar[0] every tick. As soon as it shows HA body alignment + Bollinger OK,
+      // promote to INCOMING and enter — no need to wait for bar[0] to close.
+      if(g_Signal == "PREPARING BUY" && g_PreflightBullOK) {
+         double _bid  = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+         double _barO = iOpen(_Symbol, PERIOD_M15, 0);
+         double _barH = iHigh(_Symbol, PERIOD_M15, 0);
+         double _barL = iLow (_Symbol, PERIOD_M15, 0);
+         double _rng  = MathMax(_barH - _barL, _Point * 5);
+         double _body = _bid - _barO;
+         // Bullish body forming: close above open, top wick < 33% of range, body >= 20% of range
+         bool liveOK = (_body > 0) &&
+                       ((_barH - _bid) < _rng * 0.33) &&
+                       (_body >= _rng * 0.20);
+         if(liveOK && LiveHABollingerOK(1)) {
+            Print("[FAST-TRACK BUY] Preflight green + live bar bullish body=",
+                  DoubleToString(_body/_Point/10.0, 1), "pip @", DoubleToString(_bid,5),
+                  " — promoting PREPARING BUY → BUY INCOMING");
+            g_Signal = "BUY INCOMING";
+            if(g_ConfirmCandleOpen == 0) g_ConfirmCandleOpen = iTime(_Symbol, PERIOD_M15, 0);
+         }
+      }
+      if(g_Signal == "PREPARING SELL" && g_PreflightBearOK) {
+         double _bid  = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+         double _barO = iOpen(_Symbol, PERIOD_M15, 0);
+         double _barH = iHigh(_Symbol, PERIOD_M15, 0);
+         double _barL = iLow (_Symbol, PERIOD_M15, 0);
+         double _rng  = MathMax(_barH - _barL, _Point * 5);
+         double _body = _barO - _bid;   // positive when bid < open = bearish
+         // Bearish body forming: close below open, bottom wick < 33% of range, body >= 20% of range
+         bool liveOK = (_body > 0) &&
+                       ((_bid - _barL) < _rng * 0.33) &&
+                       (_body >= _rng * 0.20);
+         if(liveOK && LiveHABollingerOK(-1)) {
+            Print("[FAST-TRACK SELL] Preflight green + live bar bearish body=",
+                  DoubleToString(_body/_Point/10.0, 1), "pip @", DoubleToString(_bid,5),
+                  " — promoting PREPARING SELL → SELL INCOMING");
+            g_Signal = "SELL INCOMING";
+            if(g_ConfirmCandleOpen == 0) g_ConfirmCandleOpen = iTime(_Symbol, PERIOD_M15, 0);
+         }
+      }
+
       bool hasTrendSig = (g_Signal == "BUY INCOMING" || g_Signal == "SELL INCOMING");
       bool hasMeanRev  = (MeanReversionSetup() != 0);
       if(hasTrendSig || hasMeanRev || g_MacroTrendRide) TryEntry();
@@ -2352,16 +2399,16 @@ string NearFibPivotLevel(double price)
 double CalcConfidence(int tradeDir, string zone, bool isMeanRev, bool isSideways, string nearLevel)
 {
    double conf = 0;   // accumulate weighted confidence
+   double prevConf = 0; // track delta per factor
+   g_ConfBreakdown = ""; // reset breakdown
 
    // --- 1. HA PATTERN QUALITY (0-15) ---
-   // Consecutive HA candles in trade direction = trend strength
-   // g_HAConsecCount is already set by EvaluateHAPattern for the active signal direction
    int consec = g_HAConsecCount;
-   if(consec >= 5)      conf += 15.0;   // very strong HA trend
+   if(consec >= 5)      conf += 15.0;
    else if(consec >= 4) conf += 12.0;
-   else if(consec >= 3) conf += 9.0;    // minimum pattern
-   else if(consec >= 2) conf += 5.0;    // early entry (if EarlyEntry on)
-   // 0-1 consecutive = very weak, no points
+   else if(consec >= 3) conf += 9.0;
+   else if(consec >= 2) conf += 5.0;
+   g_ConfBreakdown += "HA:" + DoubleToString(conf - prevConf, 0); prevConf = conf;
 
    // --- 2. SESSION QUALITY (0-10) ---
    MqlDateTime dt;
@@ -2374,6 +2421,7 @@ double CalcConfidence(int tradeDir, string zone, bool isMeanRev, bool isSideways
    else if(isNY)       conf += 7.0;
    else if(isLondon)   conf += 7.0;
    else                conf += 2.0;  // Asian/off-hours: minimal
+   g_ConfBreakdown += " Sess:" + DoubleToString(conf - prevConf, 0); prevConf = conf;
 
    // --- 3. ZONE POSITION (0-10) ---
    if(zone == "LOWER_THIRD" && tradeDir == 1)   conf += 10.0;  // buy from low
@@ -2381,6 +2429,7 @@ double CalcConfidence(int tradeDir, string zone, bool isMeanRev, bool isSideways
    else if(zone == "LOWER_THIRD" && tradeDir == -1)  conf += 3.0;   // sell from low (risky)
    else if(zone == "UPPER_THIRD" && tradeDir == 1)   conf += 3.0;   // buy from high (risky)
    else if(zone == "MID_ZONE")   conf += 1.0;   // mid = limited runway
+   g_ConfBreakdown += " Zone:" + DoubleToString(conf - prevConf, 0); prevConf = conf;
 
    // --- 4. CONFLUENCE — near a Fib/Pivot level, TYPE scores differently per direction ---
    // Support levels (S1, S2, Fib 61.8%, 76.4%) favour BUY; resist BUY headwind if selling from support
@@ -2412,6 +2461,7 @@ double CalcConfidence(int tradeDir, string zone, bool isMeanRev, bool isSideways
             conf += resistanceIntact ? 2.0  : 8.0; // broken resistance now acts as support = decent for buy
       }
    }
+   g_ConfBreakdown += " Cnfl:" + DoubleToString(conf - prevConf, 0); prevConf = conf;
 
    // --- 5. BIAS ALIGNMENT (0-5, can go negative) ---
    if(tradeDir == 1  && g_TotalBias >= 2)   conf += 5.0;   // strong bull bias + buy
@@ -2421,6 +2471,7 @@ double CalcConfidence(int tradeDir, string zone, bool isMeanRev, bool isSideways
    // Counter-trend penalty
    if(tradeDir == 1  && g_TotalBias <= -2) conf -= 5.0;
    if(tradeDir == -1 && g_TotalBias >= 2)  conf -= 5.0;
+   g_ConfBreakdown += " Bias:" + DoubleToString(conf - prevConf, 0); prevConf = conf;
 
    // --- 6. RANGE ROOM (0-10) ---
    if(g_RangeHigh > 0 && g_RangeLow > 0) {
@@ -2434,6 +2485,7 @@ double CalcConfidence(int tradeDir, string zone, bool isMeanRev, bool isSideways
       else if(roomPips >= 15.0) conf += 4.0;
       else                      conf += 1.0;   // tight
    }
+   g_ConfBreakdown += " Room:" + DoubleToString(conf - prevConf, 0); prevConf = conf;
 
    // --- 7. ATR VOLATILITY (0-10) ---
    double atrPips = (g_ATR > 0) ? (g_ATR / _Point / 10.0) : 10.0;
@@ -2442,6 +2494,7 @@ double CalcConfidence(int tradeDir, string zone, bool isMeanRev, bool isSideways
    else if(atrPips >= 10.0) conf += 5.0;
    else if(atrPips >= 7.0)  conf += 3.0;
    // < 7 = dead market, minimal confidence
+   g_ConfBreakdown += " ATR:" + DoubleToString(conf - prevConf, 0); prevConf = conf;
 
    // --- 8. SWING STRUCTURE (0-10) ---
    bool structAligned = false;
@@ -2455,6 +2508,7 @@ double CalcConfidence(int tradeDir, string zone, bool isMeanRev, bool isSideways
       if(g_BOS && structAligned)   conf += 5.0;
       if(g_CHoCH && structAligned) conf += 3.0;
    }
+   g_ConfBreakdown += " Struct:" + DoubleToString(conf - prevConf, 0); prevConf = conf;
 
    // --- 9. VOLUME CONFIRMATION (directional) ---
    // High volume in the TRADE direction = institutional participation = gold.
@@ -2481,6 +2535,7 @@ double CalcConfidence(int tradeDir, string zone, bool isMeanRev, bool isSideways
       }
       if(g_VolDivergence) conf -= 3.0;  // price trending but volume fading = weakening
    }
+   g_ConfBreakdown += " Vol:" + DoubleToString(conf - prevConf, 0); prevConf = conf;
 
    // --- 10. LIQUIDITY SWEEP (0-10) ---
    // Sweep = institutions hunted stops, then reversed. If sweep matches our
@@ -2489,6 +2544,7 @@ double CalcConfidence(int tradeDir, string zone, bool isMeanRev, bool isSideways
       if(g_SweepDir == tradeDir)  conf += 10.0;  // aligned sweep = maximum edge
       else                         conf -= 3.0;   // sweep against us = danger
    }
+   g_ConfBreakdown += " Sweep:" + DoubleToString(conf - prevConf, 0); prevConf = conf;
 
    // --- 11. ORDER BLOCK PROXIMITY (directional, with opposing OB penalty) ---
    bool nearOB = false;
@@ -2530,6 +2586,7 @@ double CalcConfidence(int tradeDir, string zone, bool isMeanRev, bool isSideways
       if(tradeDir == 1  && g_BullOBCount >= 2) conf += 3.0;
       if(tradeDir == -1 && g_BearOBCount >= 2) conf += 3.0;
    }
+   g_ConfBreakdown += " OB:" + DoubleToString(conf - prevConf, 0); prevConf = conf;
 
    // --- 12. FAIR VALUE GAP (0-10) ---
    bool nearFVG = false;
@@ -2541,6 +2598,7 @@ double CalcConfidence(int tradeDir, string zone, bool isMeanRev, bool isSideways
       if(tradeDir == 1 && g_NearBearFVG && !g_NearBullFVG) conf -= 3.0;
       if(tradeDir == -1 && g_NearBullFVG && !g_NearBearFVG) conf -= 3.0;
    }
+   g_ConfBreakdown += " FVG:" + DoubleToString(conf - prevConf, 0); prevConf = conf;
 
    // --- 13. KEY HOUR BONUS (0-8) ---
    // Full-hour session boundaries where institutional order flow and volatility spikes
@@ -2569,6 +2627,7 @@ double CalcConfidence(int tradeDir, string zone, bool isMeanRev, bool isSideways
          keyHourBonus = KeyHourBonusPts * 0.5;        // within 30 min: half bonus
       conf += keyHourBonus;
    }
+   g_ConfBreakdown += " KeyHr:" + DoubleToString(conf - prevConf, 0); prevConf = conf;
 
    // --- 14. ASIAN SESSION PREV-DAY MOMENTUM ALIGNMENT (0-6) ---
    // During the Asian session, the last hour of the previous trading day often
@@ -2584,6 +2643,7 @@ double CalcConfidence(int tradeDir, string zone, bool isMeanRev, bool isSideways
          conf += asianMomBonus;
       }
    }
+   g_ConfBreakdown += " AsiMom:" + DoubleToString(conf - prevConf, 0); prevConf = conf;
 
    // --- 15. MULTI-TIMEFRAME (MTF) STRUCTURE ALIGNMENT (0-12) ---
    // When both the macro (H4) and intermediate (H1) structure label agree with
@@ -2610,6 +2670,7 @@ double CalcConfidence(int tradeDir, string zone, bool isMeanRev, bool isSideways
       if(g_MacroCHoCH && macroAlignedWithTrade) mtfBonus += 3.0;
       conf += mtfBonus;
    }
+   g_ConfBreakdown += " MTF:" + DoubleToString(conf - prevConf, 0); prevConf = conf;
 
    // --- FACTOR 16 — H4 FVG & Order Blocks (macro supply/demand confluences) ---
    // H4 zones represent multi-day institutional memory: the strongest SMC confirmation.
@@ -2632,6 +2693,7 @@ double CalcConfidence(int tradeDir, string zone, bool isMeanRev, bool isSideways
       if(tradeDir == -1 && nearH4BullZone && !nearH4BearZone) h4smcBonus -= 5.0;
       conf += h4smcBonus;
    }
+   g_ConfBreakdown += " H4:" + DoubleToString(conf - prevConf, 0); prevConf = conf;
 
    // --- FACTOR 17 — FVG H1+H4 OVERLAP CONFLUENCE (0-6) ---
    // When an unfilled H1 FVG overlaps an unfilled H4 FVG in the same direction,
@@ -2640,10 +2702,12 @@ double CalcConfidence(int tradeDir, string zone, bool isMeanRev, bool isSideways
       if(tradeDir == 1  && g_FVGOverlapBullish) conf += 6.0;
       if(tradeDir == -1 && g_FVGOverlapBearish) conf += 6.0;
    }
+   g_ConfBreakdown += " FVGovlp:" + DoubleToString(conf - prevConf, 0); prevConf = conf;
 
    // --- PENALTIES ---
-   if(isSideways)  conf -= 8.0;   // choppy market = unreliable signals
-   if(isMeanRev)   conf -= 3.0;   // MRV = limited runway, lower confidence
+   if(isSideways)  conf -= 8.0;
+   if(isMeanRev)   conf -= 3.0;
+   g_ConfBreakdown += " Pen:" + DoubleToString(conf - prevConf, 0); prevConf = conf;
 
    // Clamp to 0-100
    conf = MathMax(0, MathMin(100, conf));
@@ -3366,13 +3430,15 @@ void EvaluateHAPattern()
             string tierInfo = "Consec=" + IntegerToString(g_HAConsecCount)
                             + " Score=" + IntegerToString(ovScore)
                             + " LvlBreak=" + lvlTag;
-            if(ovScore >= HugeBoldMinScore && g_BarsSinceLevelBreak <= MaxConsecCandles * 2) {
+            // v6.23b: HUGE_BOLD needs only score (high conviction = override LvlBreak)
+            //         SMALL_BOLD: LvlBreak OR elevated score (SmallBoldMinScore+1)
+            if(ovScore >= HugeBoldMinScore) {
                g_BoldTier          = "HUGE_BOLD";
                g_ConfirmCandleOpen = iTime(_Symbol, PERIOD_M15, 1);
                g_Signal            = "BUY INCOMING";
                didReset            = false;
                Print("[HUGE BOLD BUY] MaxConsec exceeded but strong trend — HUGE_BOLD: ", tierInfo);
-            } else if(ovScore >= SmallBoldMinScore && g_BarsSinceLevelBreak <= MaxConsecCandles * 3) {
+            } else if(ovScore >= SmallBoldMinScore && (g_BarsSinceLevelBreak <= MaxConsecCandles * 3 || ovScore >= SmallBoldMinScore + 1)) {
                g_BoldTier          = "SMALL_BOLD";
                g_ConfirmCandleOpen = iTime(_Symbol, PERIOD_M15, 1);
                g_Signal            = "BUY INCOMING";
@@ -3488,13 +3554,15 @@ void EvaluateHAPattern()
             string tierInfo = "Consec=" + IntegerToString(g_HAConsecCount)
                             + " Score=" + IntegerToString(ovScore)
                             + " LvlBreak=" + lvlTag;
-            if(ovScore >= HugeBoldMinScore && g_BarsSinceLevelBreak <= MaxConsecCandles * 2) {
+            // v6.23b: HUGE_BOLD needs only score (high conviction = override LvlBreak)
+            //         SMALL_BOLD: LvlBreak OR elevated score (SmallBoldMinScore+1)
+            if(ovScore >= HugeBoldMinScore) {
                g_BoldTier          = "HUGE_BOLD";
                g_ConfirmCandleOpen = iTime(_Symbol, PERIOD_M15, 1);
                g_Signal            = "SELL INCOMING";
                didReset            = false;
                Print("[HUGE BOLD SELL] MaxConsec exceeded but strong trend — HUGE_BOLD: ", tierInfo);
-            } else if(ovScore >= SmallBoldMinScore && g_BarsSinceLevelBreak <= MaxConsecCandles * 3) {
+            } else if(ovScore >= SmallBoldMinScore && (g_BarsSinceLevelBreak <= MaxConsecCandles * 3 || ovScore >= SmallBoldMinScore + 1)) {
                g_BoldTier          = "SMALL_BOLD";
                g_ConfirmCandleOpen = iTime(_Symbol, PERIOD_M15, 1);
                g_Signal            = "SELL INCOMING";
@@ -3522,6 +3590,8 @@ void EvaluateHAPattern()
       g_ZonePending       = false;
       g_ZoneContextUsed   = false;
       g_Signal            = "WAITING";
+      g_PreflightBearOK   = false;   // bear setup died
+      g_PreflightBlocker  = "";
    }
    else if(dir1 == -1 && g_HABullSetup) {
       g_HABullSetup       = false;
@@ -3530,6 +3600,8 @@ void EvaluateHAPattern()
       g_ZonePending       = false;
       g_ZoneContextUsed   = false;
       g_Signal            = "WAITING";
+      g_PreflightBullOK   = false;   // bull setup died
+      g_PreflightBlocker  = "";
    }
 
    // === PREPARING EXPIRY — if Bollinger hasn't confirmed after PrepMaxBars, abandon setup ===
@@ -3538,10 +3610,13 @@ void EvaluateHAPattern()
       if(barsSinceArm >= PrepMaxBars) {
          Print("[PREPARING EXPIRED] ", g_Signal, " timed out after ", barsSinceArm,
                " bars (max=", PrepMaxBars, ") — Bollinger never confirmed. Resetting to WAITING.");
-         g_Signal       = "WAITING";
-         g_HABullSetup  = false;
-         g_HABearSetup  = false;
-         g_PrepStartTime = 0;
+         g_Signal         = "WAITING";
+         g_HABullSetup    = false;
+         g_HABearSetup    = false;
+         g_PrepStartTime  = 0;
+         g_PreflightBullOK = false;
+         g_PreflightBearOK = false;
+         g_PreflightBlocker = "";
          return;
       }
    }
@@ -3594,6 +3669,9 @@ void EvaluateHAPattern()
       }
 
       // --- TryEntry gate pre-checks (forward look once Bollinger clears) ---
+      // Compute live confidence so the diagnostic shows real values (not stale 0)
+      CalcConfidence(trD, g_ZoneLabel, false, IsSideways(), g_NearLevel);
+
       bool hpBiasOK      = isBuy ? (g_TotalBias > -2) : (g_TotalBias < 2);
       bool hpConfOK      = (g_Confidence >= MinConfidence);
       bool hpDailyOK     = (MaxDailyTrades == 0 || g_DailyTradeCount < MaxDailyTrades);
@@ -3696,6 +3774,38 @@ void EvaluateHAPattern()
             "  CONFIRMED:\n", confirmed, "\n",
             "  CURRENT BLOCKER:\n", pending, "\n",
             "  NEXT GATES (after Bollinger):\n", nextGates);
+      Print("  SCORE BREAKDOWN: [", g_ConfBreakdown, "] = ", DoubleToString(g_Confidence,1), "%");
+
+      // === CACHE PRE-FLIGHT RESULT for live bar fast-track ===
+      // If ALL downstream gates are already green while PREPARING, the next HA candle
+      // that aligns (even live/forming) can trigger an immediate entry.
+      bool macroBOSBlockPF = g_MacroBOS && UseMacroStructure && MacroBOSHardBlock &&
+                             ((isBuy  && g_MacroStructLabel == "BEARISH") ||
+                              (!isBuy && g_MacroStructLabel == "BULLISH"));
+      bool allDownGatesOK = hpZoneOK && hpBiasOK && hpConfOK && hpTimeOK &&
+                            hpCooldownOK && hpForeignOK && hpDailyOK && hpDailyLossOK &&
+                            !macroBOSBlockPF && !g_TradeOpen;
+
+      if(isBuy)  g_PreflightBullOK = allDownGatesOK;
+      else       g_PreflightBearOK = allDownGatesOK;
+
+      if(!allDownGatesOK) {
+         if(!hpTimeOK)         g_PreflightBlocker = "NoEntryAfter=" + IntegerToString(NoEntryAfterHour) + ":00";
+         else if(!hpCooldownOK) g_PreflightBlocker = cooldownInfo;
+         else if(!hpDailyOK)    g_PreflightBlocker = "DailyTrades=" + IntegerToString(g_DailyTradeCount) + "/" + IntegerToString(MaxDailyTrades);
+         else if(!hpDailyLossOK)g_PreflightBlocker = "DailyLoss=$" + DoubleToString(g_DailyPnL,2);
+         else if(!hpForeignOK)  g_PreflightBlocker = "ForeignTrade open";
+         else if(!hpZoneOK)     g_PreflightBlocker = "Zone=" + g_ZoneLabel;
+         else if(!hpBiasOK)     g_PreflightBlocker = "Bias=" + IntegerToString(g_TotalBias);
+         else if(macroBOSBlockPF)g_PreflightBlocker = "MacroBOS=" + g_MacroStructLabel;
+         else if(!hpConfOK)     g_PreflightBlocker = "Conf=" + DoubleToString(g_Confidence,1) + "% (min " + DoubleToString(MinConfidence,1) + "%";
+         Print("[PREFLIGHT ", (isBuy?"BUY":"SELL"), " BLOCKED] ", g_PreflightBlocker,
+               " — live bar fast-track disabled until this clears");
+      } else {
+         g_PreflightBlocker = "";
+         Print("[PREFLIGHT ", (isBuy?"BUY":"SELL"), " ✓ GREEN] All downstream gates clear",
+               " — live bar fast-track ARMED (Boll still needed)");
+      }
    }
 
    // === MEAN REVERSION TWO-CANDLE STATE MACHINE ===
@@ -3940,6 +4050,47 @@ double USDtoPoints(double usdAmount, double lot)
 }
 
 //+------------------------------------------------------------------+
+//| LIVE BAR BOLLINGER CHECK                                         |
+//| Checks whether the FORMING bar[0] passes the Bollinger gate,    |
+//| using the current bid/ask as a provisional close price.          |
+//| This allows fast-track entry before bar[0] fully closes.        |
+//+------------------------------------------------------------------+
+bool LiveHABollingerOK(int tradeDir)
+{
+   if(g_BollingerMid1 <= 0) return true;  // no Bollinger data — don't block
+
+   double barO = iOpen  (_Symbol, PERIOD_M15, 0);
+   double barH = iHigh  (_Symbol, PERIOD_M15, 0);
+   double barL = iLow   (_Symbol, PERIOD_M15, 0);
+   // Use bid for buy checks, ask for sell checks (more conservative)
+   double barC = (tradeDir == 1)
+                 ? SymbolInfoDouble(_Symbol, SYMBOL_BID)
+                 : SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+
+   // Provisional HA close for bar[0]: average of OHLC with live price
+   double haC0 = (barO + barH + barL + barC) / 4.0;
+   // Provisional HA open for bar[0] = average of bar[1]'s HA open & close
+   double haO1, haH1, haL1, haC1;
+   CalcHA(1, haO1, haH1, haL1, haC1);
+   double haO0    = (haO1 + haC1) / 2.0;
+   double bodyMid = (haO0 + haC0) / 2.0;
+
+   double bandPips = (g_BollingerUpper1 > 0 && g_BollingerLower1 > 0)
+                     ? (g_BollingerUpper1 - g_BollingerLower1) / _Point / 10.0 : 999.0;
+   bool isNarrow = (g_BollingerUpper1 > 0 && bandPips < NarrowBandPips);
+
+   if(isNarrow) {
+      // Relaxed: high/low pokes past midline, body stays inside bands
+      if(tradeDir ==  1) return (barH >= g_BollingerMid1 && bodyMid <= g_BollingerUpper1);
+      else               return (barL <= g_BollingerMid1 && bodyMid >= g_BollingerLower1);
+   } else {
+      // Standard: live body mid on the correct side of midline
+      if(tradeDir ==  1) return (bodyMid <= g_BollingerMid1);
+      else               return (bodyMid >= g_BollingerMid1);
+   }
+}
+
+//+------------------------------------------------------------------+
 //| ENTRY LOGIC v3                                                    |
 //| Handles: trend trades, midrange caution, mean reversion          |
 //+------------------------------------------------------------------+
@@ -3954,8 +4105,11 @@ void TryEntry()
    // === FOREIGN TRADE GUARD ===
    // If a non-bot trade exists on this symbol, respect the one-trade rule
    if(RespectForeignTrades && g_ForeignCountSymbol > 0) {
-      Print("ENTRY BLOCKED: ", g_ForeignCountSymbol, " foreign trade(s) open on ", _Symbol,
-            " (", DoubleToString(g_ForeignLotsSymbol,2), " lots) — one-trade rule");
+      if(_canPrintBlock) {
+         Print("ENTRY BLOCKED: ", g_ForeignCountSymbol, " foreign trade(s) open on ", _Symbol,
+               " (", DoubleToString(g_ForeignLotsSymbol,2), " lots) — one-trade rule");
+         g_LastBlockPrintBar = _blockBar;
+      }
       return;
    }
 

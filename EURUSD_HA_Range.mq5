@@ -276,6 +276,15 @@ string g_LastMgmtAction   = "";      // last management action label (for dashbo
 string g_TradeMgmtModeName = "STANDARD"; // resolved mode name
 string g_ComebackLabel     = "";       // comeback potential label for dashboard (HIGH/MODERATE/LOW)
 
+// HA chain cache — proper recursive calculation built once per new bar.
+// The old CalcHA used a 2-bar lookback which under-smoothed HA Open, causing
+// late direction flips, missed bottomless/topless candles, and short counts.
+double g_HACacheO[50];     // HA Open  for bars 0..49
+double g_HACacheH[50];     // HA High  for bars 0..49
+double g_HACacheL[50];     // HA Low   for bars 0..49
+double g_HACacheC[50];     // HA Close for bars 0..49
+datetime g_HACacheBar = 0; // bar-0 open time when cache was last built
+
 int    g_TotalBias    = 0;
 
 // Auto market-derived bias components (recalculated every tick)
@@ -629,17 +638,38 @@ int OnInit()
    UpdateLiveSessionBar();
    g_ZoneLabel = ClassifyZone(SymbolInfoDouble(_Symbol, SYMBOL_BID));
 
-   // Startup grace period: wait N minutes before allowing entries after a real restart.
-   // Skipped entirely when the user simply switches timeframe or symbol (REASON_CHARTCHANGE),
-   // since that is not a logic restart — conditions are still valid.
+   // Warm up HA chain cache immediately so cold-start recovery has accurate values
+   BuildHACache();
+
+   // Startup grace period: wait N minutes before allowing entries after a TRUE COLD START.
+   // Skipped on warm restarts where market data is already in memory:
+   //   REASON_CHARTCHANGE (3) = TF/symbol switch
+   //   REASON_PARAMETERS  (5) = user changed inputs
+   //   REASON_RECOMPILE   (2) = code recompiled in MetaEditor
+   //   REASON_REMOVE      (1) = EA removed and re-added
+   //   REASON_TEMPLATE    (7) = chart template applied
+   //   REASON_ACCOUNT     (6) = account change
+   // Grace only fires on: first attach (0), terminal close (9), chart close (4).
    int  _reinitReason = UninitializeReason();
-   bool _isTFSwitch   = (_reinitReason == REASON_CHARTCHANGE);
-   if(StartupGraceMins > 0 && !_isTFSwitch) {
+   bool _isWarmRestart = (_reinitReason == REASON_CHARTCHANGE ||
+                          _reinitReason == REASON_PARAMETERS  ||
+                          _reinitReason == REASON_RECOMPILE   ||
+                          _reinitReason == REASON_REMOVE       ||
+                          _reinitReason == REASON_TEMPLATE     ||
+                          _reinitReason == REASON_ACCOUNT);
+   if(StartupGraceMins > 0 && !_isWarmRestart) {
       g_StartupGraceUntil = TimeCurrent() + (datetime)(StartupGraceMins * 60);
-      Print("[STARTUP GRACE] Waiting ", StartupGraceMins, " min(s) before allowing entries",
+      Print("[STARTUP GRACE] Cold start — waiting ", StartupGraceMins, " min(s) before allowing entries",
             " (until ", TimeToString(g_StartupGraceUntil, TIME_MINUTES), ") reason=", _reinitReason);
-   } else if(_isTFSwitch) {
-      Print("[STARTUP GRACE] Skipped — timeframe/symbol switch (reason=", _reinitReason, ")");
+   } else if(_isWarmRestart) {
+      g_StartupGraceUntil = 0;   // clear any leftover grace from previous init
+      Print("[STARTUP GRACE] Skipped — warm restart (reason=", _reinitReason, " ",
+            (_reinitReason == REASON_CHARTCHANGE ? "TF_SWITCH" :
+             _reinitReason == REASON_PARAMETERS  ? "PARAMS" :
+             _reinitReason == REASON_RECOMPILE   ? "RECOMPILE" :
+             _reinitReason == REASON_REMOVE       ? "REMOVE+ADD" :
+             _reinitReason == REASON_TEMPLATE     ? "TEMPLATE" : "ACCOUNT"),
+            ") — data in memory, no wait needed");
    }
 
    UpdateDashboard();
@@ -730,6 +760,9 @@ void OnTick()
 
    // Recalc bias every tick so dashboard always reflects live price movement
    RecalcBias();
+
+   // Ensure HA chain cache is current (O(1) check; rebuilds only on new bar or first tick)
+   BuildHACache();
 
    // New bar processing
    datetime barTime = iTime(_Symbol, PERIOD_M15, 0);
@@ -2318,30 +2351,103 @@ void DrawH4SMCZones()
 }
 
 //+------------------------------------------------------------------+
+//| BUILD HA CHAIN CACHE — proper recursive Heikin-Ashi calculation  |
+//| Seeds from bar 50 (raw OHLC midpoint) and iterates forward to   |
+//| bar 0.  After ~15 bars the seed error is negligible (<0.1 pip). |
+//| Called once per new bar; bar 0 is recomputed on-the-fly in      |
+//| CalcHA() using the cached bar 1 values + current tick OHLC.     |
+//+------------------------------------------------------------------+
+void BuildHACache()
+{
+   datetime curBar = iTime(_Symbol, PERIOD_M15, 0);
+   if(curBar == g_HACacheBar && g_HACacheBar != 0) return;  // already current
+   g_HACacheBar = curBar;
+
+   // Seed: use raw OHLC midpoint of bar 50 as the initial haOpen.
+   // The error from this approximation decays exponentially and is
+   // negligible by bar ~35 (well before the bars we actually read).
+   int seedIdx = 49;
+   double seedO = iOpen (_Symbol, PERIOD_M15, seedIdx + 1);
+   double seedH = iHigh (_Symbol, PERIOD_M15, seedIdx + 1);
+   double seedL = iLow  (_Symbol, PERIOD_M15, seedIdx + 1);
+   double seedC = iClose(_Symbol, PERIOD_M15, seedIdx + 1);
+   double prevHaO = (seedO + seedC) / 2.0;
+   double prevHaC = (seedO + seedH + seedL + seedC) / 4.0;
+
+   // Forward iterate from oldest cached bar to newest
+   for(int i = seedIdx; i >= 0; i--)
+   {
+      double o = iOpen (_Symbol, PERIOD_M15, i);
+      double h = iHigh (_Symbol, PERIOD_M15, i);
+      double l = iLow  (_Symbol, PERIOD_M15, i);
+      double c = iClose(_Symbol, PERIOD_M15, i);
+
+      double haC = (o + h + l + c) / 4.0;
+      double haO = (prevHaO + prevHaC) / 2.0;
+      double haH = MathMax(h, MathMax(haO, haC));
+      double haL = MathMin(l, MathMin(haO, haC));
+
+      g_HACacheO[i] = haO;
+      g_HACacheH[i] = haH;
+      g_HACacheL[i] = haL;
+      g_HACacheC[i] = haC;
+
+      prevHaO = haO;
+      prevHaC = haC;
+   }
+}
+
+//+------------------------------------------------------------------+
 //| HEIKEN ASHI CALCULATION for bar at index idx                     |
+//| Reads from the pre-built chain cache (bars 1-49) or computes    |
+//| bar 0 on-the-fly using current tick data + cached bar 1 values. |
 //+------------------------------------------------------------------+
 void CalcHA(int idx, double &haO, double &haH, double &haL, double &haC)
 {
-   double o  = iOpen (_Symbol, PERIOD_M15, idx);
-   double h  = iHigh (_Symbol, PERIOD_M15, idx);
-   double l  = iLow  (_Symbol, PERIOD_M15, idx);
-   double c  = iClose(_Symbol, PERIOD_M15, idx);
+   // Bar 0 (forming): recompute every tick using CURRENT OHLC + cached prev bar
+   if(idx == 0 && g_HACacheBar != 0)
+   {
+      double o = iOpen (_Symbol, PERIOD_M15, 0);
+      double h = iHigh (_Symbol, PERIOD_M15, 0);
+      double l = iLow  (_Symbol, PERIOD_M15, 0);
+      double c = iClose(_Symbol, PERIOD_M15, 0);
+      haC = (o + h + l + c) / 4.0;
+      haO = (g_HACacheO[1] + g_HACacheC[1]) / 2.0;
+      haH = MathMax(h, MathMax(haO, haC));
+      haL = MathMin(l, MathMin(haO, haC));
+      return;
+   }
 
-   haC = (o + h + l + c) / 4.0;
+   // Closed bars (1-49): read directly from cache
+   if(idx >= 1 && idx < 50 && g_HACacheBar != 0)
+   {
+      haO = g_HACacheO[idx];
+      haH = g_HACacheH[idx];
+      haL = g_HACacheL[idx];
+      haC = g_HACacheC[idx];
+      return;
+   }
 
-   // HA Open needs the previous bar's HA values
-   double prevO = iOpen (_Symbol, PERIOD_M15, idx + 1);
-   double prevH = iHigh (_Symbol, PERIOD_M15, idx + 1);
-   double prevL = iLow  (_Symbol, PERIOD_M15, idx + 1);
-   double prevC = iClose(_Symbol, PERIOD_M15, idx + 1);
-
-   double prevHaC = (prevO + prevH + prevL + prevC) / 4.0;
-   double prevHaO = (iOpen(_Symbol, PERIOD_M15, idx + 2) + iClose(_Symbol, PERIOD_M15, idx + 2)) / 2.0;
-   // Recursive prev HA open (simplified 2-step lookback — good enough for signal detection)
-   haO = (prevHaO + prevHaC) / 2.0;
-
-   haH = MathMax(h, MathMax(haO, haC));
-   haL = MathMin(l, MathMin(haO, haC));
+   // Fallback for indices beyond cache or cache not yet built —
+   // uses a local 10-step recursion (much better than old 2-step)
+   double chainO[12], chainC[12];
+   // Seed from idx+11
+   chainO[11] = (iOpen(_Symbol, PERIOD_M15, idx + 11) + iClose(_Symbol, PERIOD_M15, idx + 11)) / 2.0;
+   chainC[11] = (iOpen(_Symbol, PERIOD_M15, idx + 11) + iHigh(_Symbol, PERIOD_M15, idx + 11)
+                + iLow(_Symbol, PERIOD_M15, idx + 11) + iClose(_Symbol, PERIOD_M15, idx + 11)) / 4.0;
+   for(int j = 10; j >= 0; j--)
+   {
+      int bi = idx + j;
+      double bO = iOpen(_Symbol, PERIOD_M15, bi), bH = iHigh(_Symbol, PERIOD_M15, bi);
+      double bL = iLow(_Symbol, PERIOD_M15, bi),  bC = iClose(_Symbol, PERIOD_M15, bi);
+      chainC[j] = (bO + bH + bL + bC) / 4.0;
+      chainO[j] = (chainO[j+1] + chainC[j+1]) / 2.0;
+   }
+   haO = chainO[0];
+   haC = chainC[0];
+   double oh = iHigh(_Symbol, PERIOD_M15, idx), ol = iLow(_Symbol, PERIOD_M15, idx);
+   haH = MathMax(oh, MathMax(haO, haC));
+   haL = MathMin(ol, MathMin(haO, haC));
 }
 
 // Returns: 1=bull, -1=bear, 0=doji

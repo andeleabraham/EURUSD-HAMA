@@ -1,10 +1,10 @@
 //+------------------------------------------------------------------+
-//|  EURUSD Heiken Ashi Range Bot v6.25                              |
-//|  CHoCH direction-aware: reversal signals now track bull/bear dir, |
-//|  enable counter-trend entries with cautious TP, MacroBOS exemption|
+//|  EURUSD Heiken Ashi Range Bot v6.26                              |
+//|  Zones+Channels: Murray Math octaves, multi-day S/R, Fib exts,  |
+//|  soft/hard zone hardness, channel-aware TP extensions            |
 //+------------------------------------------------------------------+
 #property copyright   "EURUSD HA Range Bot"
-#property version     "6.25"
+#property version     "6.26"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -144,7 +144,7 @@ input group "=== MACRO TREND RIDE ==="
 // Asian session is blocked: Asia often makes a small counter-BOS move before the
 // real continuation begins at London open. Wait for non-Asian confirmation.
 input bool   MacroTrendRideEnabled  = true;   // Enable MacroBOS intraday trend-ride entries
-input int    MacroTrendMinScore     = 5;      // Min ZoneContextScore (0-12) — higher = more selective
+input int    MacroTrendMinScore     = 5;      // Min ZoneContextScore (0-14) — higher = more selective
 input double MacroTrendSL_USD       = 2.75;   // SL per 0.01 lot (wider space for trend volatility)
 input double MacroTrendMinTP_USD    = 4.00;   // Floor TP per 0.01 lot (minimum target for a trend ride)
 input double MacroTrendMaxTP_USD    = 8.00;   // Ceiling TP per 0.01 lot (cap at realistic intraday range)
@@ -160,17 +160,22 @@ input bool   AllowMeanReversion = true; // Enable HA-confirmed mean reversion tr
 // Zone strictness controls how "wrong zone" trend trades are treated:
 //   0 = STRICT        — Hard block. Zone is an absolute barrier; no exceptions ever.
 //   1 = RELAXED       — Block unless Asian session + prev-day carry-over bias (original default).
-//   2 = CONTEXT_AWARE — Smart mode. Scores structural confluence (up to 12 points):
+//   2 = CONTEXT_AWARE — Smart mode. Scores structural confluence (up to 14 points):
 //                       If score >= ZoneContextMinScore AND price is approaching a Fib/Pivot level
 //                       → sets PENDING state; waits for that level to break + momentum before entry.
 //                       If score sufficient AND no Fib barrier ahead (or already past one)
 //                       → allows CAUTION entry, logged to journal for learning.
 //                       Ideal for trending markets where the zone filter alone is misleading.
 input int    ZoneStrictness        = 2;    // 0=STRICT | 1=RELAXED (Asian relax) | 2=CONTEXT_AWARE
-input int    ZoneContextMinScore   = 4;    // Min confluence score (0-12) for CONTEXT_AWARE zone override
+input int    ZoneContextMinScore   = 4;    // Min confluence score (0-14) for CONTEXT_AWARE zone override
 input bool   ZonePendingEnabled    = true; // CONTEXT mode: wait for Fib/Pivot breakout before entry
 input double ZonePendingPips       = 10.0; // Pip lookahead: detect approaching Fib/Pivot within this range
 input int    ZonePendingMaxBars    = 4;    // CONTEXT mode: auto-expire pending wait after N M15 bars (4=1hr)
+//
+// Extended zone analysis — channels, multi-day S/R, and Fib extensions
+input bool   UseMurrayChannels    = true;  // Compute Murray Math octave levels from H4 swing range
+input bool   UseWeeklySR          = true;  // Track weekly & 3-day H/L for multi-day support/resistance
+input bool   UseFibExtensions     = true;  // Add 127.2% and 161.8% Fib extension levels beyond range
 
 input group "=== ATR & RANGE CONFIDENCE ==="
 input int    ATRPeriod        = 14;
@@ -219,6 +224,16 @@ double g_NYHigh     = 0, g_NYLow     = 0, g_NYOpen     = 0;
 double g_TodayHigh  = 0, g_TodayLow  = 0, g_TodayOpen  = 0;
 double g_RangeHigh  = 0, g_RangeLow  = 0, g_RangeMid = 0;
 double g_PrevDayHigh= 0, g_PrevDayLow = 0;  // yesterday only (fixed reference)
+double g_PrevWeekHigh = 0, g_PrevWeekLow = 0;  // W1[1] previous completed week
+double g_ThreeDayHigh = 0, g_ThreeDayLow = 0;  // rolling 3-day high/low (D1[0..2])
+double g_Murray[9];            // Murray Math octave levels [0/8 .. 8/8]
+double g_MurrayBase  = 0;     // Murray channel base price (lowest octave)
+double g_MurrayRange = 0;     // Murray channel total range (8/8 - 0/8)
+double g_FibExt1272  = 0;     // Fib 127.2% extension (above range for buys)
+double g_FibExt1618  = 0;     // Fib 161.8% extension (above range for buys)
+double g_FibExt1272L = 0;     // Fib 127.2% extension (below range for sells)
+double g_FibExt1618L = 0;     // Fib 161.8% extension (below range for sells)
+string g_ZoneHardness = "HARD";  // "SOFT" or "HARD" — zone boundary expected to hold?
 double g_CIHigh     = 0, g_CILow     = 0, g_ATR      = 0;
 int    g_InitTickCount = 0;  // count ticks since attach; D1[0] not trusted until threshold
 
@@ -341,7 +356,7 @@ string g_LastBlockReason   = "";             // last TryEntry block message — 
 // Macro Trend Ride state
 bool   g_MacroTrendRide  = false;  // true when MacroBOS trend-ride conditions are met on this bar
 int    g_MacroTrendDir   = 0;      // 1=bullish ride (long), -1=bearish ride (short)
-int    g_MacroTrendScore = 0;      // ZoneContextScore captured at time of detection (0-12)
+int    g_MacroTrendScore = 0;      // ZoneContextScore captured at time of detection (0-14)
 int    g_BoldRejectConsec = 0;      // last consec count that printed a BOLD REJECTED (throttle)
 
 // Order Blocks (institutional entry zones on H1) — up to 3 per direction
@@ -559,6 +574,7 @@ int OnInit()
    trade.SetExpertMagicNumber(202502);
    trade.SetDeviationInPoints(20);
    trade.SetAsyncMode(false);
+   ArrayInitialize(g_Murray, 0);  // zero Murray octave array
 
    // Seed ranges from historical data immediately
    SeedRangesFromHistory();
@@ -700,6 +716,8 @@ void OnTick()
       SetActiveRange();
       RecalcBias();
       CalcFibPivotLevels();   // recalc on every new bar
+      ComputeMurrayLevels();  // Murray Math octave channels from H4
+      ComputeMultiDaySR();    // weekly + 3-day S/R levels
 
       // Prev-day last-hour direction — recalc once per day during Asian session
       if(AsianPrevDayMomEnabled) {
@@ -912,6 +930,8 @@ void SeedRangesFromHistory()
    // Fallback: if today has no data at all, g_RangeHigh/Low from D1 already set above
    SetActiveRange();
    CalcFibPivotLevels();
+   ComputeMurrayLevels();
+   ComputeMultiDaySR();
    Print("SeedRangesFromHistory: PrevDay H=", DoubleToString(g_RangeHigh,5),
          " L=", DoubleToString(g_RangeLow,5),
          " | Asian H=", DoubleToString(g_AsianHigh,5), " L=", DoubleToString(g_AsianLow,5),
@@ -2322,6 +2342,167 @@ bool IsToplessWithBottomSpike(int idx)
 }
 
 //+------------------------------------------------------------------+
+//| MURRAY MATH CHANNEL LEVELS                                       |
+//| Computes 9 octave levels (0/8 through 8/8) from the H4 swing.   |
+//| These act as natural support/resistance beyond intraday range.   |
+//+------------------------------------------------------------------+
+void ComputeMurrayLevels()
+{
+   if(!UseMurrayChannels) return;
+   ArrayInitialize(g_Murray, 0);
+   g_MurrayBase = 0;
+   g_MurrayRange = 0;
+
+   // Get H4 high/low over the last 32 bars (~5.3 days of H4 data)
+   double h4High = 0, h4Low = 999999;
+   double h4Highs[], h4Lows[];
+   ArraySetAsSeries(h4Highs, true);
+   ArraySetAsSeries(h4Lows, true);
+   int copied = CopyHigh(_Symbol, PERIOD_H4, 0, 32, h4Highs);
+   int copiedL = CopyLow(_Symbol, PERIOD_H4, 0, 32, h4Lows);
+   if(copied < 16 || copiedL < 16) return;  // not enough data
+   for(int i = 0; i < copied; i++)
+      if(h4Highs[i] > h4High) h4High = h4Highs[i];
+   for(int i = 0; i < copiedL; i++)
+      if(h4Lows[i] < h4Low) h4Low = h4Lows[i];
+
+   if(h4High <= h4Low || h4Low <= 0) return;
+
+   // Murray Math: find the nearest power-of-2 fraction that contains the range
+   double rawRange = h4High - h4Low;
+   // Round range UP to a "Murray octave" — the smallest 2^n / 10^k that covers rawRange
+   double murrayOctave = 0.00010;  // start small for forex
+   while(murrayOctave < rawRange) murrayOctave *= 2.0;
+   // Now murrayOctave >= rawRange
+
+   // Base = floor of h4Low to nearest murrayOctave
+   double base = MathFloor(h4Low / murrayOctave) * murrayOctave;
+   // If base + murrayOctave < h4High, shift up
+   if(base + murrayOctave < h4High)
+      base = h4High - murrayOctave;
+
+   g_MurrayBase  = base;
+   g_MurrayRange = murrayOctave;
+
+   // Compute 9 octave levels: 0/8, 1/8, 2/8, ... 8/8
+   for(int i = 0; i <= 8; i++)
+      g_Murray[i] = base + (murrayOctave * i) / 8.0;
+}
+
+//+------------------------------------------------------------------+
+//| MULTI-DAY SUPPORT / RESISTANCE                                   |
+//| Tracks: previous weekly H/L, rolling 3-day H/L                  |
+//+------------------------------------------------------------------+
+void ComputeMultiDaySR()
+{
+   // --- Previous completed week: W1[1] ---
+   if(UseWeeklySR) {
+      double wkH = iHigh(_Symbol, PERIOD_W1, 1);
+      double wkL = iLow (_Symbol, PERIOD_W1, 1);
+      if(wkH > 0 && wkL > 0) {
+         g_PrevWeekHigh = wkH;
+         g_PrevWeekLow  = wkL;
+      }
+      // --- Rolling 3-day H/L: D1[0], D1[1], D1[2] ---
+      double dH[3], dL[3];
+      ArraySetAsSeries(dH, true);
+      ArraySetAsSeries(dL, true);
+      int ch = CopyHigh(_Symbol, PERIOD_D1, 0, 3, dH);
+      int cl = CopyLow (_Symbol, PERIOD_D1, 0, 3, dL);
+      if(ch >= 3 && cl >= 3) {
+         g_ThreeDayHigh = MathMax(dH[0], MathMax(dH[1], dH[2]));
+         g_ThreeDayLow  = MathMin(dL[0], MathMin(dL[1], dL[2]));
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| ZONE HARDNESS CLASSIFIER                                         |
+//| Determines whether the current zone boundary (UPPER_THIRD for    |
+//| buys, LOWER_THIRD for sells) is likely to HOLD ("HARD") or be   |
+//| broken through ("SOFT"). If SOFT, the zone filter is relaxed.   |
+//|                                                                  |
+//| Factors that make a boundary SOFT:                               |
+//|  • Price already broke multi-day S/R in trade direction          |
+//|  • BOS or MacroBOS confirms structural break                    |
+//|  • CHoCH direction aligned with trade direction                  |
+//|  • Momentum elevated (ATR-based, HA consecutive >= 3)           |
+//|  • Murray octave above/below is close (run room exists)          |
+//| Factors that make a boundary HARD:                               |
+//|  • Multiple multi-day S/R levels clustered ahead (resistance)    |
+//|  • No structural break (range-bound)                             |
+//|  • Low momentum / volume                                         |
+//+------------------------------------------------------------------+
+string ClassifyZoneHardness(int tradeDir, double price)
+{
+   int softScore = 0;
+
+   // 1. Price vs multi-day S/R: if price already broke weekly high (buy) or low (sell)
+   if(UseWeeklySR) {
+      if(tradeDir == 1 && g_PrevWeekHigh > 0 && price > g_PrevWeekHigh)  softScore += 2;
+      if(tradeDir == -1 && g_PrevWeekLow > 0 && price < g_PrevWeekLow)   softScore += 2;
+      // Also check 3-day: already above 3-day high (buy) or below 3-day low (sell)
+      if(tradeDir == 1 && g_ThreeDayHigh > 0 && price > g_ThreeDayHigh)  softScore += 1;
+      if(tradeDir == -1 && g_ThreeDayLow > 0 && price < g_ThreeDayLow)   softScore += 1;
+   }
+
+   // 2. Structural breaks
+   if(g_BOS) softScore += 1;
+   if(g_MacroBOS) softScore += 2;
+
+   // 3. CHoCH in trade direction
+   if(g_CHoCH && g_CHoCHDir == tradeDir) softScore += 1;
+   if(g_MacroCHoCH && g_MacroCHoCHDir == tradeDir) softScore += 1;
+
+   // 4. Macro structure alignment
+   if(tradeDir == 1 && g_MacroStructLabel == "BULLISH")  softScore += 1;
+   if(tradeDir == -1 && g_MacroStructLabel == "BEARISH") softScore += 1;
+
+   // 5. Momentum: HA consecutive >= 3 signals a trending move
+   if(g_HAConsecCount >= 3) softScore += 1;
+
+   // 6. Volume elevated (institutional participation)
+   if(g_VolumeState == "HIGH" || g_VolumeState == "ABOVE_AVG") softScore += 1;
+
+   // 7. Murray channel: check if there is room beyond current range boundary
+   if(UseMurrayChannels && g_MurrayRange > 0) {
+      double nextMurray = 0;
+      for(int i = 0; i <= 8; i++) {
+         if(g_Murray[i] <= 0) continue;
+         if(tradeDir == 1 && g_Murray[i] > price && (nextMurray == 0 || g_Murray[i] < nextMurray))
+            nextMurray = g_Murray[i];
+         if(tradeDir == -1 && g_Murray[i] < price && (nextMurray == 0 || g_Murray[i] > nextMurray))
+            nextMurray = g_Murray[i];
+      }
+      // If next Murray level is >= 8 pips away, there is room to run → SOFT
+      if(nextMurray > 0 && MathAbs(nextMurray - price) >= 8.0 * _Point * 10)
+         softScore += 1;
+   }
+
+   // 8. Fib extension exists beyond range → runway exists
+   if(UseFibExtensions) {
+      if(tradeDir == 1 && g_FibExt1272 > 0 && g_FibExt1272 > g_RangeHigh)  softScore += 1;
+      if(tradeDir == -1 && g_FibExt1272L > 0 && g_FibExt1272L < g_RangeLow) softScore += 1;
+   }
+
+   // Penalise (reduce) for clustered resistance ahead
+   int resistCount = 0;
+   double lookAhead = 15.0 * _Point * 10;  // 15 pips ahead
+   if(UseWeeklySR && tradeDir == 1) {
+      if(g_PrevWeekHigh > price && g_PrevWeekHigh < price + lookAhead) resistCount++;
+      if(g_ThreeDayHigh > price && g_ThreeDayHigh < price + lookAhead) resistCount++;
+   }
+   if(UseWeeklySR && tradeDir == -1) {
+      if(g_PrevWeekLow < price && g_PrevWeekLow > price - lookAhead) resistCount++;
+      if(g_ThreeDayLow < price && g_ThreeDayLow > price - lookAhead) resistCount++;
+   }
+   softScore -= resistCount;  // each clustered level subtracts 1
+
+   // Decision: need softScore >= 3 to classify as SOFT
+   return (softScore >= 3) ? "SOFT" : "HARD";
+}
+
+//+------------------------------------------------------------------+
 //| FIBONACCI & PIVOT LEVELS ENGINE                                  |
 //+------------------------------------------------------------------+
 void CalcFibPivotLevels()
@@ -2357,6 +2538,14 @@ void CalcFibPivotLevels()
       g_Fib500 = fibH - 0.500 * span;   // = midpoint
       g_Fib618 = fibH - 0.618 * span;
       g_Fib764 = fibH - 0.764 * span;
+
+      // --- Fib EXTENSIONS: levels beyond the range (for TP targeting) ---
+      if(UseFibExtensions) {
+         g_FibExt1272  = fibH + 0.272 * span;   // 127.2% above high (buy target)
+         g_FibExt1618  = fibH + 0.618 * span;   // 161.8% above high (extended buy)
+         g_FibExt1272L = fibL - 0.272 * span;   // 127.2% below low (sell target)
+         g_FibExt1618L = fibL - 0.618 * span;   // 161.8% below low (extended sell)
+      }
    }
 
    // Draw lines if requested
@@ -2383,6 +2572,27 @@ string NearFibPivotLevel(double price)
       if(MathAbs(price - g_Fib500) <= zone) return "Fib 50.0%";
       if(MathAbs(price - g_Fib618) <= zone) return "Fib 61.8%";
       if(MathAbs(price - g_Fib764) <= zone) return "Fib 76.4%";
+   }
+   // Check Fibonacci extension levels
+   if(UseFibExtensions) {
+      if(g_FibExt1272  > 0 && MathAbs(price - g_FibExt1272)  <= zone) return "Fib 127.2%";
+      if(g_FibExt1618  > 0 && MathAbs(price - g_FibExt1618)  <= zone) return "Fib 161.8%";
+      if(g_FibExt1272L > 0 && MathAbs(price - g_FibExt1272L) <= zone) return "Fib 127.2%L";
+      if(g_FibExt1618L > 0 && MathAbs(price - g_FibExt1618L) <= zone) return "Fib 161.8%L";
+   }
+   // Check Murray Math octave levels
+   if(UseMurrayChannels && g_MurrayRange > 0) {
+      for(int mi = 0; mi <= 8; mi++) {
+         if(g_Murray[mi] > 0 && MathAbs(price - g_Murray[mi]) <= zone)
+            return "Murray " + IntegerToString(mi) + "/8";
+      }
+   }
+   // Check multi-day S/R
+   if(UseWeeklySR) {
+      if(g_PrevWeekHigh > 0 && MathAbs(price - g_PrevWeekHigh) <= zone) return "Wk High";
+      if(g_PrevWeekLow  > 0 && MathAbs(price - g_PrevWeekLow)  <= zone) return "Wk Low";
+      if(g_ThreeDayHigh > 0 && MathAbs(price - g_ThreeDayHigh) <= zone) return "3D High";
+      if(g_ThreeDayLow  > 0 && MathAbs(price - g_ThreeDayLow)  <= zone) return "3D Low";
    }
    return "";
 }
@@ -2877,10 +3087,10 @@ double FindNextTargetLevel(double entryPrice, int tradeDir)
    double bestDist = 99999;
    double minDist  = 5.0 * _Point * 10;  // at least 5 pips away
 
-   // Collect all known levels
+   // Collect all known levels — increased capacity for Murray + multi-day + Fib ext
    double levels[];
    int    cnt = 0;
-   ArrayResize(levels, 60);
+   ArrayResize(levels, 100);
 
    if(UseDailyPivot && g_PivotPP > 0) {
       levels[cnt++] = g_PivotPP;
@@ -2895,6 +3105,26 @@ double FindNextTargetLevel(double entryPrice, int tradeDir)
       levels[cnt++] = g_Fib500;
       levels[cnt++] = g_Fib618;
       levels[cnt++] = g_Fib764;
+   }
+   // Fib EXTENSIONS (beyond range — for trending markets)
+   if(UseFibExtensions) {
+      if(g_FibExt1272 > 0)  levels[cnt++] = g_FibExt1272;
+      if(g_FibExt1618 > 0)  levels[cnt++] = g_FibExt1618;
+      if(g_FibExt1272L > 0) levels[cnt++] = g_FibExt1272L;
+      if(g_FibExt1618L > 0) levels[cnt++] = g_FibExt1618L;
+   }
+   // Murray Math octave levels (channel S/R beyond intraday range)
+   if(UseMurrayChannels && g_MurrayRange > 0) {
+      for(int m = 0; m <= 8; m++) {
+         if(g_Murray[m] > 0) levels[cnt++] = g_Murray[m];
+      }
+   }
+   // Multi-day S/R (weekly, 3-day)
+   if(UseWeeklySR) {
+      if(g_PrevWeekHigh > 0) levels[cnt++] = g_PrevWeekHigh;
+      if(g_PrevWeekLow  > 0) levels[cnt++] = g_PrevWeekLow;
+      if(g_ThreeDayHigh > 0) levels[cnt++] = g_ThreeDayHigh;
+      if(g_ThreeDayLow  > 0) levels[cnt++] = g_ThreeDayLow;
    }
    // Range extremes
    if(g_RangeHigh > 0) levels[cnt++] = g_RangeHigh;
@@ -2915,6 +3145,9 @@ double FindNextTargetLevel(double entryPrice, int tradeDir)
    if(g_AsianLow  > 0) levels[cnt++] = g_AsianLow;
    if(g_LondonHigh > 0) levels[cnt++] = g_LondonHigh;
    if(g_LondonLow  > 0) levels[cnt++] = g_LondonLow;
+   // Previous day (additional reference for TP)
+   if(g_PrevDayHigh > 0) levels[cnt++] = g_PrevDayHigh;
+   if(g_PrevDayLow  > 0) levels[cnt++] = g_PrevDayLow;
    // Fair Value Gap edges (institutional imbalance = magnets)
    for(int f = 0; f < g_FVGCount; f++) {
       if(cnt >= ArraySize(levels) - 2) break;
@@ -3067,7 +3300,7 @@ void CheckMacroTrendRide()
       bool mtfDiv = !g_MTFAligned;
       bool volDiv = (UseVolumeAnalysis && g_VolDivergence);
       if(mtfDiv && volDiv) {
-         Print("[MACRO TREND RIDE] Blocked: MTF+Vol both diverged (score=", score, "/12)");
+         Print("[MACRO TREND RIDE] Blocked: MTF+Vol both diverged (score=", score, "/14)");
          return;
       }
    }
@@ -3077,7 +3310,7 @@ void CheckMacroTrendRide()
    g_MacroTrendScore = score;
    Print("[MACRO TREND RIDE] Armed: ", g_MacroStructLabel, " BOS",
          " HAConsec=", g_HAConsecCount,
-         " Score=", score, "/12",
+         " Score=", score, "/14",
          " Vol=", g_VolumeState,
          " MTF=", (g_MTFAligned ? "ALIGNED" : "diverged"),
          " dir=", (bosDir == 1 ? "BULL" : "BEAR"));
@@ -3140,7 +3373,7 @@ int CheckLevelBreakBars(int tradeDir)
 //+------------------------------------------------------------------+
 //| ZONE CONTEXT SCORE                                               |
 //| Evaluates structural confluence to decide whether a wrong-zone  |
-//| trend trade should be allowed (CONTEXT_AWARE mode). Returns 0-12|
+//| trend trade should be allowed (CONTEXT_AWARE mode). Returns 0-14|
 //| — higher = stronger evidence the trend should override the zone. |
 //+------------------------------------------------------------------+
 int ZoneContextScore(int tradeDir)
@@ -3178,7 +3411,23 @@ int ZoneContextScore(int tradeDir)
    // 11: Liquidity sweep in trade direction (stop hunt confirms directional intent)
    if(g_LiquiditySweep && g_SweepDir == tradeDir) score++;
 
-   return score;   // max 12
+   // 12: Multi-day S/R break (price already beyond weekly or 3-day boundary = strong trend)
+   double p = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   if(UseWeeklySR) {
+      if(tradeDir == 1 && g_PrevWeekHigh > 0 && p > g_PrevWeekHigh) score++;
+      if(tradeDir == -1 && g_PrevWeekLow > 0 && p < g_PrevWeekLow)  score++;
+   }
+
+   // 13: Murray channel room (next octave level >= 8 pips from price → run room)
+   if(UseMurrayChannels && g_MurrayRange > 0) {
+      for(int mi = 0; mi <= 8; mi++) {
+         if(g_Murray[mi] <= 0) continue;
+         double md = (tradeDir == 1) ? (g_Murray[mi] - p) : (p - g_Murray[mi]);
+         if(md >= 8.0 * _Point * 10) { score++; break; }
+      }
+   }
+
+   return score;   // max 14 (was 12, +2 for multi-day/Murray)
 }
 
 //+------------------------------------------------------------------+
@@ -3198,6 +3447,22 @@ double FibLevelPrice(string levelName)
    if(levelName == "Fib 50.0%") return g_Fib500;
    if(levelName == "Fib 61.8%") return g_Fib618;
    if(levelName == "Fib 76.4%") return g_Fib764;
+   // Fib extensions
+   if(levelName == "Fib 127.2%")  return g_FibExt1272;
+   if(levelName == "Fib 161.8%")  return g_FibExt1618;
+   if(levelName == "Fib 127.2%L") return g_FibExt1272L;
+   if(levelName == "Fib 161.8%L") return g_FibExt1618L;
+   // Multi-day S/R
+   if(levelName == "Wk High")  return g_PrevWeekHigh;
+   if(levelName == "Wk Low")   return g_PrevWeekLow;
+   if(levelName == "3D High")  return g_ThreeDayHigh;
+   if(levelName == "3D Low")   return g_ThreeDayLow;
+   // Murray Math
+   if(StringFind(levelName, "Murray ") == 0) {
+      string numStr = StringSubstr(levelName, 7, 1);
+      int idx = (int)StringToInteger(numStr);
+      if(idx >= 0 && idx <= 8 && g_Murray[idx] > 0) return g_Murray[idx];
+   }
    return 0;
 }
 
@@ -3648,6 +3913,8 @@ void EvaluateHAPattern()
    if((g_Signal == "PREPARING BUY" || g_Signal == "PREPARING SELL") && g_HAConsecCount >= 1) {
       int  trD      = (g_Signal == "PREPARING BUY") ? 1 : -1;
       bool isBuy    = (trD == 1);
+      // Recompute zone hardness for PREPARING diagnostic
+      g_ZoneHardness = ClassifyZoneHardness(trD, SymbolInfoDouble(_Symbol, SYMBOL_BID));
 
       // --- Recompute Bollinger gate status (mirrors state-machine logic above) ---
       double hpO1, hpH1, hpL1, hpC1, hpO2, hpH2, hpL2, hpC2;
@@ -3701,8 +3968,10 @@ void EvaluateHAPattern()
                            && !(g_PostTradeCoolUntil > 0 && TimeCurrent() < g_PostTradeCoolUntil)
                            && !(g_StartupGraceUntil > 0 && TimeCurrent() < g_StartupGraceUntil);
       bool hpTradeOpenOK = !g_TradeOpen;
-      bool hpZoneOK      = !(isBuy  && g_ZoneLabel == "UPPER_THIRD" && g_RangeHigh > 0) &&
-                           !(!isBuy && g_ZoneLabel == "LOWER_THIRD" && g_RangeLow  > 0);
+      // Zone check — SOFT zones do not block (boundaries expected to break)
+      bool hpZoneHard    = (g_ZoneHardness == "HARD");
+      bool hpZoneOK      = !(isBuy  && g_ZoneLabel == "UPPER_THIRD" && g_RangeHigh > 0 && hpZoneHard) &&
+                           !(!isBuy && g_ZoneLabel == "LOWER_THIRD" && g_RangeLow  > 0 && hpZoneHard);
 
       MqlDateTime hpDt; TimeToStruct(TimeCurrent(), hpDt);
       bool hpTimeOK = (NoEntryAfterHour == 0 || hpDt.hour < NoEntryAfterHour);
@@ -3717,7 +3986,7 @@ void EvaluateHAPattern()
       // --- Compose confirmed list ---
       string confirmed = "";
       confirmed += "  ✓ HA " + (isBuy ? "BULL" : "BEAR") + " x" + IntegerToString(g_HAConsecCount) + "/" + IntegerToString(MaxConsecCandles);
-      confirmed += " | Zone=" + g_ZoneLabel;
+      confirmed += " | Zone=" + g_ZoneLabel + "[" + g_ZoneHardness + "]";
       confirmed += " | Bias=" + IntegerToString(g_TotalBias) + (hpBiasOK ? " ok" : " [BLOCKED]");
       if(g_MTFAligned) confirmed += " | MTF=" + hpMTF;
       if(g_NearBullFVG || g_NearBearFVG) confirmed += " | H1FVG=" + (g_NearBullFVG ? "BULL" : "BEAR");
@@ -4333,6 +4602,14 @@ void TryEntry()
    else if(isMeanRev)      tradeDir = meanRevDir;
    else if(isMacroTrend)   tradeDir = g_MacroTrendDir;
 
+   // === ZONE HARDNESS (SOFT/HARD) ===
+   // Evaluate whether the zone boundary is expected to hold or break.
+   // Must be computed after tradeDir is known.
+   if(tradeDir != 0)
+      g_ZoneHardness = ClassifyZoneHardness(tradeDir, price);
+   else
+      g_ZoneHardness = "HARD";  // unknown direction → conservative
+
    // === ZONE FILTERS FOR TREND TRADES ===
    // Standard rule: avoid UPPER_THIRD for buys (near range high = mean-reversion risk)
    //                and LOWER_THIRD for sells (near range low = bounce risk).
@@ -4355,8 +4632,18 @@ void TryEntry()
       bool inAsian = (zdt.hour >= AsianStartHour && zdt.hour < AsianEndHour);
 
       // Determine whether we would normally block this trade (trending into unfavourable zone)
-      bool wouldBlock = (tradeDir == 1  && zone == "UPPER_THIRD" && g_RangeHigh > 0) ||
-                        (tradeDir == -1 && zone == "LOWER_THIRD" && g_RangeLow  > 0);
+      // SOFT zones are expected to break — do not block when g_ZoneHardness == "SOFT"
+      bool wouldBlock = ((tradeDir == 1  && zone == "UPPER_THIRD" && g_RangeHigh > 0) ||
+                         (tradeDir == -1 && zone == "LOWER_THIRD" && g_RangeLow  > 0))
+                        && (g_ZoneHardness == "HARD");  // SOFT boundary → no block
+
+      // If SOFT zone override applied, log it
+      if(g_ZoneHardness == "SOFT" && !wouldBlock &&
+         ((tradeDir == 1 && zone == "UPPER_THIRD") || (tradeDir == -1 && zone == "LOWER_THIRD"))) {
+         string _softMsg = "SOFT ZONE PASS: " + zone + " boundary expected to break"
+                         + " (Murray/weekly/struct confluence) — trade allowed";
+         if(_softMsg != g_LastBlockReason) { Print(_softMsg); g_LastBlockReason = _softMsg; }
+      }
 
       // Cancel stale pending state if direction flipped
       if(g_ZonePending && g_ZonePendingDir != tradeDir)
@@ -4413,7 +4700,7 @@ void TryEntry()
             if(ctxScore < ZoneContextMinScore) {
                // Not enough confluence to override the zone filter
                string _br = (tradeDir == 1 ? "BUY" : "SELL") + " skipped: " + zone +
-                            " zone [CONTEXT score=" + IntegerToString(ctxScore) + "/12, need " +
+                            " zone [CONTEXT score=" + IntegerToString(ctxScore) + "/14, need " +
                             IntegerToString(ZoneContextMinScore) + "+ for override]";
                if(_br != g_LastBlockReason) { Print(_br); g_LastBlockReason = _br; }
                g_ZonePending = false;
@@ -4460,7 +4747,7 @@ void TryEntry()
                                               : ("awaiting " + g_ZonePendingLevel + " breakout");
                   string _br = "ZONE PENDING: " + pndMsg + " (" + IntegerToString(barsSince) +
                                "/" + IntegerToString(ZonePendingMaxBars) +
-                               " bars, score=" + IntegerToString(ctxScore) + "/12)";
+                               " bars, score=" + IntegerToString(ctxScore) + "/14)";
                   if(_br != g_LastBlockReason) { Print(_br); g_LastBlockReason = _br; }
                   return;
                }
@@ -4471,7 +4758,7 @@ void TryEntry()
                g_ZonePendingLevel     = approachLvl;
                g_ZonePendingDir       = tradeDir;
                g_ZonePendingStartTime = TimeCurrent();
-               Print("ZONE PENDING SET: ", zone, " zone, score=", ctxScore, "/12",
+               Print("ZONE PENDING SET: ", zone, " zone, score=", ctxScore, "/14",
                      " — approaching ", approachLvl, " within ",
                      DoubleToString(ZonePendingPips, 1),
                      " pips; waiting for breakout + momentum before entry");
@@ -4479,7 +4766,7 @@ void TryEntry()
 
             } else {
                // ── No Fib barrier ahead, or price already at/past level — CAUTION entry ──
-               string ctx = "score=" + IntegerToString(ctxScore) + "/12"
+               string ctx = "score=" + IntegerToString(ctxScore) + "/14"
                            + (atLvl != "" ? " | at/past " + atLvl : " | no Fib barrier ahead");
                string _br = "ZONE CONTEXT OVERRIDE: " + zone + " — " + ctx + " — CAUTION entry";
                if(_br != g_LastBlockReason) { Print(_br); g_LastBlockReason = _br; }
@@ -4714,7 +5001,7 @@ void TryEntry()
       Print("[MACRO TREND RIDE] SL=$", DoubleToString(MacroTrendSL_USD,2),
             " TP=$", DoubleToString(baseTpUSD,2),
             htfTarget > 0 ? " HTFtarget=" + DoubleToString(htfTarget,5) : " (no HTF level, using cap)",
-            " Score=", g_MacroTrendScore, "/12");
+            " Score=", g_MacroTrendScore, "/14");
    }
 
    // === MTF / VOLUME DIVERGENCE BLOCK ===
@@ -5187,7 +5474,7 @@ void UpdateDashboard()
    color zoneClr = (g_ZoneLabel == "MID_ZONE") ? clrOrange :
                    (g_ZoneLabel == "UPPER_THIRD") ? clrTomato :
                    (g_ZoneLabel == "LOWER_THIRD") ? clrLime : clrGray;
-   DashLine("04b_zone",  "Zone    : " + g_ZoneLabel,                            cx, cy, row, lh, corner, zoneClr,       9); row++;
+   DashLine("04b_zone",  "Zone    : " + g_ZoneLabel + " [" + g_ZoneHardness + "]",   cx, cy, row, lh, corner, zoneClr,       9); row++;
    bool sw = IsSideways();
    DashLine("04c_sw",    "Sideways: " + (sw ? "YES (tight lock)" : "No"),       cx, cy, row, lh, corner, sw?clrOrange:clrGray, 9); row++;
 
@@ -5277,7 +5564,7 @@ void UpdateDashboard()
          color  rideClr = g_MacroTrendRide ? clrGold : clrDimGray;
          string rideStr = g_MacroTrendRide
                           ? (g_MacroTrendDir==1 ? "BULL RIDE" : "BEAR RIDE") +
-                            " ARMED  Score=" + IntegerToString(g_MacroTrendScore) + "/12"
+                            " ARMED  Score=" + IntegerToString(g_MacroTrendScore) + "/14"
                           : "trend ride: no setup";
          DashLine("10bo_ride", "TrendRide: " + rideStr,
                   cx, cy, row, lh, corner, rideClr, 9); row++;

@@ -1,10 +1,10 @@
 //+------------------------------------------------------------------+
-//|  EURUSD Heiken Ashi Range Bot v6.24a                             |
-//|  Live bar fast-track: pre-qualify all gates during PREPARING,   |
-//|  enter on forming bar when HA body + Bollinger already aligned   |
+//|  EURUSD Heiken Ashi Range Bot v6.25                              |
+//|  CHoCH direction-aware: reversal signals now track bull/bear dir, |
+//|  enable counter-trend entries with cautious TP, MacroBOS exemption|
 //+------------------------------------------------------------------+
 #property copyright   "EURUSD HA Range Bot"
-#property version     "6.24"
+#property version     "6.25"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -127,6 +127,7 @@ input double MinConfidence       = 35.0;   // Minimum confidence % to take a tra
 // taking a trade in the OPPOSITE direction is a high-risk counter-trend bet.
 // Default=true blocks it entirely so the bot does not fight a confirmed macro move.
 input bool   MacroBOSHardBlock   = true;   // Block trades against confirmed H4 MacroBOS direction
+input double CHoCHReversalTPScale = 0.65;   // TP multiplier for CHoCH reversal trades (counter-trend, cautious; 0=disabled)
 //
 // MTF / volume divergence caution: when H4 and H1 disagree (MTF not aligned) AND volume
 // is declining against the price trend simultaneously, both signals are weak — skip the trade.
@@ -307,6 +308,9 @@ datetime g_MacroBOSTime   = 0;                         // when Macro BOS was las
 datetime g_MacroCHoCHTime = 0;                         // when Macro CHoCH was last detected
 bool     g_MacroBOSActive  = false;                    // true while within persistence window
 bool     g_MacroCHoCHActive = false;                   // true while within persistence window
+int      g_CHoCHDir      = 0;                          // +1=bullish CHoCH (bearish→reversal up), -1=bearish CHoCH, 0=inactive
+int      g_MacroCHoCHDir = 0;                          // +1=bullish macro CHoCH, -1=bearish macro CHoCH, 0=inactive
+bool     g_IsCHoCHReversal = false;                    // true when current trade is a CHoCH-driven counter-trend reversal
 bool   g_MTFAligned = false;   // true when macro (H4) and intermediate (H1) agree on direction
 bool   g_BoldBet    = false;   // true when MTF aligned + FVG or OB present + HA valid
 bool   g_BollOverridden     = false;  // true when Bollinger gate was bypassed by confluence override
@@ -1239,8 +1243,10 @@ void DetectSwingStructure()
    datetime h1BarTime = iTime(_Symbol, PERIOD_H1, 0);
    if(g_BOSTime > 0 && h1BarTime - g_BOSTime > g_BOSPersistBars * PeriodSeconds(PERIOD_H1))
       g_BOSActive = false;
-   if(g_CHoCHTime > 0 && h1BarTime - g_CHoCHTime > g_BOSPersistBars * PeriodSeconds(PERIOD_H1))
+   if(g_CHoCHTime > 0 && h1BarTime - g_CHoCHTime > g_BOSPersistBars * PeriodSeconds(PERIOD_H1)) {
       g_CHoCHActive = false;
+      g_CHoCHDir = 0;   // direction expires with the CHoCH event
+   }
 
    // Fresh detection this tick (may re-trigger or upgrade)
    bool freshBOS   = false;
@@ -1265,18 +1271,18 @@ void DetectSwingStructure()
       if(g_StructureLabel == "BULLISH" && bid > g_SwingHigh1) freshBOS = true;
       if(g_StructureLabel == "BEARISH" && bid < g_SwingLow1)  freshBOS = true;
 
-      // --- Classic CHoCH: HH/HL ↔ LH/LL pattern flip ---
-      if(prevStructure == "BULLISH"  && g_StructureLabel == "BEARISH") freshCHoCH = true;
-      if(prevStructure == "BEARISH"  && g_StructureLabel == "BULLISH") freshCHoCH = true;
+      // --- Classic CHoCH: HH/HL ↔ LH/LL pattern flip (with direction) ---
+      if(prevStructure == "BULLISH"  && g_StructureLabel == "BEARISH") { freshCHoCH = true; g_CHoCHDir = -1; }  // bearish reversal
+      if(prevStructure == "BEARISH"  && g_StructureLabel == "BULLISH") { freshCHoCH = true; g_CHoCHDir =  1; }  // bullish reversal
 
       // --- Price-break CHoCH (ICT concept): price breaks a swing in the OPPOSITE
       //     direction to the previous trend, confirming the character change.
       //     Bearish trend: price breaks above the most recent Lower High = bull CHoCH
       //     Bullish trend: price breaks below the most recent Higher Low = bear CHoCH
       if(prevStructure == "BEARISH" && shCount >= 1 && bid > g_SwingHigh1)
-         freshCHoCH = true;   // was bearish, now breaking above swing high
+         { freshCHoCH = true; g_CHoCHDir =  1; }   // bullish reversal: breaking above swing high
       if(prevStructure == "BULLISH" && slCount >= 1 && bid < g_SwingLow1)
-         freshCHoCH = true;   // was bullish, now breaking below swing low
+         { freshCHoCH = true; g_CHoCHDir = -1; }   // bearish reversal: breaking below swing low
    }
 
    // --- Apply persistence: fresh events set timestamp + activate ---
@@ -1348,8 +1354,10 @@ void DetectMacroStructure()
    int macroPersistBars = 2;   // persist for 2 H4 bars (~8h)
    if(g_MacroBOSTime > 0 && h4BarTime - g_MacroBOSTime > macroPersistBars * PeriodSeconds(MacroStructTF))
       g_MacroBOSActive = false;
-   if(g_MacroCHoCHTime > 0 && h4BarTime - g_MacroCHoCHTime > macroPersistBars * PeriodSeconds(MacroStructTF))
+   if(g_MacroCHoCHTime > 0 && h4BarTime - g_MacroCHoCHTime > macroPersistBars * PeriodSeconds(MacroStructTF)) {
       g_MacroCHoCHActive = false;
+      g_MacroCHoCHDir = 0;   // direction expires with the macro CHoCH event
+   }
 
    bool freshMacroBOS   = false;
    bool freshMacroCHoCH = false;
@@ -1371,15 +1379,15 @@ void DetectMacroStructure()
       if(g_MacroStructLabel == "BULLISH" && bid > g_MacroSwingHigh1) freshMacroBOS = true;
       if(g_MacroStructLabel == "BEARISH" && bid < g_MacroSwingLow1)  freshMacroBOS = true;
 
-      // Classic CHoCH: pattern flip
-      if(prevMacro == "BULLISH" && g_MacroStructLabel == "BEARISH") freshMacroCHoCH = true;
-      if(prevMacro == "BEARISH" && g_MacroStructLabel == "BULLISH") freshMacroCHoCH = true;
+      // Classic CHoCH: pattern flip (with direction)
+      if(prevMacro == "BULLISH" && g_MacroStructLabel == "BEARISH") { freshMacroCHoCH = true; g_MacroCHoCHDir = -1; }  // bearish reversal
+      if(prevMacro == "BEARISH" && g_MacroStructLabel == "BULLISH") { freshMacroCHoCH = true; g_MacroCHoCHDir =  1; }  // bullish reversal
 
-      // Price-break CHoCH on macro TF
+      // Price-break CHoCH on macro TF (with direction)
       if(prevMacro == "BEARISH" && shCount >= 1 && bid > g_MacroSwingHigh1)
-         freshMacroCHoCH = true;
+         { freshMacroCHoCH = true; g_MacroCHoCHDir =  1; }   // bullish reversal
       if(prevMacro == "BULLISH" && slCount >= 1 && bid < g_MacroSwingLow1)
-         freshMacroCHoCH = true;
+         { freshMacroCHoCH = true; g_MacroCHoCHDir = -1; }   // bearish reversal
    }
 
    // Apply persistence
@@ -1410,6 +1418,7 @@ void DetectMacroStructure()
          " MTF:",    (g_MTFAligned ? "ALIGNED" : "diverged"),
          " BoldBet:", (g_BoldBet ? "YES" : "no"),
          " MacroBOS:", g_MacroBOS, " MacroCHoCH:", g_MacroCHoCH,
+         " CHoCHDir:", (g_MacroCHoCHDir > 0 ? "Bull" : (g_MacroCHoCHDir < 0 ? "Bear" : "none")),
          " MacroSH=", DoubleToString(g_MacroSwingHigh1,5),
          " MacroSL=", DoubleToString(g_MacroSwingLow1,5));
 }
@@ -2508,9 +2517,14 @@ double CalcConfidence(int tradeDir, string zone, bool isMeanRev, bool isSideways
       // Counter-structure penalty
       if(g_StructureLabel == "BULLISH" && tradeDir == -1)  conf -= 5.0;
       if(g_StructureLabel == "BEARISH" && tradeDir == 1)   conf -= 5.0;
-      // BOS = strong continuation, CHoCH = reversal confirmed
+      // BOS = strong continuation
       if(g_BOS && structAligned)   conf += 5.0;
-      if(g_CHoCH && structAligned) conf += 3.0;
+      // CHoCH = reversal signal — direction-aware scoring:
+      // Boost trades aligned with the reversal, penalise trades going with the dying trend
+      if(g_CHoCH && g_CHoCHDir != 0) {
+         if(g_CHoCHDir == tradeDir)  conf += 4.0;   // WITH reversal
+         if(g_CHoCHDir == -tradeDir) conf -= 4.0;   // AGAINST reversal
+      }
    }
    g_ConfBreakdown += " Struct:" + DoubleToString(conf - prevConf, 0); prevConf = conf;
 
@@ -2670,8 +2684,12 @@ double CalcConfidence(int tradeDir, string zone, bool isMeanRev, bool isSideways
       }
       // Macro BOS in trade direction = recent structural break confirming continuation
       if(g_MacroBOS && macroAlignedWithTrade) mtfBonus += 2.0;
-      // Macro CHoCH that just switched to trade direction = fresh reversal confirmed on H4
-      if(g_MacroCHoCH && macroAlignedWithTrade) mtfBonus += 3.0;
+      // Macro CHoCH = reversal signal on H4 — direction-aware scoring:
+      // Boost trades aligned with the macro reversal, penalise trades going with the dying macro trend
+      if(g_MacroCHoCH && g_MacroCHoCHDir != 0) {
+         if(g_MacroCHoCHDir == tradeDir)  mtfBonus += 4.0;   // WITH macro reversal
+         if(g_MacroCHoCHDir == -tradeDir) mtfBonus -= 4.0;   // AGAINST macro reversal
+      }
       conf += mtfBonus;
    }
    g_ConfBreakdown += " MTF:" + DoubleToString(conf - prevConf, 0); prevConf = conf;
@@ -3719,9 +3737,13 @@ void EvaluateHAPattern()
       if(g_MacroBOS && UseMacroStructure) {
          bool macroOpp = (trD ==  1 && g_MacroStructLabel == "BEARISH") ||
                          (trD == -1 && g_MacroStructLabel == "BULLISH");
-         if(macroOpp && MacroBOSHardBlock)
-            confirmed += " | ❌MacroBOS=" + g_MacroStructLabel + " — will BLOCK entry";
-         else if(macroOpp)
+         if(macroOpp && MacroBOSHardBlock) {
+            bool _chochEx = g_MacroCHoCH && (g_MacroCHoCHDir == trD);
+            if(_chochEx)
+               confirmed += " | ⚡MacroBOS=" + g_MacroStructLabel + " — CHoCH reversal (" + (g_MacroCHoCHDir>0?"Bull":"Bear") + ") exempts block";
+            else
+               confirmed += " | ❌MacroBOS=" + g_MacroStructLabel + " — will BLOCK entry";
+         } else if(macroOpp)
             confirmed += " | ⚠️MacroBOS=" + g_MacroStructLabel + " opposes (block disabled)";
       }
       // MTF / volume divergence flag
@@ -3783,9 +3805,11 @@ void EvaluateHAPattern()
       // === CACHE PRE-FLIGHT RESULT for live bar fast-track ===
       // If ALL downstream gates are already green while PREPARING, the next HA candle
       // that aligns (even live/forming) can trigger an immediate entry.
-      bool macroBOSBlockPF = g_MacroBOS && UseMacroStructure && MacroBOSHardBlock &&
-                             ((isBuy  && g_MacroStructLabel == "BEARISH") ||
-                              (!isBuy && g_MacroStructLabel == "BULLISH"));
+      bool _macroBOSRawPF  = g_MacroBOS && UseMacroStructure && MacroBOSHardBlock &&
+                              ((isBuy  && g_MacroStructLabel == "BEARISH") ||
+                               (!isBuy && g_MacroStructLabel == "BULLISH"));
+      bool _chochExmptPF   = g_MacroCHoCH && (g_MacroCHoCHDir == (isBuy ? 1 : -1));
+      bool macroBOSBlockPF = _macroBOSRawPF && !_chochExmptPF;
       bool allDownGatesOK = hpZoneOK && hpBiasOK && hpConfOK && hpTimeOK &&
                             hpCooldownOK && hpForeignOK && hpDailyOK && hpDailyLossOK &&
                             !macroBOSBlockPF && !g_TradeOpen;
@@ -4543,13 +4567,21 @@ void TryEntry()
       bool macroOpposes = (tradeDir ==  1 && g_MacroStructLabel == "BEARISH") ||
                           (tradeDir == -1 && g_MacroStructLabel == "BULLISH");
       if(macroOpposes) {
-         string _br = "TRADE BLOCKED: MacroBOS=" + g_MacroStructLabel +
-                      " — refusing " + (tradeDir == 1 ? "BUY" : "SELL") + " counter-macro trade";
-         if(_br != g_LastBlockReason) {
-            Print(_br, " (H4 structure confirmed). Set MacroBOSHardBlock=false to override.");
-            g_LastBlockReason = _br;
+         // CHoCH exemption: if macro CHoCH points in the trade direction,
+         // the BOS is being challenged — allow a cautious reversal entry
+         bool _chochExempt = (g_MacroCHoCH && g_MacroCHoCHDir == tradeDir);
+         if(!_chochExempt) {
+            string _br = "TRADE BLOCKED: MacroBOS=" + g_MacroStructLabel +
+                         " — refusing " + (tradeDir == 1 ? "BUY" : "SELL") + " counter-macro trade";
+            if(_br != g_LastBlockReason) {
+               Print(_br, " (H4 structure confirmed). Set MacroBOSHardBlock=false to override.");
+               g_LastBlockReason = _br;
+            }
+            return;
          }
-         return;
+         Print("[CHoCH OVERRIDE] MacroBOS=", g_MacroStructLabel, " would block ",
+               (tradeDir == 1 ? "BUY" : "SELL"),
+               " but MacroCHoCH(dir=", g_MacroCHoCHDir, ") grants exemption — proceeding cautiously");
       }
    }
 
@@ -4596,6 +4628,28 @@ void TryEntry()
          Print("TP EXTENDED to structural level: $", DoubleToString(targetUSD, 2),
                " (at ", DoubleToString(targetLvl, 5), ", ", DoubleToString(targetPips, 1), " pips)");
          baseTpUSD = targetUSD;
+         g_DynamicTP_USD = baseTpUSD;
+      }
+   }
+
+   // === CHoCH REVERSAL TP REDUCTION ===
+   // When trading WITH a CHoCH reversal signal but AGAINST the established macro/H1 trend,
+   // scale back TP for a cautious quick-profit target — this is a counter-trend bet.
+   g_IsCHoCHReversal = false;
+   if(CHoCHReversalTPScale > 0 && CHoCHReversalTPScale < 1.0) {
+      bool _macroOpposesTrade = (tradeDir == 1 && g_MacroStructLabel != "BULLISH") ||
+                                (tradeDir == -1 && g_MacroStructLabel != "BEARISH");
+      bool _macroCHoCHAligned = (g_MacroCHoCH && g_MacroCHoCHDir == tradeDir);
+      bool _h1CHoCHAligned    = (g_CHoCH && g_CHoCHDir == tradeDir);
+      if((_macroCHoCHAligned || _h1CHoCHAligned) && _macroOpposesTrade) {
+         g_IsCHoCHReversal = true;
+         double chochTP = baseTpUSD * CHoCHReversalTPScale;
+         chochTP = MathMax(chochTP, g_DynamicSL_USD * 1.0);   // floor: at least 1:1 R:R
+         Print("[CHoCH REVERSAL TP] $", DoubleToString(baseTpUSD,2),
+               " → $", DoubleToString(chochTP,2),
+               " (scale=", DoubleToString(CHoCHReversalTPScale*100,0), "%",
+               _macroCHoCHAligned ? " MacroCHoCH" : "", _h1CHoCHAligned ? " H1CHoCH" : "", ")");
+         baseTpUSD = chochTP;
          g_DynamicTP_USD = baseTpUSD;
       }
    }

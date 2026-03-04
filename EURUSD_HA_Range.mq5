@@ -2404,7 +2404,7 @@ void ComputeMultiDaySR()
          g_PrevWeekLow  = wkL;
       }
       // --- Rolling 3-day H/L: D1[0], D1[1], D1[2] ---
-      double dH[3], dL[3];
+      double dH[], dL[];
       ArraySetAsSeries(dH, true);
       ArraySetAsSeries(dL, true);
       int ch = CopyHigh(_Symbol, PERIOD_D1, 0, 3, dH);

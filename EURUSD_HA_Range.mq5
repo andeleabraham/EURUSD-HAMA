@@ -1,10 +1,10 @@
 //+------------------------------------------------------------------+
-//|  EURUSD Heiken Ashi Range Bot v6.27c                             |
-//|  Reverted v6.26a H1 structure changes that caused late entries   |
+//|  EURUSD Heiken Ashi Range Bot v6.28                              |
+//|  Fixed ADAPTIVE/CHRONO early-cut + Smart loss exit + Comeback    |
 //|  STANDARD / SENTINEL / MOMENTUM / ADAPTIVE / HARVESTER / CHRONO |
 //+------------------------------------------------------------------+
 #property copyright   "EURUSD HA Range Bot"
-#property version     "6.27c"
+#property version     "6.28"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -39,6 +39,14 @@ input double TrailPct         = 0.30;   // Trail gap = 30% of TP — generous ro
 //   4 = HARVESTER — profit-tier slasher. Closes at $1/$1.50/$2 (per 0.01 lot) based on context.
 //   5 = CHRONO   — session-aware hybrid. Slashes in quiet sessions, rides in active ones.
 input int    TradeMgmtMode    = 3;      // 0-5: STD|SENT|MOM|ADAPT|HARVEST|CHRONO
+// Pause new-trade scanning while bot has an open trade.
+// true = focus entirely on managing the open trade (default, recommended).
+// false = continue scanning/arming signals even while a trade is running.
+// Note: foreign-only trades do NOT trigger the pause — bot can still arm.
+input bool   PauseScanInTrade = true;    // Pause signal scanning while bot trade open
+// Smart loss exit: close losing trades early when structure shifts against them.
+// 0 = OFF, 1 = ADAPTIVE+CHRONO+HARVESTER only (default), 2 = ALL modes
+input int    LossStructExit   = 1;      // 0=OFF | 1=ADAPT/CHRONO/HARVEST | 2=ALL
 // Mid-range time-exit: close if stalling in LOSS after MidRangeMaxBars
 input double MidRangeStallUSD = 0.00;   // Stall exit disabled — trust the SL/TP
 input int    MidRangeMaxBars  = 16;     // Bars before mid-range stall check (only if MidRangeStallUSD > 0)
@@ -266,6 +274,7 @@ bool   g_EarlyLockEngaged = false;   // SENTINEL/ADAPTIVE: early lock level has 
 int    g_StructShiftCount = 0;       // times H1 structure changed direction during trade
 string g_LastMgmtAction   = "";      // last management action label (for dashboard/log)
 string g_TradeMgmtModeName = "STANDARD"; // resolved mode name
+string g_ComebackLabel     = "";       // comeback potential label for dashboard (HIGH/MODERATE/LOW)
 
 int    g_TotalBias    = 0;
 
@@ -782,11 +791,19 @@ void OnTick()
       // --- FVG H1+H4 overlap confluence detection ---
       DetectFVGOverlap();
 
-      EvaluateHAPattern();
-      CheckMacroTrendRide();   // must run after EvaluateHAPattern (uses g_HAConsecCount, g_MacroBOS, etc.)
+      // --- Signal scanning: skip when bot has open trade and PauseScanInTrade ---
+      // Structure detection above ALWAYS runs (needed for trade management + comeback).
+      // Only HA pattern evaluation and macro trend ride arming are paused.
+      if(!(PauseScanInTrade && g_TradeOpen)) {
+         EvaluateHAPattern();
+         CheckMacroTrendRide();   // must run after EvaluateHAPattern (uses g_HAConsecCount, g_MacroBOS, etc.)
+      }
    }
 
-   // Fire TryEntry when trend signal active, mean reversion qualifies, OR macro trend ride armed
+   // Fire TryEntry when trend signal active, mean reversion qualifies, OR macro trend ride armed.
+   // When PauseScanInTrade is on and bot has a trade, the signal scanning above was already
+   // skipped, so g_Signal stays WAITING and TryEntry() won't fire. The !g_TradeOpen guard
+   // is the ultimate safety net regardless.
    if(!g_TradeOpen) {
       // === LIVE BAR FAST-TRACK ===
       // When PREPARING and all downstream gates are already green (pre-flight), monitor
@@ -5210,6 +5227,7 @@ void ResetTradeGlobals(double closePnL)
    g_EarlyLockEngaged = false;
    g_StructShiftCount = 0;
    g_LastMgmtAction   = "";
+   g_ComebackLabel    = "";
 }
 
 //+------------------------------------------------------------------+
@@ -5319,6 +5337,86 @@ void ManageOpenTrade()
       if(profit < 0) {
          Print("MAX HOLD exit after ", g_OpenBarCount, "/", MaxHoldBars,
                " bars (IN LOSS) | profit=$", DoubleToString(profit,2));
+         trade.PositionClose(posInfo.Ticket());
+         ResetTradeGlobals(profit);
+         return;
+      }
+   }
+
+   // === COMEBACK POTENTIAL ASSESSMENT (always updated when trade is open) ===
+   // Evaluates how likely a losing trade is to recover, based on structure.
+   // Also used by the smart-loss-exit system below.
+   bool lse_structWith    = false;
+   bool lse_structAgainst = false;
+   bool lse_macroAligned  = (g_TradeDir == 1 && g_MacroStructLabel == "BULLISH") ||
+                            (g_TradeDir == -1 && g_MacroStructLabel == "BEARISH");
+   bool lse_macroCHoCH    = (g_MacroCHoCH && g_MacroCHoCHDir != 0 && g_MacroCHoCHDir != g_TradeDir);
+   bool lse_h1CHoCHAgainst = (g_CHoCHActive && g_CHoCHDir != 0 && g_CHoCHDir != g_TradeDir);
+
+   if(g_BOSActive) {
+      if((g_TradeDir == 1 && g_StructureLabel == "BULLISH") ||
+         (g_TradeDir == -1 && g_StructureLabel == "BEARISH"))
+         lse_structWith = true;
+      if((g_TradeDir == 1 && g_StructureLabel == "BEARISH") ||
+         (g_TradeDir == -1 && g_StructureLabel == "BULLISH"))
+         lse_structAgainst = true;
+   }
+
+   // M15 short-term momentum: are recent bars moving with or against the trade?
+   double m15Close1 = iClose(_Symbol, PERIOD_M15, 1);
+   double m15Close3 = iClose(_Symbol, PERIOD_M15, 3);
+   int    m15Dir    = (m15Close1 > m15Close3) ? 1 : (m15Close1 < m15Close3) ? -1 : 0;
+   bool   m15With   = (m15Dir == g_TradeDir);
+   bool   m15Against = (m15Dir != 0 && m15Dir != g_TradeDir);
+
+   // Score: +points for support, -points for opposition
+   int comebackScore = 0;
+   if(lse_structWith)       comebackScore += 3;   // H1 BOS with trade
+   if(lse_macroAligned)     comebackScore += 2;   // H4 macro aligned
+   if(m15With)              comebackScore += 1;   // M15 short-term momentum with trade
+   if(lse_structAgainst)    comebackScore -= 3;   // H1 BOS against
+   if(lse_h1CHoCHAgainst)   comebackScore -= 2;   // H1 CHoCH against
+   if(lse_macroCHoCH)       comebackScore -= 3;   // H4 macro CHoCH against
+   if(m15Against)           comebackScore -= 1;   // M15 momentum against
+   if(g_StructShiftCount >= 2) comebackScore -= 1; // multiple shifts = unstable
+
+   // Label for dashboard
+   if(profit < 0) {
+      if(comebackScore >= 3)       g_ComebackLabel = "HIGH";
+      else if(comebackScore >= 0)  g_ComebackLabel = "MODERATE";
+      else                         g_ComebackLabel = "LOW";
+   } else {
+      g_ComebackLabel = "";  // only show when in loss
+   }
+
+   // === SMART LOSS EXIT — structure-informed early loss cutting ===
+   // When the trade is in loss AND structure has definitively shifted against,
+   // close early instead of waiting for full SL. This is NOT panic — it requires
+   // confirmed structural evidence (H1 CHoCH or BOS against + macro confirmation).
+   // LossStructExit: 0=OFF, 1=modes 3/4/5 only, 2=all modes
+   bool lseApplies = (LossStructExit == 2) ||
+                     (LossStructExit == 1 && (mode == 3 || mode == 4 || mode == 5));
+
+   if(lseApplies && profit < 0 && g_OpenBarCount >= 4) {
+      // Require strong evidence: comeback score deep negative + multiple confirming signals
+      // This is conservative — NOT panic-closing on tiny dips
+      bool structConfirmedAgainst = lse_structAgainst || lse_h1CHoCHAgainst;
+      bool multipleEvidence = (lse_structAgainst && lse_macroCHoCH) ||
+                              (lse_h1CHoCHAgainst && lse_macroCHoCH) ||
+                              (lse_h1CHoCHAgainst && m15Against && g_StructShiftCount >= 2);
+
+      // Only cut if: struct confirmed against + macro confirms + trade has been losing for 6+ bars
+      // AND loss has exceeded 30% of SL (not a tiny dip)
+      double lossThreshold = -(g_ScaledSLUSD * 0.30);
+      if(structConfirmedAgainst && multipleEvidence && profit < lossThreshold && g_OpenBarCount >= 6) {
+         g_LastMgmtAction = "SMART_LOSS_EXIT";
+         Print("[SMART_LOSS] Structure shifted against trade with multi-TF confirmation",
+               " | profit=$", DoubleToString(profit, 2),
+               " | comeback=", g_ComebackLabel,
+               " | H1:", (lse_structAgainst ? "BOS_AGT" : ""), (lse_h1CHoCHAgainst ? "+CHoCH_AGT" : ""),
+               " | Macro:", (lse_macroCHoCH ? "CHoCH_AGT" : lse_macroAligned ? "ALIGNED" : "NEUTRAL"),
+               " | M15:", (m15Against ? "AGAINST" : m15With ? "WITH" : "FLAT"),
+               " | Shifts:", g_StructShiftCount);
          trade.PositionClose(posInfo.Ticket());
          ResetTradeGlobals(profit);
          return;
@@ -5475,45 +5573,32 @@ void ManageOpenTrade()
 
    } else if(mode == 3) {
       // === MODE 3: ADAPTIVE (full smart) ===
+      // Entries travel $1-2+ per 0.01 lot. Give them room to mature.
+      // Dwindling/trail only activates AFTER profit has reached $1.00 per 0.01 lot.
+      // Structure exits remain but require meaningful profit first.
+      //
       // Graduated protection with three tiers:
-      //   Tier 1: Early protection at 35% of TP with a medium trail
+      //   Tier 1: Early protection at max(35% TP, $1.00/0.01lot) — patient floor
       //   Tier 2: Standard lock at LockPct of TP with structure-adjusted trail
       //   Tier 3: Extended run when profit > TP and structure supports it
-      //
-      // Dwindling detection: if profit reached significant peak but has been
-      // oscillating/declining for many bars, accept the trade has stalled.
-      //
-      // Structure exits: H1 BOS/CHoCH during trade dynamically adjusts protection.
 
-      double earlyLockUSD = g_DynamicTP_USD * 0.35 * scale;   // Tier 1: 35% of TP
-      double stdLockUSD   = g_ScaledLockUSD;                   // Tier 2: standard LockPct
-      double tpUSD        = g_ScaledTPUSD;                     // full TP for reference
+      double minFloorUSD  = 1.00 * scale;                                       // $1.00 per 0.01 lot floor
+      double earlyLockUSD = MathMax(g_DynamicTP_USD * 0.35 * scale, minFloorUSD); // Tier 1: at least $1.00
+      double stdLockUSD   = g_ScaledLockUSD;                                      // Tier 2: standard LockPct
+      double tpUSD        = g_ScaledTPUSD;                                        // full TP for reference
 
-      // --- Structural assessment ---
-      bool structWith    = false;
-      bool structAgainst = false;
-      bool macroAligned  = (g_TradeDir == 1 && g_MacroStructLabel == "BULLISH") ||
-                           (g_TradeDir == -1 && g_MacroStructLabel == "BEARISH");
+      // --- Structural assessment (reuse shared lse_ variables) ---
+      bool structWith    = lse_structWith;
+      bool structAgainst = lse_structAgainst;
+      bool macroAligned  = lse_macroAligned;
+      bool macroCHoCHAgainst = lse_macroCHoCH;
 
-      if(g_BOSActive) {
-         if((g_TradeDir == 1 && g_StructureLabel == "BULLISH") ||
-            (g_TradeDir == -1 && g_StructureLabel == "BEARISH"))
-            structWith = true;
-         if((g_TradeDir == 1 && g_StructureLabel == "BEARISH") ||
-            (g_TradeDir == -1 && g_StructureLabel == "BULLISH"))
-            structAgainst = true;
-      }
-      if(g_CHoCHActive && g_CHoCHDir != 0 && g_CHoCHDir != g_TradeDir)
-         structAgainst = true;
-      // Macro CHoCH against trade = high-confidence reversal signal
-      bool macroCHoCHAgainst = (g_MacroCHoCH && g_MacroCHoCHDir != 0 && g_MacroCHoCHDir != g_TradeDir);
-
-      // --- Tier 1: Early protection ---
+      // --- Tier 1: Early protection (only after $1.00+ floor) ---
       if(!g_EarlyLockEngaged && profit >= earlyLockUSD) {
          g_EarlyLockEngaged = true;
          g_LastMgmtAction = "ADAPT_EARLY@" + DoubleToString(profit,2);
          Print("[ADAPTIVE] TIER1 EARLY LOCK at $", DoubleToString(profit,2),
-               " (35% of TP=$", DoubleToString(earlyLockUSD,2), ")");
+               " (floor=$", DoubleToString(earlyLockUSD,2), ")");
       }
       // --- Tier 2: Standard lock ---
       if(!g_ProfitLocked && profit >= stdLockUSD) {
@@ -5523,38 +5608,34 @@ void ManageOpenTrade()
       }
 
       // --- Calculate adaptive trail width ---
-      // Base: 25% of TP. Adjusted by structure:
-      //   +aligned BOS & macro: 40% (give room to run)
-      //   +aligned BOS only:    30%
-      //   +struct against:      12% (protect fast)
-      //   +macro CHoCH against: 10% (high-urgency protect)
-      //   +profit > TP:         45% (running hot — let it extend)
+      // Only meaningful after early lock is engaged (profit >= $1.00+ floor).
+      // Before that, let the trade breathe — no trail at all.
       double adaptiveTrail;
-      if(macroCHoCHAgainst)                    adaptiveTrail = g_DynamicTP_USD * 0.10 * scale;
-      else if(structAgainst)                   adaptiveTrail = g_DynamicTP_USD * 0.12 * scale;
-      else if(profit >= tpUSD && structWith)   adaptiveTrail = g_DynamicTP_USD * 0.45 * scale;
-      else if(structWith && macroAligned)       adaptiveTrail = g_DynamicTP_USD * 0.40 * scale;
-      else if(structWith)                      adaptiveTrail = g_DynamicTP_USD * 0.30 * scale;
-      else                                     adaptiveTrail = g_DynamicTP_USD * 0.25 * scale;
+      if(macroCHoCHAgainst)                    adaptiveTrail = g_DynamicTP_USD * 0.15 * scale;
+      else if(structAgainst)                   adaptiveTrail = g_DynamicTP_USD * 0.18 * scale;
+      else if(profit >= tpUSD && structWith)   adaptiveTrail = g_DynamicTP_USD * 0.50 * scale;
+      else if(structWith && macroAligned)       adaptiveTrail = g_DynamicTP_USD * 0.45 * scale;
+      else if(structWith)                      adaptiveTrail = g_DynamicTP_USD * 0.35 * scale;
+      else                                     adaptiveTrail = g_DynamicTP_USD * 0.30 * scale;
 
-      // --- Dwindling detection ---
-      // If: (a) reached meaningful profit (>35% of TP),
-      //     (b) profit declined to <50% of peak for >10 bars,
-      //     (c) not currently ripping to new highs → trade has stalled, cut it
+      // --- Dwindling detection (only after peak >= $1.00 per 0.01 lot) ---
+      // Entries travel $1-2+, so we only consider dwindling AFTER that range.
       bool dwindling = false;
-      if(g_EarlyLockEngaged && g_PeakProfit > earlyLockUSD && profit > 0) {
-         if(g_BarsSincePeak >= 10 && profit < g_PeakProfit * 0.50) {
+      if(g_EarlyLockEngaged && g_PeakProfit >= minFloorUSD && profit > 0) {
+         // Profit fell below 45% of peak for 14+ bars = stalled
+         if(g_BarsSincePeak >= 14 && profit < g_PeakProfit * 0.45) {
             dwindling = true;
          }
-         // Extended dwindling: if >20 bars since peak and below 70% of peak
-         if(g_BarsSincePeak >= 20 && profit < g_PeakProfit * 0.70) {
+         // Extended dwindling: 24+ bars and below 65% of peak
+         if(g_BarsSincePeak >= 24 && profit < g_PeakProfit * 0.65) {
             dwindling = true;
          }
       }
 
-      // --- Structure-accelerated exit ---
-      // If structure both CHoCH'd against trade AND profit is declining → urgent cut
-      bool structUrgent = structAgainst && g_EarlyLockEngaged && profit < g_PeakProfit * 0.65;
+      // --- Structure-accelerated exit (only after meaningful profit) ---
+      // Only fires if we HAD $1.00+ profit — don't urgently exit a trade that never ran
+      bool structUrgent = structAgainst && g_EarlyLockEngaged &&
+                          g_PeakProfit >= minFloorUSD && profit < g_PeakProfit * 0.55;
 
       // --- Execute dwindling or structure-urgent exit ---
       if(dwindling || structUrgent) {
@@ -5564,36 +5645,34 @@ void ManageOpenTrade()
                " now=$", DoubleToString(profit,2),
                " bars_since_peak=", g_BarsSincePeak,
                " struct:", (structWith ? "WITH" : structAgainst ? "AGAINST" : "NEUTRAL"),
-               " macro:", (macroAligned ? "ALIGNED" : macroCHoCHAgainst ? "CHoCH_AGAINST" : "—"));
+               " macro:", (macroAligned ? "ALIGNED" : macroCHoCHAgainst ? "CHoCH_AGAINST" : "---"));
          trade.PositionClose(posInfo.Ticket());
          ResetTradeGlobals(profit);
          return;
       }
 
-      // --- Trailing close (applies after early lock or standard lock) ---
-      if(g_EarlyLockEngaged || g_ProfitLocked) {
-         if(profit < g_PeakProfit - adaptiveTrail && profit > 0) {
-            g_LastMgmtAction = "ADAPT_TRAIL";
-            Print("[ADAPTIVE] TRAIL CLOSE: peak=$", DoubleToString(g_PeakProfit,2),
-                  " now=$", DoubleToString(profit,2),
-                  " trail=$", DoubleToString(adaptiveTrail,2),
-                  " struct:", (structWith ? "WITH" : structAgainst ? "AGAINST" : "NEUTRAL"),
-                  " tier:", (g_ProfitLocked ? "FULL" : "EARLY"));
-            trade.PositionClose(posInfo.Ticket());
-            ResetTradeGlobals(profit);
-            return;
-         }
+      // --- Trailing close (ONLY after early lock — let trades grow to $1.00+ first) ---
+      if(g_EarlyLockEngaged && profit < g_PeakProfit - adaptiveTrail && profit > 0) {
+         g_LastMgmtAction = "ADAPT_TRAIL";
+         Print("[ADAPTIVE] TRAIL CLOSE: peak=$", DoubleToString(g_PeakProfit,2),
+               " now=$", DoubleToString(profit,2),
+               " trail=$", DoubleToString(adaptiveTrail,2),
+               " struct:", (structWith ? "WITH" : structAgainst ? "AGAINST" : "NEUTRAL"),
+               " tier:", (g_ProfitLocked ? "FULL" : "EARLY"));
+         trade.PositionClose(posInfo.Ticket());
+         ResetTradeGlobals(profit);
+         return;
       }
 
-      // --- Time decay (ADAPTIVE specific): very long holds with modest profit ---
-      // After 32 bars (8 hours), if profit hasn't reached standard lock → progressive close
-      if(g_OpenBarCount >= 32 && profit > 0 && !g_ProfitLocked) {
-         double minAcceptable = earlyLockUSD * 0.60;   // at least 21% of TP after 8 hours
+      // --- Time decay: very long holds with modest profit ---
+      // After 40 bars (10 hours), if profit is still tiny → accept stall
+      if(g_OpenBarCount >= 40 && profit > 0 && !g_EarlyLockEngaged) {
+         double minAcceptable = 0.50 * scale;   // at least $0.50 per 0.01 lot after 10h
          if(profit < minAcceptable) {
             g_LastMgmtAction = "TIME_DECAY_STALL";
             Print("[ADAPTIVE] TIME DECAY: ", g_OpenBarCount, " bars, profit=$",
                   DoubleToString(profit,2), " below min acceptable $",
-                  DoubleToString(minAcceptable,2), " — closing stalled trade");
+                  DoubleToString(minAcceptable,2), " --- closing stalled trade");
             trade.PositionClose(posInfo.Ticket());
             ResetTradeGlobals(profit);
             return;
@@ -5752,22 +5831,11 @@ void ManageOpenTrade()
       // accelRatio > 1.0 = bars bigger than ATR (strong movement)
       // accelRatio < 0.5 = bars small (sluggish market)
 
-      // --- Structural assessment (shared across sub-modes) ---
-      bool crStructWith    = false;
-      bool crStructAgainst = false;
-      bool crMacroAligned  = (g_TradeDir == 1 && g_MacroStructLabel == "BULLISH") ||
-                             (g_TradeDir == -1 && g_MacroStructLabel == "BEARISH");
-      if(g_BOSActive) {
-         if((g_TradeDir == 1 && g_StructureLabel == "BULLISH") ||
-            (g_TradeDir == -1 && g_StructureLabel == "BEARISH"))
-            crStructWith = true;
-         if((g_TradeDir == 1 && g_StructureLabel == "BEARISH") ||
-            (g_TradeDir == -1 && g_StructureLabel == "BULLISH"))
-            crStructAgainst = true;
-      }
-      if(g_CHoCHActive && g_CHoCHDir != 0 && g_CHoCHDir != g_TradeDir)
-         crStructAgainst = true;
-      bool crMacroCHoCH = (g_MacroCHoCH && g_MacroCHoCHDir != 0 && g_MacroCHoCHDir != g_TradeDir);
+      // --- Structural assessment (reuse shared lse_ variables) ---
+      bool crStructWith    = lse_structWith;
+      bool crStructAgainst = lse_structAgainst;
+      bool crMacroAligned  = lse_macroAligned;
+      bool crMacroCHoCH    = lse_macroCHoCH;
 
       // --- Determine session phase ---
       // "SLASH" = harvest-style quick cut,  "RIDE" = adaptive/momentum trailing
@@ -5859,24 +5927,26 @@ void ManageOpenTrade()
       } else if(chronoSub == "MOMENTUM") {
          // Overlap is the highest-liquidity window.  Use momentum-style:
          // wider trails when structure supports, tighter when against.
-         double crMomLock   = g_DynamicTP_USD * 0.50 * scale;
-         double crBaseTrail = g_DynamicTP_USD * 0.25 * scale;
-         double crWideTrail = g_DynamicTP_USD * 0.40 * scale;
-         double crTightTrail= g_DynamicTP_USD * 0.12 * scale;
+         // Floor: $1.00 per 0.01 lot — entries travel $1-2+, don't cut early.
+         double crMinFloor  = 1.00 * scale;
+         double crMomLock   = MathMax(g_DynamicTP_USD * 0.50 * scale, crMinFloor);
+         double crBaseTrail = g_DynamicTP_USD * 0.30 * scale;
+         double crWideTrail = g_DynamicTP_USD * 0.45 * scale;
+         double crTightTrail= g_DynamicTP_USD * 0.18 * scale;
 
          double crTrail = crBaseTrail;
-         if(crStructWith && crMacroAligned)     crTrail = crWideTrail;
-         else if(crStructAgainst || crMacroCHoCH) crTrail = crTightTrail;
+         if(crStructWith && crMacroAligned)        crTrail = crWideTrail;
+         else if(crStructAgainst || crMacroCHoCH)  crTrail = crTightTrail;
 
-         // Lock at 50% TP
+         // Lock (at least $1.00 per 0.01 lot)
          if(!g_ProfitLocked && profit >= crMomLock) {
             g_ProfitLocked = true;
             g_LastMgmtAction = "CR_MOM_LOCK@" + DoubleToString(profit, 2);
             Print("[CHRONO] MOMENTUM LOCK at $", DoubleToString(profit, 2), " @H", ch);
          }
 
-         // Trail
-         if(g_ProfitLocked && profit < g_PeakProfit - crTrail) {
+         // Trail (only after lock — which is $1.00+ floor)
+         if(g_ProfitLocked && profit < g_PeakProfit - crTrail && profit > 0) {
             g_LastMgmtAction = "CR_MOM_TRAIL";
             Print("[CHRONO] MOMENTUM TRAIL: peak=$", DoubleToString(g_PeakProfit, 2),
                   " now=$", DoubleToString(profit, 2), " trail=$", DoubleToString(crTrail, 2));
@@ -5885,10 +5955,11 @@ void ManageOpenTrade()
             return;
          }
 
-         // Accelerated dwindling: high-liquidity phase should not stall
-         if(g_ProfitLocked && g_BarsSincePeak >= 8 && profit < g_PeakProfit * 0.55 && profit > 0) {
+         // Dwindling: only after peak >= $1.00 floor, 12+ bars stalled
+         if(g_ProfitLocked && g_PeakProfit >= crMinFloor && g_BarsSincePeak >= 12 && profit < g_PeakProfit * 0.50 && profit > 0) {
             g_LastMgmtAction = "CR_MOM_DWINDLE";
-            Print("[CHRONO] MOMENTUM DWINDLE: stalled in overlap session");
+            Print("[CHRONO] MOMENTUM DWINDLE: peak=$", DoubleToString(g_PeakProfit, 2),
+                  " now=$", DoubleToString(profit, 2), " stalled ", g_BarsSincePeak, " bars in overlap");
             trade.PositionClose(posInfo.Ticket());
             ResetTradeGlobals(profit);
             return;
@@ -5899,15 +5970,18 @@ void ManageOpenTrade()
       // ===================================================
       } else {
          // Full adaptive logic: graduated tiers, dwindling, structure exits.
-         double crEarlyLock = g_DynamicTP_USD * 0.35 * scale;
+         // Same $1.00/0.01 lot floor as standalone ADAPTIVE mode.
+         double crMinFloor  = 1.00 * scale;
+         double crEarlyLock = MathMax(g_DynamicTP_USD * 0.35 * scale, crMinFloor);
          double crStdLock   = g_ScaledLockUSD;
          double crTP        = g_ScaledTPUSD;
 
-         // Tier 1: early protect
+         // Tier 1: early protect (at least $1.00 per 0.01 lot)
          if(!g_EarlyLockEngaged && profit >= crEarlyLock) {
             g_EarlyLockEngaged = true;
             g_LastMgmtAction = "CR_ADAPT_EARLY@" + DoubleToString(profit, 2);
-            Print("[CHRONO] ADAPTIVE EARLY LOCK at $", DoubleToString(profit, 2), " @H", ch);
+            Print("[CHRONO] ADAPTIVE EARLY LOCK at $", DoubleToString(profit, 2),
+                  " (floor=$", DoubleToString(crEarlyLock, 2), ") @H", ch);
          }
          // Tier 2: standard lock
          if(!g_ProfitLocked && profit >= crStdLock) {
@@ -5916,26 +5990,27 @@ void ManageOpenTrade()
             Print("[CHRONO] ADAPTIVE LOCK at $", DoubleToString(profit, 2));
          }
 
-         // Adaptive trail (structure-informed)
+         // Adaptive trail (structure-informed, wider buffers to avoid early cuts)
          double crAdaptTrail;
-         if(crMacroCHoCH)                            crAdaptTrail = g_DynamicTP_USD * 0.10 * scale;
-         else if(crStructAgainst)                    crAdaptTrail = g_DynamicTP_USD * 0.12 * scale;
-         else if(profit >= crTP && crStructWith)     crAdaptTrail = g_DynamicTP_USD * 0.45 * scale;
-         else if(crStructWith && crMacroAligned)     crAdaptTrail = g_DynamicTP_USD * 0.40 * scale;
-         else if(crStructWith)                       crAdaptTrail = g_DynamicTP_USD * 0.30 * scale;
-         else                                        crAdaptTrail = g_DynamicTP_USD * 0.25 * scale;
+         if(crMacroCHoCH)                            crAdaptTrail = g_DynamicTP_USD * 0.15 * scale;
+         else if(crStructAgainst)                    crAdaptTrail = g_DynamicTP_USD * 0.18 * scale;
+         else if(profit >= crTP && crStructWith)     crAdaptTrail = g_DynamicTP_USD * 0.50 * scale;
+         else if(crStructWith && crMacroAligned)     crAdaptTrail = g_DynamicTP_USD * 0.45 * scale;
+         else if(crStructWith)                       crAdaptTrail = g_DynamicTP_USD * 0.35 * scale;
+         else                                        crAdaptTrail = g_DynamicTP_USD * 0.30 * scale;
 
-         // Dwindling detection
+         // Dwindling detection (only after peak >= $1.00 per 0.01 lot)
          bool crDwindling = false;
-         if(g_EarlyLockEngaged && g_PeakProfit > crEarlyLock && profit > 0) {
-            if(g_BarsSincePeak >= 10 && profit < g_PeakProfit * 0.50)
+         if(g_EarlyLockEngaged && g_PeakProfit >= crMinFloor && profit > 0) {
+            if(g_BarsSincePeak >= 14 && profit < g_PeakProfit * 0.45)
                crDwindling = true;
-            if(g_BarsSincePeak >= 20 && profit < g_PeakProfit * 0.70)
+            if(g_BarsSincePeak >= 24 && profit < g_PeakProfit * 0.65)
                crDwindling = true;
          }
 
-         // Structure-urgent exit
-         bool crStructUrgent = crStructAgainst && g_EarlyLockEngaged && profit < g_PeakProfit * 0.65;
+         // Structure-urgent exit (only after meaningful profit)
+         bool crStructUrgent = crStructAgainst && g_EarlyLockEngaged &&
+                               g_PeakProfit >= crMinFloor && profit < g_PeakProfit * 0.55;
 
          if(crDwindling || crStructUrgent) {
             string rsn = crDwindling ? "CR_DWINDLE" : "CR_STRUCT_URGENT";
@@ -5947,8 +6022,8 @@ void ManageOpenTrade()
             return;
          }
 
-         // Trailing close
-         if((g_EarlyLockEngaged || g_ProfitLocked) && profit < g_PeakProfit - crAdaptTrail && profit > 0) {
+         // Trailing close (only after early lock — $1.00+ floor)
+         if(g_EarlyLockEngaged && profit < g_PeakProfit - crAdaptTrail && profit > 0) {
             g_LastMgmtAction = "CR_ADAPT_TRAIL";
             Print("[CHRONO] ADAPTIVE TRAIL: peak=$", DoubleToString(g_PeakProfit, 2),
                   " now=$", DoubleToString(profit, 2), " trail=$", DoubleToString(crAdaptTrail, 2));
@@ -5957,12 +6032,13 @@ void ManageOpenTrade()
             return;
          }
 
-         // Time decay: 32+ bars without standard lock
-         if(g_OpenBarCount >= 32 && profit > 0 && !g_ProfitLocked) {
-            double minAccept = crEarlyLock * 0.60;
+         // Time decay: 40+ bars without early lock → stalled
+         if(g_OpenBarCount >= 40 && profit > 0 && !g_EarlyLockEngaged) {
+            double minAccept = 0.50 * scale;
             if(profit < minAccept) {
                g_LastMgmtAction = "CR_TIME_DECAY";
-               Print("[CHRONO] TIME DECAY after ", g_OpenBarCount, " bars @H", ch);
+               Print("[CHRONO] TIME DECAY after ", g_OpenBarCount, " bars, profit=$",
+                     DoubleToString(profit, 2), " below $", DoubleToString(minAccept, 2), " @H", ch);
                trade.PositionClose(posInfo.Ticket());
                ResetTradeGlobals(profit);
                return;
@@ -6145,6 +6221,13 @@ void UpdateDashboard()
    DashLine("01b_emode", "EntryMd : " + modeLabel,                             cx, cy, row, lh, corner, clrAqua,        8); row++;
 
    DashLine("02_sig",    "Signal  : " + g_Signal,                               cx, cy, row, lh, corner, sigColor,     10); row++;
+
+   // Scan-paused indicator when bot has an open trade
+   if(PauseScanInTrade && g_TradeOpen) {
+      DashLine("02_pause", "          [SCAN PAUSED — managing trade]",          cx, cy, row, lh, corner, clrOrange,     8); row++;
+   } else {
+      DashLine("02_pause", "",                                                  cx, cy, row, lh, corner, clrGray,       8); row++;
+   }
 
    // Entry window status — ALWAYS rendered so Bias row never overlaps this row
    {
@@ -6607,6 +6690,17 @@ void UpdateDashboard()
          DashLine("R_mgmt", "MgmtAct : " + g_LastMgmtAction, rx, cy, rowR, lh, corner, clrCyan, 8);
       } else {
          DashLine("R_mgmt", "MgmtAct : ---", rx, cy, rowR, lh, corner, clrDimGray, 8);
+      }
+      rowR++;
+
+      // --- Comeback Potential (only shown when trade is in loss) ---
+      if(g_TradeOpen && g_ComebackLabel != "") {
+         color cbClr = clrYellow;
+         if(g_ComebackLabel == "HIGH")         cbClr = clrLime;
+         else if(g_ComebackLabel == "LOW")     cbClr = clrTomato;
+         DashLine("R_comeback", "Comeback: " + g_ComebackLabel, rx, cy, rowR, lh, corner, cbClr, 8);
+      } else {
+         DashLine("R_comeback", "", rx, cy, rowR, lh, corner, clrGray, 8);
       }
       rowR++;
    }

@@ -1,10 +1,10 @@
 //+------------------------------------------------------------------+
-//|  EURUSD Heiken Ashi Range Bot v6.27b                             |
-//|  H1 BOS coherence gate + 6 trade management modes:              |
+//|  EURUSD Heiken Ashi Range Bot v6.27c                             |
+//|  Reverted v6.26a H1 structure changes that caused late entries   |
 //|  STANDARD / SENTINEL / MOMENTUM / ADAPTIVE / HARVESTER / CHRONO |
 //+------------------------------------------------------------------+
 #property copyright   "EURUSD HA Range Bot"
-#property version     "6.27b"
+#property version     "6.27c"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -1257,9 +1257,7 @@ void CalcBollinger()
 //+------------------------------------------------------------------+
 void DetectSwingStructure()
 {
-   // v6.26a: reduced lookback from 3→2 (saves 1 hour of detection latency);
-   // added partial-pattern recognition and CHoCH-from-RANGING.
-   int lookback = 2;   // bars each side to confirm a swing point (was 3 → 1h faster)
+   int lookback = 3;   // bars each side to confirm a swing point
    int scanBars = 50;  // H1 bars to scan
 
    double swingHighs[];
@@ -1312,24 +1310,16 @@ void DetectSwingStructure()
 
    if(shCount >= 2 && slCount >= 2)
    {
-      // 2-pip tolerance to avoid noise
+      // 20-point tolerance (2 pips) to avoid noise
       double tol = _Point * 20;
       bool HH = (g_SwingHigh1 > g_SwingHigh2 + tol);
       bool HL = (g_SwingLow1  > g_SwingLow2  + tol);
       bool LH = (g_SwingHigh1 < g_SwingHigh2 - tol);
       bool LL = (g_SwingLow1  < g_SwingLow2  - tol);
 
-      // --- Structure classification ---
-      // Full patterns: HH+HL = confirmed BULLISH, LH+LL = confirmed BEARISH (classic ICT)
       if(HH && HL)       g_StructureLabel = "BULLISH";
       else if(LH && LL)  g_StructureLabel = "BEARISH";
-      // Partial patterns: a single-sided confirmation (HH alone, HL alone, etc.) is enough
-      // to lean directional. This prevents the label from stalling on RANGING during
-      // one-legged transitions, which previously blinded BOS and CHoCH detection for hours.
-      // Guard: the opposite legs must NOT be active (avoids conflicting expanding-range noise).
-      else if((HH || HL) && !LH && !LL)  g_StructureLabel = "BULLISH";
-      else if((LH || LL) && !HH && !HL)  g_StructureLabel = "BEARISH";
-      else                                g_StructureLabel = "RANGING";
+      else                g_StructureLabel = "RANGING";
 
       double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
 
@@ -1340,15 +1330,6 @@ void DetectSwingStructure()
       // --- Classic CHoCH: HH/HL ↔ LH/LL pattern flip (with direction) ---
       if(prevStructure == "BULLISH"  && g_StructureLabel == "BEARISH") { freshCHoCH = true; g_CHoCHDir = -1; }  // bearish reversal
       if(prevStructure == "BEARISH"  && g_StructureLabel == "BULLISH") { freshCHoCH = true; g_CHoCHDir =  1; }  // bullish reversal
-
-      // --- CHoCH from RANGING: the market was indeterminate (conflicting legs) and
-      //     now resolves to a clear direction. This catches character changes that were
-      //     previously invisible because the strict HH+HL/LH+LL rule kept the label
-      //     on RANGING during the transition. Guarded by prior-activity check to avoid
-      //     a false CHoCH on bot startup (when RANGING is just the default).
-      bool hadPriorStruct = (g_BOSTime > 0 || g_CHoCHTime > 0);
-      if(hadPriorStruct && prevStructure == "RANGING" && g_StructureLabel == "BULLISH") { freshCHoCH = true; g_CHoCHDir =  1; }
-      if(hadPriorStruct && prevStructure == "RANGING" && g_StructureLabel == "BEARISH") { freshCHoCH = true; g_CHoCHDir = -1; }
 
       // --- Price-break CHoCH (ICT concept): price breaks a swing in the OPPOSITE
       //     direction to the previous trend, confirming the character change.

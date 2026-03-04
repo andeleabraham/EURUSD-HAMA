@@ -1,7 +1,7 @@
 //+------------------------------------------------------------------+
-//|  EURUSD Heiken Ashi Range Bot v6.23                              |
-//|  CHoCH/BOS persistence, price-break CHoCH, multi-OB tracking,  |
-//|  FVG 50% CE fill, H1+H4 FVG overlap confluence, confidence v17 |
+//|  EURUSD Heiken Ashi Range Bot v6.23a                             |
+//|  TryEntry diagnostics: all silent gates now print block reason   |
+//|  once per bar. PREPARING expiry, session cutoff reset, consec>=1 |
 //+------------------------------------------------------------------+
 #property copyright   "EURUSD HA Range Bot"
 #property version     "6.23"
@@ -196,6 +196,7 @@ input int    CooldownBars       = 8;     // Bars to pause after consecutive loss
 input int    PostTradeCoolBars  = 2;     // Cool-off bars after ANY trade closes before next entry (2 = 30 min)
 input int    StartupGraceBars   = 1;     // After restart, wait N new bars before allowing entry (re-evaluate)
 input int    NoEntryAfterHour   = 21;    // No new entries after this server hour (0-23, 0=disabled)
+input int    PrepMaxBars        = 8;     // Max bars PREPARING can wait for Bollinger confirm before expiring (0=no limit)
 input int    FridayCloseHour    = 20;    // Force close open trades on Friday at this hour (0=disabled)
 
 input group "=== DASHBOARD POSITION ==="
@@ -411,6 +412,8 @@ int      g_ConsecLosses    = 0;      // consecutive SL/hard-loss exits
 datetime g_CooldownUntil   = 0;      // if > 0, no entries until this time
 datetime g_PostTradeCoolUntil = 0;   // if > 0, post-trade cooloff active until this time
 datetime g_StartupGraceUntil = 0;    // if > 0, startup grace period active until this time
+datetime g_LastBlockPrintBar = 0;    // throttle TryEntry block diagnostics to once per M15 bar
+datetime g_PrepStartTime     = 0;    // time when PREPARING state was first armed (for PrepMaxBars expiry)
 int      g_DailyWins       = 0;      // wins today (for dashboard)
 int      g_DailyLosses     = 0;      // losses today (for dashboard)
 double   g_DailyPnL        = 0.0;    // cumulative P&L today
@@ -3275,6 +3278,7 @@ void EvaluateHAPattern()
       g_ZonePending        = false;
       g_ZoneContextUsed    = false;
       g_Signal             = "PREPARING BUY";
+      g_PrepStartTime      = TimeCurrent();
       Print("PREPARING BUY: Bottomless bull candle detected (bar1). ",
             "Consec=", g_HAConsecCount, "/", MaxConsecCandles,
             " Boll=", DoubleToString(g_BollingerMid1, 5),
@@ -3405,6 +3409,7 @@ void EvaluateHAPattern()
       g_ZonePending        = false;
       g_ZoneContextUsed    = false;
       g_Signal             = "PREPARING SELL";
+      g_PrepStartTime      = TimeCurrent();
       Print("PREPARING SELL: Topless bear candle detected (bar1). ",
             "Consec=", g_HAConsecCount, "/", MaxConsecCandles,
             " Boll=", DoubleToString(g_BollingerMid1, 5),
@@ -3527,8 +3532,23 @@ void EvaluateHAPattern()
       g_Signal            = "WAITING";
    }
 
+   // === PREPARING EXPIRY — if Bollinger hasn't confirmed after PrepMaxBars, abandon setup ===
+   if((g_Signal == "PREPARING BUY" || g_Signal == "PREPARING SELL") && PrepMaxBars > 0 && g_PrepStartTime > 0) {
+      int barsSinceArm = Bars(_Symbol, PERIOD_M15, g_PrepStartTime, TimeCurrent());
+      if(barsSinceArm >= PrepMaxBars) {
+         Print("[PREPARING EXPIRED] ", g_Signal, " timed out after ", barsSinceArm,
+               " bars (max=", PrepMaxBars, ") — Bollinger never confirmed. Resetting to WAITING.");
+         g_Signal       = "WAITING";
+         g_HABullSetup  = false;
+         g_HABearSetup  = false;
+         g_PrepStartTime = 0;
+         return;
+      }
+   }
+
    // === STILL PREPARING diagnostic — structured confirmed / pending / next-gate report ===
-   if((g_Signal == "PREPARING BUY" || g_Signal == "PREPARING SELL") && g_HAConsecCount >= 2) {
+   // v6.23a: threshold lowered from consec>=2 to consec>=1 so first armed bar gets a report
+   if((g_Signal == "PREPARING BUY" || g_Signal == "PREPARING SELL") && g_HAConsecCount >= 1) {
       int  trD      = (g_Signal == "PREPARING BUY") ? 1 : -1;
       bool isBuy    = (trD == 1);
 
@@ -3927,6 +3947,10 @@ void TryEntry()
 {
    if(g_TradeOpen) return;
 
+   // Throttle block diagnostics: print once per M15 bar, not every tick
+   datetime _blockBar = iTime(_Symbol, PERIOD_M15, 0);
+   bool _canPrintBlock = (_blockBar != g_LastBlockPrintBar);
+
    // === FOREIGN TRADE GUARD ===
    // If a non-bot trade exists on this symbol, respect the one-trade rule
    if(RespectForeignTrades && g_ForeignCountSymbol > 0) {
@@ -3937,17 +3961,32 @@ void TryEntry()
 
    // === DAILY TRADE LIMIT ===
    if(MaxDailyTrades > 0 && g_DailyTradeCount >= MaxDailyTrades) {
-      return;   // silent — already logged when limit was hit
+      if(_canPrintBlock) {
+         Print("[ENTRY WAIT] DailyTrades=", g_DailyTradeCount, "/", MaxDailyTrades,
+               " reached | Signal=", g_Signal);
+         g_LastBlockPrintBar = _blockBar;
+      }
+      return;
    }
 
    // === DAILY LOSS LIMIT ===
    if(MaxDailyLossUSD > 0 && g_DailyPnL <= -MaxDailyLossUSD) {
-      return;   // daily loss cap hit — stop trading for today
+      if(_canPrintBlock) {
+         Print("[ENTRY WAIT] DailyPnL=$", DoubleToString(g_DailyPnL, 2),
+               " hit limit $-", DoubleToString(MaxDailyLossUSD, 2), " | Signal=", g_Signal);
+         g_LastBlockPrintBar = _blockBar;
+      }
+      return;
    }
 
    // === CONSECUTIVE LOSS COOLDOWN ===
    if(g_CooldownUntil > 0 && TimeCurrent() < g_CooldownUntil) {
-      return;   // still in cooldown after consecutive losses
+      if(_canPrintBlock) {
+         Print("[ENTRY WAIT] ConsecLossCooldown until ",
+               TimeToString(g_CooldownUntil, TIME_MINUTES), " | Signal=", g_Signal);
+         g_LastBlockPrintBar = _blockBar;
+      }
+      return;
    }
    if(g_CooldownUntil > 0 && TimeCurrent() >= g_CooldownUntil) {
       Print("COOLDOWN expired — resuming trading (consec losses reset)");
@@ -3957,7 +3996,12 @@ void TryEntry()
 
    // === POST-TRADE COOLDOWN ===
    if(g_PostTradeCoolUntil > 0 && TimeCurrent() < g_PostTradeCoolUntil) {
-      return;   // still in post-trade cooloff
+      if(_canPrintBlock) {
+         Print("[ENTRY WAIT] PostTradeCooldown until ",
+               TimeToString(g_PostTradeCoolUntil, TIME_MINUTES), " | Signal=", g_Signal);
+         g_LastBlockPrintBar = _blockBar;
+      }
+      return;
    }
    if(g_PostTradeCoolUntil > 0 && TimeCurrent() >= g_PostTradeCoolUntil) {
       Print("[POST-TRADE COOLDOWN] expired — resuming trading");
@@ -3966,7 +4010,12 @@ void TryEntry()
 
    // === STARTUP GRACE PERIOD ===
    if(g_StartupGraceUntil > 0 && TimeCurrent() < g_StartupGraceUntil) {
-      return;   // still in startup grace
+      if(_canPrintBlock) {
+         Print("[ENTRY WAIT] StartupGrace until ",
+               TimeToString(g_StartupGraceUntil, TIME_MINUTES), " | Signal=", g_Signal);
+         g_LastBlockPrintBar = _blockBar;
+      }
+      return;
    }
    if(g_StartupGraceUntil > 0 && TimeCurrent() >= g_StartupGraceUntil) {
       Print("[STARTUP GRACE] expired — allowing entries");
@@ -3978,7 +4027,20 @@ void TryEntry()
       MqlDateTime entryDt;
       TimeToStruct(TimeCurrent(), entryDt);
       if(entryDt.hour >= NoEntryAfterHour) {
-         return;   // too late in the day
+         if(_canPrintBlock && g_Signal != "WAITING") {
+            Print("[SESSION CUTOFF] ", g_Signal, " killed — past NoEntryAfter=",
+                  IntegerToString(NoEntryAfterHour), ":00 (current=",
+                  IntegerToString(entryDt.hour), ":", StringFormat("%02d", entryDt.min), ")");
+            g_LastBlockPrintBar = _blockBar;
+         }
+         // Reset signal so dashboard doesn't show stale INCOMING after cutoff
+         if(g_Signal == "BUY INCOMING" || g_Signal == "SELL INCOMING" ||
+            g_Signal == "PREPARING BUY" || g_Signal == "PREPARING SELL") {
+            g_Signal      = "WAITING";
+            g_HABullSetup = false;
+            g_HABearSetup = false;
+         }
+         return;
       }
    }
 
@@ -3988,7 +4050,14 @@ void TryEntry()
    bool isMeanRev     = (meanRevDir != 0 && !isTrendSignal);
    bool isMacroTrend  = (g_MacroTrendRide && g_MacroTrendDir != 0 && MacroTrendRideEnabled);
 
-   if(!isTrendSignal && !isMeanRev && !isMacroTrend) return;
+   if(!isTrendSignal && !isMeanRev && !isMacroTrend) {
+      if(_canPrintBlock && g_Signal != "WAITING") {
+         Print("[ENTRY WAIT] No valid signal | g_Signal=", g_Signal,
+               " MeanRev=", meanRevDir, " MacroTrend=", (g_MacroTrendRide ? "armed" : "off"));
+         g_LastBlockPrintBar = _blockBar;
+      }
+      return;
+   }
 
    // === ENTRY TIMING based on HAEntryMode, or MRV 5-minute window ===
    datetime barTime   = iTime(_Symbol, PERIOD_M15, 0);
@@ -4014,7 +4083,14 @@ void TryEntry()
 
       if(!confirmIsClean) {
          // Impure confirming candle — only enter in the last 5 min of the bar
-         if(secsElapsed < 600) return;
+         if(secsElapsed < 600) {
+            if(_canPrintBlock) {
+               Print("[ENTRY WAIT] EntryTiming: double-wick candle, waiting for last 5min of bar (",
+                     secsElapsed, "s elapsed, need >=600) | Signal=", g_Signal);
+               g_LastBlockPrintBar = _blockBar;
+            }
+            return;
+         }
       } else if(secsElapsed <= EarlyEntryMins * 60) {
          // Within early window — proceed immediately
       } else if(AllowLateEntry) {
@@ -4023,11 +4099,25 @@ void TryEntry()
                EarlyEntryMins * 60, "s). Signal=" + g_Signal);
       } else {
          // AllowLateEntry=false — wait for last 5 min of current bar only
-         if(secsElapsed < 600) return;
+         if(secsElapsed < 600) {
+            if(_canPrintBlock) {
+               Print("[ENTRY WAIT] EntryTiming: past early window, waiting for last 5min (",
+                     secsElapsed, "s elapsed, need >=600) | Signal=", g_Signal);
+               g_LastBlockPrintBar = _blockBar;
+            }
+            return;
+         }
       }
    } else {
       // MODE 2: last 5 minutes of the current bar (confirming candle's successor)
-      if(secsElapsed < 600) return;
+      if(secsElapsed < 600) {
+         if(_canPrintBlock) {
+            Print("[ENTRY WAIT] EntryTiming: MODE2 waiting for last 5min (",
+                  secsElapsed, "s elapsed, need >=600) | Signal=", g_Signal);
+            g_LastBlockPrintBar = _blockBar;
+         }
+         return;
+      }
    }
 
    // HA consecutive candle guard — include the forming bar (bar 0) in the count
@@ -4036,6 +4126,8 @@ void TryEntry()
    // and Macro Trend Rides (structural breakout, not pattern count limited).
    int liveConsec = LiveHAConsecTotal();
    if(liveConsec > MaxConsecCandles && !isMacroTrend && g_BoldTier == "NORMAL") {
+      Print("[SIGNAL EXPIRED] liveConsec=", liveConsec, " exceeded MaxConsecCandles=",
+            MaxConsecCandles, " — resetting to WAITING");
       g_Signal = "WAITING"; g_HABullSetup = false; g_HABearSetup = false;
       return;
    }

@@ -1,10 +1,10 @@
 //+------------------------------------------------------------------+
-//|  EURUSD Heiken Ashi Range Bot v6.27a                             |
-//|  H1 BOS coherence gate + 5 trade management modes:              |
-//|  STANDARD / SENTINEL / MOMENTUM / ADAPTIVE / HARVESTER          |
+//|  EURUSD Heiken Ashi Range Bot v6.27b                             |
+//|  H1 BOS coherence gate + 6 trade management modes:              |
+//|  STANDARD / SENTINEL / MOMENTUM / ADAPTIVE / HARVESTER / CHRONO |
 //+------------------------------------------------------------------+
 #property copyright   "EURUSD HA Range Bot"
-#property version     "6.27a"
+#property version     "6.27b"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -37,7 +37,8 @@ input double TrailPct         = 0.30;   // Trail gap = 30% of TP — generous ro
 //   2 = MOMENTUM  — structure-informed. Widens trail on aligned BOS, tightens on adverse CHoCH.
 //   3 = ADAPTIVE  — full smart mode. Tracks peak/trough, dwindling detection, structure exits.
 //   4 = HARVESTER — profit-tier slasher. Closes at $1/$1.50/$2 (per 0.01 lot) based on context.
-input int    TradeMgmtMode    = 3;      // 0-4: STD|SENT|MOM|ADAPT|HARVEST
+//   5 = CHRONO   — session-aware hybrid. Slashes in quiet sessions, rides in active ones.
+input int    TradeMgmtMode    = 3;      // 0-5: STD|SENT|MOM|ADAPT|HARVEST|CHRONO
 // Mid-range time-exit: close if stalling in LOSS after MidRangeMaxBars
 input double MidRangeStallUSD = 0.00;   // Stall exit disabled — trust the SL/TP
 input int    MidRangeMaxBars  = 16;     // Bars before mid-range stall check (only if MidRangeStallUSD > 0)
@@ -534,7 +535,8 @@ void RestoreExistingTrade()
       g_TradeMgmtModeName = (TradeMgmtMode == 0) ? "STANDARD" :
                              (TradeMgmtMode == 1) ? "SENTINEL" :
                              (TradeMgmtMode == 2) ? "MOMENTUM" :
-                             (TradeMgmtMode == 3) ? "ADAPTIVE" : "HARVESTER";
+                             (TradeMgmtMode == 3) ? "ADAPTIVE" :
+                             (TradeMgmtMode == 4) ? "HARVESTER" : "CHRONO";
 
       Print("RESTORED position | Ticket:", posInfo.Ticket(),
             "  Lot:", DoubleToString(lot, 2),
@@ -5177,7 +5179,8 @@ void TryEntry()
       g_TradeMgmtModeName = (TradeMgmtMode == 0) ? "STANDARD" :
                              (TradeMgmtMode == 1) ? "SENTINEL" :
                              (TradeMgmtMode == 2) ? "MOMENTUM" :
-                             (TradeMgmtMode == 3) ? "ADAPTIVE" : "HARVESTER";
+                             (TradeMgmtMode == 3) ? "ADAPTIVE" :
+                             (TradeMgmtMode == 4) ? "HARVESTER" : "CHRONO";
       g_DailyTradeCount++;
       if(MaxDailyTrades > 0 && g_DailyTradeCount >= MaxDailyTrades)
          Print("DAILY TRADE LIMIT reached (", g_DailyTradeCount, "/", MaxDailyTrades, ")");
@@ -5229,9 +5232,9 @@ void ResetTradeGlobals(double closePnL)
 }
 
 //+------------------------------------------------------------------+
-//| TRADE MANAGEMENT v9 — 5-MODE SYSTEM                              |
+//| TRADE MANAGEMENT v10 — 6-MODE SYSTEM                             |
 //| Modes: STANDARD(0), SENTINEL(1), MOMENTUM(2), ADAPTIVE(3),     |
-//|        HARVESTER(4)                                             |
+//|        HARVESTER(4), CHRONO(5)                                  |
 //|                                                                  |
 //| All modes share:                                                 |
 //|   - Hard MaxLossUSD cap (absolute safety net)                   |
@@ -5248,6 +5251,11 @@ void ResetTradeGlobals(double closePnL)
 //| MODE 4 — HARVESTER: Profit-tier slasher. Closes at $1/$1.5/$2  |
 //|          per 0.01 lot based on structure/momentum context.      |
 //|          Quick materialisation — slashes once a tier is hit.    |
+//| MODE 5 — CHRONO: Session-aware hybrid. Auto-selects sub-mode   |
+//|          based on the current hour:                             |
+//|          Early Asian / Late NY → HARVEST slash ($1-$1.50)       |
+//|          Mid Asian / London / NY → ADAPTIVE (ride with struct)  |
+//|          London-NY overlap → MOMENTUM (wide trail, full ride)   |
 //+------------------------------------------------------------------+
 void ManageOpenTrade()
 {
@@ -5299,7 +5307,7 @@ void ManageOpenTrade()
 
    // --- Resolve effective mode ---
    int mode = TradeMgmtMode;
-   if(mode < 0 || mode > 4) mode = 0;
+   if(mode < 0 || mode > 5) mode = 0;
 
    // === HARD LOSS CAP — MaxLossUSD per 0.01 lot, ALWAYS (all modes) ===
    double hardLossLimit = -(MaxLossUSD * scale);
@@ -5611,7 +5619,7 @@ void ManageOpenTrade()
          }
       }
 
-   } else {
+   } else if(mode == 4) {
       // === MODE 4: HARVESTER (profit-tier slasher) ===
       // Philosophy: entries are strong — materialise profits at fixed dollar
       // thresholds instead of trailing.  The TARGET tier is selected once when
@@ -5722,6 +5730,262 @@ void ManageOpenTrade()
             trade.PositionClose(posInfo.Ticket());
             ResetTradeGlobals(profit);
             return;
+         }
+      }
+
+   } else {
+      // === MODE 5: CHRONO (session-aware hybrid) ===
+      // Philosophy: different sessions have different pip potential.
+      // The mode auto-selects a sub-strategy based on the CURRENT hour:
+      //
+      //  EARLY ASIAN (hour 0-3):  Low volatility → aggressive HARVEST slash.
+      //     Close at $1.00-$1.50 per 0.01 lot depending on bar acceleration.
+      //
+      //  MID/LATE ASIAN (hour 3-7):  Trade may carry into London →
+      //     ADAPTIVE sub-mode (structure-informed, let it ride if aligned).
+      //
+      //  LONDON OPEN (hour 8-12):  Peak volatility → ADAPTIVE sub-mode,
+      //     wider trails, structure-informed.  Ride the London move.
+      //
+      //  LONDON-NY OVERLAP (hour 13-16):  Maximum liquidity →
+      //     MOMENTUM sub-mode (structure-adjusted trail widths).
+      //
+      //  NY ACTIVE (hour 17-19):  Moderate activity → ADAPTIVE sub-mode.
+      //
+      //  LATE NY / OFF-HOURS (hour 20-23):  Dying liquidity →
+      //     aggressive HARVEST slash.  Don't hold into the void.
+      //
+      //  All hours respect session inputs (AsianStartHour etc.) for phase
+      //  boundaries.  Bar-height acceleration adjusts slash aggressiveness.
+
+      MqlDateTime cdt;
+      TimeToStruct(TimeCurrent(), cdt);
+      int ch = cdt.hour;
+
+      // --- Measure recent bar acceleration (avg of last 3 closed M15 bar ranges vs ATR) ---
+      double avgBarRange = 0;
+      for(int bi = 1; bi <= 3; bi++)
+         avgBarRange += iHigh(_Symbol, PERIOD_M15, bi) - iLow(_Symbol, PERIOD_M15, bi);
+      avgBarRange /= 3.0;
+      double accelRatio = (g_ATR > 0) ? (avgBarRange / g_ATR) : 0.5;
+      // accelRatio > 1.0 = bars bigger than ATR (strong movement)
+      // accelRatio < 0.5 = bars small (sluggish market)
+
+      // --- Structural assessment (shared across sub-modes) ---
+      bool crStructWith    = false;
+      bool crStructAgainst = false;
+      bool crMacroAligned  = (g_TradeDir == 1 && g_MacroStructLabel == "BULLISH") ||
+                             (g_TradeDir == -1 && g_MacroStructLabel == "BEARISH");
+      if(g_BOSActive) {
+         if((g_TradeDir == 1 && g_StructureLabel == "BULLISH") ||
+            (g_TradeDir == -1 && g_StructureLabel == "BEARISH"))
+            crStructWith = true;
+         if((g_TradeDir == 1 && g_StructureLabel == "BEARISH") ||
+            (g_TradeDir == -1 && g_StructureLabel == "BULLISH"))
+            crStructAgainst = true;
+      }
+      if(g_CHoCHActive && g_CHoCHDir != 0 && g_CHoCHDir != g_TradeDir)
+         crStructAgainst = true;
+      bool crMacroCHoCH = (g_MacroCHoCH && g_MacroCHoCHDir != 0 && g_MacroCHoCHDir != g_TradeDir);
+
+      // --- Determine session phase ---
+      // "SLASH" = harvest-style quick cut,  "RIDE" = adaptive/momentum trailing
+      string chronoPhase = "RIDE";    // default
+      string chronoSub   = "ADAPT";   // default sub-strategy label
+
+      bool isEarlyAsian    = (ch >= AsianStartHour && ch < AsianStartHour + 3);
+      bool isMidLateAsian  = (ch >= AsianStartHour + 3 && ch < AsianEndHour);
+      bool isLondonOpen    = (ch >= LondonStartHour && ch < LondonStartHour + 5);
+      bool isOverlap       = (ch >= NewYorkStartHour && ch < LondonEndHour);
+      bool isNYActive      = (ch >= LondonEndHour && ch < NewYorkEndHour - 2);
+      bool isLateNY        = (ch >= NewYorkEndHour - 2 && ch < NewYorkEndHour);
+      bool isOffHours      = (ch >= NewYorkEndHour || ch < AsianStartHour);
+
+      if(isEarlyAsian || isLateNY || isOffHours) {
+         chronoPhase = "SLASH";
+         chronoSub   = "HARVEST";
+      } else if(isOverlap) {
+         chronoPhase = "RIDE";
+         chronoSub   = "MOMENTUM";
+      } else if(isLondonOpen || isMidLateAsian || isNYActive) {
+         chronoPhase = "RIDE";
+         chronoSub   = "ADAPT";
+      }
+
+      // Update dashboard with current phase
+      if(g_LastMgmtAction == "" || StringFind(g_LastMgmtAction, "PHASE:") == 0)
+         g_LastMgmtAction = "PHASE:" + chronoSub + " @H" + IntegerToString(ch);
+
+      // ===================================================
+      //  SLASH sub-mode (early Asian, late NY, off-hours)
+      // ===================================================
+      if(chronoPhase == "SLASH") {
+         // Slash tiers scaled by bar acceleration:
+         //   Sluggish (accel < 0.5) → slash at $1.00 (take what you can)
+         //   Normal  (0.5 - 1.0)    → slash at $1.00-$1.30 depending on struct
+         //   Fast    (accel > 1.0)   → slash at $1.50 (market has legs)
+         double slashTarget;
+         string slashLabel;
+
+         if(accelRatio > 1.0 && (crStructWith || crMacroAligned)) {
+            slashTarget = 1.50 * scale;
+            slashLabel  = "FAST";
+         } else if(accelRatio >= 0.5 && crStructWith && !crStructAgainst) {
+            slashTarget = 1.30 * scale;
+            slashLabel  = "NORM+";
+         } else {
+            slashTarget = 1.00 * scale;
+            slashLabel  = "QUICK";
+         }
+
+         // Slash when target hit
+         if(profit >= slashTarget) {
+            g_LastMgmtAction = "CR_SLASH_" + slashLabel;
+            Print("[CHRONO] SLASH ", slashLabel, " at $", DoubleToString(profit, 2),
+                  " target=$", DoubleToString(slashTarget, 2),
+                  " accel=", DoubleToString(accelRatio, 2),
+                  " hour=", ch, " phase=SLASH");
+            trade.PositionClose(posInfo.Ticket());
+            ResetTradeGlobals(profit);
+            return;
+         }
+
+         // Protect: peak near target (80%+) but fading 5+ bars
+         if(g_PeakProfit >= slashTarget * 0.80 && profit > 0) {
+            if(g_BarsSincePeak >= 5 && profit < g_PeakProfit * 0.70) {
+               g_LastMgmtAction = "CR_SLASH_PROTECT";
+               Print("[CHRONO] SLASH PROTECT: peak=$", DoubleToString(g_PeakProfit, 2),
+                     " now=$", DoubleToString(profit, 2), " fading ", g_BarsSincePeak, " bars");
+               trade.PositionClose(posInfo.Ticket());
+               ResetTradeGlobals(profit);
+               return;
+            }
+         }
+
+         // Structure-against + reached $0.70+: don't wait → take it
+         if(crStructAgainst && profit >= 0.70 * scale) {
+            g_LastMgmtAction = "CR_SLASH_STRUCT_AGT";
+            Print("[CHRONO] SLASH on struct against: profit=$", DoubleToString(profit, 2),
+                  " in low-liquidity phase + adverse structure");
+            trade.PositionClose(posInfo.Ticket());
+            ResetTradeGlobals(profit);
+            return;
+         }
+
+      // ===================================================
+      //  RIDE sub-mode: MOMENTUM (London-NY overlap)
+      // ===================================================
+      } else if(chronoSub == "MOMENTUM") {
+         // Overlap is the highest-liquidity window.  Use momentum-style:
+         // wider trails when structure supports, tighter when against.
+         double crMomLock   = g_DynamicTP_USD * 0.50 * scale;
+         double crBaseTrail = g_DynamicTP_USD * 0.25 * scale;
+         double crWideTrail = g_DynamicTP_USD * 0.40 * scale;
+         double crTightTrail= g_DynamicTP_USD * 0.12 * scale;
+
+         double crTrail = crBaseTrail;
+         if(crStructWith && crMacroAligned)     crTrail = crWideTrail;
+         else if(crStructAgainst || crMacroCHoCH) crTrail = crTightTrail;
+
+         // Lock at 50% TP
+         if(!g_ProfitLocked && profit >= crMomLock) {
+            g_ProfitLocked = true;
+            g_LastMgmtAction = "CR_MOM_LOCK@" + DoubleToString(profit, 2);
+            Print("[CHRONO] MOMENTUM LOCK at $", DoubleToString(profit, 2), " @H", ch);
+         }
+
+         // Trail
+         if(g_ProfitLocked && profit < g_PeakProfit - crTrail) {
+            g_LastMgmtAction = "CR_MOM_TRAIL";
+            Print("[CHRONO] MOMENTUM TRAIL: peak=$", DoubleToString(g_PeakProfit, 2),
+                  " now=$", DoubleToString(profit, 2), " trail=$", DoubleToString(crTrail, 2));
+            trade.PositionClose(posInfo.Ticket());
+            ResetTradeGlobals(profit);
+            return;
+         }
+
+         // Accelerated dwindling: high-liquidity phase should not stall
+         if(g_ProfitLocked && g_BarsSincePeak >= 8 && profit < g_PeakProfit * 0.55 && profit > 0) {
+            g_LastMgmtAction = "CR_MOM_DWINDLE";
+            Print("[CHRONO] MOMENTUM DWINDLE: stalled in overlap session");
+            trade.PositionClose(posInfo.Ticket());
+            ResetTradeGlobals(profit);
+            return;
+         }
+
+      // ===================================================
+      //  RIDE sub-mode: ADAPTIVE (mid/late Asian, London, NY)
+      // ===================================================
+      } else {
+         // Full adaptive logic: graduated tiers, dwindling, structure exits.
+         double crEarlyLock = g_DynamicTP_USD * 0.35 * scale;
+         double crStdLock   = g_ScaledLockUSD;
+         double crTP        = g_ScaledTPUSD;
+
+         // Tier 1: early protect
+         if(!g_EarlyLockEngaged && profit >= crEarlyLock) {
+            g_EarlyLockEngaged = true;
+            g_LastMgmtAction = "CR_ADAPT_EARLY@" + DoubleToString(profit, 2);
+            Print("[CHRONO] ADAPTIVE EARLY LOCK at $", DoubleToString(profit, 2), " @H", ch);
+         }
+         // Tier 2: standard lock
+         if(!g_ProfitLocked && profit >= crStdLock) {
+            g_ProfitLocked = true;
+            g_LastMgmtAction = "CR_ADAPT_LOCK@" + DoubleToString(profit, 2);
+            Print("[CHRONO] ADAPTIVE LOCK at $", DoubleToString(profit, 2));
+         }
+
+         // Adaptive trail (structure-informed)
+         double crAdaptTrail;
+         if(crMacroCHoCH)                            crAdaptTrail = g_DynamicTP_USD * 0.10 * scale;
+         else if(crStructAgainst)                    crAdaptTrail = g_DynamicTP_USD * 0.12 * scale;
+         else if(profit >= crTP && crStructWith)     crAdaptTrail = g_DynamicTP_USD * 0.45 * scale;
+         else if(crStructWith && crMacroAligned)     crAdaptTrail = g_DynamicTP_USD * 0.40 * scale;
+         else if(crStructWith)                       crAdaptTrail = g_DynamicTP_USD * 0.30 * scale;
+         else                                        crAdaptTrail = g_DynamicTP_USD * 0.25 * scale;
+
+         // Dwindling detection
+         bool crDwindling = false;
+         if(g_EarlyLockEngaged && g_PeakProfit > crEarlyLock && profit > 0) {
+            if(g_BarsSincePeak >= 10 && profit < g_PeakProfit * 0.50)
+               crDwindling = true;
+            if(g_BarsSincePeak >= 20 && profit < g_PeakProfit * 0.70)
+               crDwindling = true;
+         }
+
+         // Structure-urgent exit
+         bool crStructUrgent = crStructAgainst && g_EarlyLockEngaged && profit < g_PeakProfit * 0.65;
+
+         if(crDwindling || crStructUrgent) {
+            string rsn = crDwindling ? "CR_DWINDLE" : "CR_STRUCT_URGENT";
+            g_LastMgmtAction = rsn;
+            Print("[CHRONO] ", rsn, ": peak=$", DoubleToString(g_PeakProfit, 2),
+                  " now=$", DoubleToString(profit, 2), " @H", ch);
+            trade.PositionClose(posInfo.Ticket());
+            ResetTradeGlobals(profit);
+            return;
+         }
+
+         // Trailing close
+         if((g_EarlyLockEngaged || g_ProfitLocked) && profit < g_PeakProfit - crAdaptTrail && profit > 0) {
+            g_LastMgmtAction = "CR_ADAPT_TRAIL";
+            Print("[CHRONO] ADAPTIVE TRAIL: peak=$", DoubleToString(g_PeakProfit, 2),
+                  " now=$", DoubleToString(profit, 2), " trail=$", DoubleToString(crAdaptTrail, 2));
+            trade.PositionClose(posInfo.Ticket());
+            ResetTradeGlobals(profit);
+            return;
+         }
+
+         // Time decay: 32+ bars without standard lock
+         if(g_OpenBarCount >= 32 && profit > 0 && !g_ProfitLocked) {
+            double minAccept = crEarlyLock * 0.60;
+            if(profit < minAccept) {
+               g_LastMgmtAction = "CR_TIME_DECAY";
+               Print("[CHRONO] TIME DECAY after ", g_OpenBarCount, " bars @H", ch);
+               trade.PositionClose(posInfo.Ticket());
+               ResetTradeGlobals(profit);
+               return;
+            }
          }
       }
    }
@@ -6328,6 +6592,32 @@ void UpdateDashboard()
          DashLine("R_hvtier", "Harvest : " + hvStr, rx, cy, rowR, lh, corner, clrGold, 8);
       } else {
          DashLine("R_hvtier", "", rx, cy, rowR, lh, corner, clrDimGray, 8);
+      }
+      rowR++;
+
+      // --- CHRONO session phase info (only when mode 5) ---
+      if(g_TradeOpen && TradeMgmtMode == 5) {
+         MqlDateTime cdtD; TimeToStruct(TimeCurrent(), cdtD);
+         int cdH = cdtD.hour;
+         string crPhStr    = "RIDE";
+         string crSubStr   = "ADAPT";
+         color  crPhClr    = clrCyan;
+         bool cdEarlyAsian = (cdH >= AsianStartHour && cdH < AsianStartHour + 3);
+         bool cdLateNY     = (cdH >= NewYorkEndHour - 2 && cdH < NewYorkEndHour);
+         bool cdOffHrs     = (cdH >= NewYorkEndHour || cdH < AsianStartHour);
+         bool cdOverlap    = (cdH >= NewYorkStartHour && cdH < LondonEndHour);
+         if(cdEarlyAsian || cdLateNY || cdOffHrs) {
+            crPhStr  = "SLASH";
+            crSubStr = "HARVEST";
+            crPhClr  = clrOrangeRed;
+         } else if(cdOverlap) {
+            crSubStr = "MOMENTUM";
+            crPhClr  = clrAqua;
+         }
+         DashLine("R_chrono", "Chrono  : " + crPhStr + " > " + crSubStr + " @H" + IntegerToString(cdH),
+                  rx, cy, rowR, lh, corner, crPhClr, 8);
+      } else {
+         DashLine("R_chrono", "", rx, cy, rowR, lh, corner, clrDimGray, 8);
       }
       rowR++;
 

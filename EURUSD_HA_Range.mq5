@@ -194,7 +194,7 @@ input double MaxDailyLossUSD    = 5.0;   // Stop trading after cumulative daily 
 input int    ConsecLossLimit    = 2;     // After N consecutive SL hits, pause trading
 input int    CooldownBars       = 8;     // Bars to pause after consecutive loss limit hit (8 = 2 hours)
 input int    PostTradeCoolBars  = 2;     // Cool-off bars after ANY trade closes before next entry (2 = 30 min)
-input int    StartupGraceBars   = 1;     // After restart, wait N new bars before allowing entry (re-evaluate)
+input int    StartupGraceMins   = 4;     // After real restart, wait N minutes before allowing entry (0=disabled; skipped on timeframe switch)
 input int    NoEntryAfterHour   = 21;    // No new entries after this server hour (0-23, 0=disabled)
 input int    PrepMaxBars        = 8;     // Max bars PREPARING can wait for Bollinger confirm before expiring (0=no limit)
 input int    FridayCloseHour    = 20;    // Force close open trades on Friday at this hour (0=disabled)
@@ -565,13 +565,17 @@ int OnInit()
    UpdateLiveSessionBar();
    g_ZoneLabel = ClassifyZone(SymbolInfoDouble(_Symbol, SYMBOL_BID));
 
-   // Startup grace period: wait for N new bars before allowing any entry.
-   // This ensures the bot re-evaluates conditions from scratch after restart
-   // instead of immediately firing a cached/recovered setup.
-   if(StartupGraceBars > 0) {
-      g_StartupGraceUntil = TimeCurrent() + (datetime)(StartupGraceBars * 15 * 60);
-      Print("[STARTUP GRACE] Waiting ", StartupGraceBars, " bar(s) before allowing entries (",
-            "until ", TimeToString(g_StartupGraceUntil, TIME_MINUTES), ")");
+   // Startup grace period: wait N minutes before allowing entries after a real restart.
+   // Skipped entirely when the user simply switches timeframe or symbol (REASON_CHARTCHANGE),
+   // since that is not a logic restart — conditions are still valid.
+   int  _reinitReason = UninitializeReason();
+   bool _isTFSwitch   = (_reinitReason == REASON_CHARTCHANGE);
+   if(StartupGraceMins > 0 && !_isTFSwitch) {
+      g_StartupGraceUntil = TimeCurrent() + (datetime)(StartupGraceMins * 60);
+      Print("[STARTUP GRACE] Waiting ", StartupGraceMins, " min(s) before allowing entries",
+            " (until ", TimeToString(g_StartupGraceUntil, TIME_MINUTES), ") reason=", _reinitReason);
+   } else if(_isTFSwitch) {
+      Print("[STARTUP GRACE] Skipped — timeframe/symbol switch (reason=", _reinitReason, ")");
    }
 
    UpdateDashboard();

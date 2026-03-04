@@ -1,10 +1,10 @@
 //+------------------------------------------------------------------+
-//|  EURUSD Heiken Ashi Range Bot v6.26                              |
-//|  Zones+Channels: Murray Math octaves, multi-day S/R, Fib exts,  |
-//|  soft/hard zone hardness, channel-aware TP extensions            |
+//|  EURUSD Heiken Ashi Range Bot v6.27                              |
+//|  H1 BOS coherence gate + Adaptive trade management modes:       |
+//|  STANDARD / SENTINEL / MOMENTUM / ADAPTIVE                      |
 //+------------------------------------------------------------------+
 #property copyright   "EURUSD HA Range Bot"
-#property version     "6.26"
+#property version     "6.27"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -31,6 +31,12 @@ input double RRRatio          = 1.8;    // Reward:Risk ratio (1.8 = for every $1
 // Lock/trail are now proportional to the dynamic SL, not fixed per tier
 input double LockPct          = 0.75;   // Lock profit at 75% of TP — only secure near-target profits
 input double TrailPct         = 0.30;   // Trail gap = 30% of TP — generous room to fluctuate
+// Trade management mode — controls how profits are protected during a live trade:
+//   0 = STANDARD  — classic lock/trail. Locks at LockPct of TP, trails at TrailPct.
+//   1 = SENTINEL  — conservative guardian. Early lock (40% TP), tighter trail, time decay exit.
+//   2 = MOMENTUM  — structure-informed. Widens trail on aligned BOS, tightens on adverse CHoCH.
+//   3 = ADAPTIVE  — full smart mode. Tracks peak/trough, dwindling detection, structure exits.
+input int    TradeMgmtMode    = 3;      // 0=STANDARD | 1=SENTINEL | 2=MOMENTUM | 3=ADAPTIVE
 // Mid-range time-exit: close if stalling in LOSS after MidRangeMaxBars
 input double MidRangeStallUSD = 0.00;   // Stall exit disabled — trust the SL/TP
 input int    MidRangeMaxBars  = 16;     // Bars before mid-range stall check (only if MidRangeStallUSD > 0)
@@ -247,6 +253,18 @@ bool   g_TradeOpen    = false;
 bool   g_ProfitLocked = false;
 double g_PeakProfit   = 0;
 double g_CurrentLot   = 0.01;
+
+// === ADAPTIVE TRADE MANAGEMENT TRACKING ===
+double g_TroughProfit     = 0;       // lowest profit since trade opened (max adverse excursion)
+int    g_BarsSincePeak    = 0;       // M15 bars since g_PeakProfit was last updated
+int    g_TradeDir         = 0;       // +1=BUY, -1=SELL (set at entry, persisted during trade)
+string g_EntryStructLabel = "";      // H1 structure label at entry time
+string g_EntryMacroLabel  = "";      // Macro structure label at entry time
+bool   g_EarlyLockEngaged = false;   // SENTINEL/ADAPTIVE: early lock level has been reached
+int    g_StructShiftCount = 0;       // times H1 structure changed direction during trade
+string g_LastMgmtAction   = "";      // last management action label (for dashboard/log)
+string g_TradeMgmtModeName = "STANDARD"; // resolved mode name
+
 int    g_TotalBias    = 0;
 
 // Auto market-derived bias components (recalculated every tick)
@@ -503,6 +521,19 @@ void RestoreExistingTrade()
       g_PeakProfit   = (profit > 0.0) ? profit : 0.0;
       g_ProfitLocked = (profit >= g_ScaledLockUSD);
 
+      // Restore adaptive management globals (best-effort from available data)
+      g_TroughProfit     = (profit < 0.0) ? profit : 0.0;
+      g_BarsSincePeak    = 0;   // can't recover — reset to 0
+      g_TradeDir         = (posInfo.PositionType() == POSITION_TYPE_BUY) ? 1 : -1;
+      g_EntryStructLabel = g_StructureLabel;    // use current (best approximation)
+      g_EntryMacroLabel  = g_MacroStructLabel;  // use current
+      g_EarlyLockEngaged = (profit >= g_DynamicTP_USD * 0.35 * (lot / 0.01));
+      g_StructShiftCount = 0;
+      g_LastMgmtAction   = "RESTORED";
+      g_TradeMgmtModeName = (TradeMgmtMode == 0) ? "STANDARD" :
+                             (TradeMgmtMode == 1) ? "SENTINEL" :
+                             (TradeMgmtMode == 2) ? "MOMENTUM" : "ADAPTIVE";
+
       Print("RESTORED position | Ticket:", posInfo.Ticket(),
             "  Lot:", DoubleToString(lot, 2),
             "  Bars:", g_OpenBarCount,
@@ -636,9 +667,7 @@ void OnTick()
                   double pnl = posInfo.Commission() + posInfo.Swap() + posInfo.Profit();
                   Print("FRIDAY CLOSE: closing before weekend | P&L=$", DoubleToString(pnl, 2));
                   trade.PositionClose(posInfo.Ticket());
-                  RecordTradeResult(pnl);
-                  g_TradeOpen = false; g_ProfitLocked = false;
-                  g_PeakProfit = 0; g_OpenBarCount = 0; g_Signal = "WAITING";
+                  ResetTradeGlobals(pnl);
                }
             }
          }
@@ -698,7 +727,10 @@ void OnTick()
       g_LastBarTime = barTime;
 
       // Count bars since trade open
-      if(g_TradeOpen) g_OpenBarCount++;
+      if(g_TradeOpen) {
+         g_OpenBarCount++;
+         g_BarsSincePeak++;
+      }
 
       // Daily reset check
       MqlDateTime dt;
@@ -4891,6 +4923,38 @@ void TryEntry()
       }
    }
 
+   // === H1 BOS STRUCTURAL COHERENCE GATE ===
+   // When H1 structure has confirmed a Break of Structure (BOS), taking a trade in the
+   // OPPOSITE direction fights a confirmed intermediate-timeframe move.
+   // Example: H1=BULLISH + BOS → block SELL.  H1=BEARISH + BOS → block BUY.
+   // Exemptions:
+   //  1) H1 CHoCH in the trade direction (reversal underway — H1 structure is challenged)
+   //  2) MacroCHoCH in the trade direction (higher-TF reversal overrides H1 continuation)
+   if(UseSwingStructure && g_BOSActive) {
+      bool h1Opposes = (tradeDir ==  1 && g_StructureLabel == "BEARISH") ||
+                       (tradeDir == -1 && g_StructureLabel == "BULLISH");
+      if(h1Opposes) {
+         bool _h1ChochExempt    = (g_CHoCHActive && g_CHoCHDir == tradeDir);
+         bool _macroChochExempt = (g_MacroCHoCH && g_MacroCHoCHDir == tradeDir);
+         if(!_h1ChochExempt && !_macroChochExempt) {
+            string _br = "TRADE BLOCKED: H1 BOS=" + g_StructureLabel +
+                         " — refusing " + (tradeDir == 1 ? "BUY" : "SELL") + " against confirmed H1 structure";
+            if(_br != g_LastBlockReason) {
+               Print(_br, " | SwingH:", DoubleToString(g_SwingHigh1,5),
+                     " SwingL:", DoubleToString(g_SwingLow1,5));
+               g_LastBlockReason = _br;
+            }
+            return;
+         }
+         if(_h1ChochExempt)
+            Print("[H1 CHoCH EXEMPT] H1 BOS=", g_StructureLabel, " would block ",
+                  (tradeDir==1?"BUY":"SELL"), " but H1 CHoCH(dir=", g_CHoCHDir, ") exempts");
+         else
+            Print("[MACRO CHoCH EXEMPT] H1 BOS=", g_StructureLabel, " would block ",
+                  (tradeDir==1?"BUY":"SELL"), " but MacroCHoCH(dir=", g_MacroCHoCHDir, ") overrides H1");
+      }
+   }
+
    // === FIB / PIVOT CONFLUENCE (check BEFORE tier calc) ===
    g_NearLevel = "";
    if(UseFibPivot) {
@@ -5091,6 +5155,9 @@ void TryEntry()
       g_TradeOpen     = true;
       g_ProfitLocked  = false;
       g_PeakProfit    = 0;
+      g_TroughProfit  = 0;
+      g_BarsSincePeak = 0;
+      g_TradeDir      = tradeDir;
       g_OpenBarCount  = 0;
       g_TradeOpenTime = TimeCurrent();
       g_IsNearMid     = isMidContext;
@@ -5100,6 +5167,14 @@ void TryEntry()
       g_HABearSetup   = false;
       g_MRVArmed      = false;
       g_MRVConfirmOpen = 0;
+      g_EntryStructLabel = g_StructureLabel;
+      g_EntryMacroLabel  = g_MacroStructLabel;
+      g_EarlyLockEngaged = false;
+      g_StructShiftCount = 0;
+      g_LastMgmtAction   = "";
+      g_TradeMgmtModeName = (TradeMgmtMode == 0) ? "STANDARD" :
+                             (TradeMgmtMode == 1) ? "SENTINEL" :
+                             (TradeMgmtMode == 2) ? "MOMENTUM" : "ADAPTIVE";
       g_DailyTradeCount++;
       if(MaxDailyTrades > 0 && g_DailyTradeCount >= MaxDailyTrades)
          Print("DAILY TRADE LIMIT reached (", g_DailyTradeCount, "/", MaxDailyTrades, ")");
@@ -5124,23 +5199,54 @@ void SetScaledThresholds(double lot)
    double scale = lot / 0.01;
    g_ScaledSLUSD    = g_DynamicSL_USD * scale;
    g_ScaledTPUSD    = g_DynamicTP_USD * scale;
-   g_ScaledLockUSD  = g_DynamicTP_USD * LockPct * scale;   // lock at 60% of TP
-   g_ScaledTrailUSD = g_DynamicTP_USD * TrailPct * scale;   // trail gap = 20% of TP
+   g_ScaledLockUSD  = g_DynamicTP_USD * LockPct * scale;   // lock at LockPct of TP
+   g_ScaledTrailUSD = g_DynamicTP_USD * TrailPct * scale;   // trail gap = TrailPct of TP
 }
 
 //+------------------------------------------------------------------+
-//| TRADE MANAGEMENT v7 — CONFIDENCE-BASED DYNAMIC                   |
-//| - Hard MaxLossUSD/0.01lot cap — absolute safety net             |
-//| - Dynamic lock/trail from LockPct/TrailPct × TP                |
-//| - Mid-range stall exit for low-momentum trades                  |
-//| - Max hold bars — exit if trade is stalling below lock level    |
-//| - Sideways: tighten trail when market chops                     |
-//| - High-confidence trail widening when profit exceeds 2× lock   |
+//| RESET TRADE GLOBALS — centralised cleanup on any trade close     |
+//| Called from ManageOpenTrade exits and FridayClose                |
+//+------------------------------------------------------------------+
+void ResetTradeGlobals(double closePnL)
+{
+   RecordTradeResult(closePnL);
+   g_TradeOpen        = false;
+   g_ProfitLocked     = false;
+   g_PeakProfit       = 0;
+   g_TroughProfit     = 0;
+   g_BarsSincePeak    = 0;
+   g_TradeDir         = 0;
+   g_OpenBarCount     = 0;
+   g_Signal           = "WAITING";
+   g_EntryStructLabel = "";
+   g_EntryMacroLabel  = "";
+   g_EarlyLockEngaged = false;
+   g_StructShiftCount = 0;
+   g_LastMgmtAction   = "";
+}
+
+//+------------------------------------------------------------------+
+//| TRADE MANAGEMENT v8 — MULTI-MODE ADAPTIVE                        |
+//| Modes: STANDARD(0), SENTINEL(1), MOMENTUM(2), ADAPTIVE(3)       |
+//|                                                                  |
+//| All modes share:                                                 |
+//|   - Hard MaxLossUSD cap (absolute safety net)                   |
+//|   - Mid-range stall exit (disabled by default)                  |
+//|   - Max hold bars exit (loss-only safety net)                   |
+//|                                                                  |
+//| MODE 0 — STANDARD: Classic lock at LockPct, trail at TrailPct.  |
+//| MODE 1 — SENTINEL: Early 40% TP lock, tighter 15% trail,       |
+//|          time-decay exit when profit dwindles.                  |
+//| MODE 2 — MOMENTUM: Structure-informed. Widens trail on aligned  |
+//|          BOS, tightens on adverse CHoCH. Balanced approach.     |
+//| MODE 3 — ADAPTIVE: Full smart. Peak/trough tracking, dwindling  |
+//|          detection, structure exits, graduated protection.      |
 //+------------------------------------------------------------------+
 void ManageOpenTrade()
 {
    if(!g_TradeOpen) return;
 
+   // --- Locate our position ---
    bool found = false;
    for(int i = PositionsTotal() - 1; i >= 0; i--) {
       if(posInfo.SelectByIndex(i)) {
@@ -5153,83 +5259,350 @@ void ManageOpenTrade()
 
    if(!found) {
       double closedPnL = GetLastClosedDealProfit();
-      RecordTradeResult(closedPnL);
       Print("Position closed by broker (SL/TP) | P&L=$", DoubleToString(closedPnL, 2));
-      g_TradeOpen    = false;
-      g_ProfitLocked = false;
-      g_PeakProfit   = 0;
-      g_OpenBarCount = 0;
-      g_Signal       = "WAITING";
+      ResetTradeGlobals(closedPnL);
       return;
    }
 
    double profit = posInfo.Commission() + posInfo.Swap() + posInfo.Profit();
-   if(profit > g_PeakProfit) g_PeakProfit = profit;
+   double scale  = g_CurrentLot / 0.01;
 
-   // === HARD LOSS CAP — MaxLossUSD per 0.01 lot, ALWAYS ===
-   double hardLossLimit = -(MaxLossUSD * g_CurrentLot / 0.01);
+   // --- Track peak and trough ---
+   if(profit > g_PeakProfit) {
+      g_PeakProfit    = profit;
+      g_BarsSincePeak = 0;   // reset on new peak
+   }
+   if(profit < g_TroughProfit)
+      g_TroughProfit = profit;
+
+   // --- Detect structure shift during trade (for MOMENTUM/ADAPTIVE) ---
+   // Count when H1 structure label changes from what it was at entry or last check
+   {
+      string currentStruct = g_StructureLabel;
+      if(g_EntryStructLabel != "" && currentStruct != g_EntryStructLabel) {
+         // Structure has shifted from entry — update tracker
+         // We only count once per direction change, not continuous
+         static string s_lastCheckedStruct = "";
+         if(currentStruct != s_lastCheckedStruct) {
+            g_StructShiftCount++;
+            s_lastCheckedStruct = currentStruct;
+         }
+      }
+   }
+
+   // --- Resolve effective mode ---
+   int mode = TradeMgmtMode;
+   if(mode < 0 || mode > 3) mode = 0;
+
+   // === HARD LOSS CAP — MaxLossUSD per 0.01 lot, ALWAYS (all modes) ===
+   double hardLossLimit = -(MaxLossUSD * scale);
    if(profit <= hardLossLimit) {
       Print("HARD LOSS CAP triggered: profit=$", DoubleToString(profit,2),
             " limit=$", DoubleToString(hardLossLimit,2));
       trade.PositionClose(posInfo.Ticket());
-      RecordTradeResult(profit);
-      g_TradeOpen = false; g_ProfitLocked = false;
-      g_PeakProfit = 0; g_OpenBarCount = 0; g_Signal = "WAITING";
+      ResetTradeGlobals(profit);
       return;
    }
 
-   // === MID-RANGE STALL EXIT (optional — disabled by default) ===
-   // Only fires when MidRangeStallUSD > 0 (user explicitly enables).
-   // Philosophy: trust the analysis. If confidence allowed the trade, give it time.
+   // === MID-RANGE STALL EXIT (optional — disabled by default, all modes) ===
    if(MidRangeStallUSD > 0 && g_IsNearMid && !g_ProfitLocked) {
       if(g_OpenBarCount >= MidRangeMaxBars) {
-         double midStallLimit = MidRangeStallUSD * g_CurrentLot / 0.01;
+         double midStallLimit = MidRangeStallUSD * scale;
          if(profit < midStallLimit) {
             Print("STALL exit: open ", g_OpenBarCount, " bars profit=$",
                   DoubleToString(profit,2), " (below $", DoubleToString(midStallLimit,2), ")");
             trade.PositionClose(posInfo.Ticket());
-            RecordTradeResult(profit);
-            g_TradeOpen = false; g_ProfitLocked = false;
-            g_PeakProfit = 0; g_OpenBarCount = 0; g_Signal = "WAITING";
+            ResetTradeGlobals(profit);
             return;
          }
       }
    }
 
-   // === MAX HOLD TIME EXIT ===
-   // ONLY exits trades that are in LOSS after max hold — profitable trades keep running.
-   // If the confidence allowed the entry, trust it to reach TP or SL.
-   // This is a pure safety net for trades stuck in drawdown, not a profit-clipper.
+   // === MAX HOLD TIME EXIT (loss-only safety net, all modes) ===
    if(g_OpenBarCount >= MaxHoldBars) {
       if(profit < 0) {
          Print("MAX HOLD exit after ", g_OpenBarCount, "/", MaxHoldBars,
-               " bars (IN LOSS) | profit=$", DoubleToString(profit,2),
-               " conf:", DoubleToString(g_Confidence,1), "%");
+               " bars (IN LOSS) | profit=$", DoubleToString(profit,2));
          trade.PositionClose(posInfo.Ticket());
-         RecordTradeResult(profit);
-         g_TradeOpen = false; g_ProfitLocked = false;
-         g_PeakProfit = 0; g_OpenBarCount = 0; g_Signal = "WAITING";
+         ResetTradeGlobals(profit);
          return;
       }
-      // Profitable but past max hold: keep running — SL/TP or trailing will close it
    }
 
-   // === STANDARD PROFIT LOCK ===
-   if(!g_ProfitLocked && profit >= g_ScaledLockUSD) {
-      g_ProfitLocked = true;
-      Print("PROFIT LOCK engaged at $", DoubleToString(profit,2),
-            " lock=$", DoubleToString(g_ScaledLockUSD,2));
-   }
+   // ================================================================
+   //  MODE-SPECIFIC LOCK & TRAIL LOGIC
+   // ================================================================
 
-   // === TRAILING CLOSE ===
-   if(g_ProfitLocked && profit < g_PeakProfit - g_ScaledTrailUSD) {
-      Print("TRAILING CLOSE: peak=$", DoubleToString(g_PeakProfit,2),
-            " now=$", DoubleToString(profit,2),
-            " trail=$", DoubleToString(g_ScaledTrailUSD,2));
-      trade.PositionClose(posInfo.Ticket());
-      RecordTradeResult(profit);
-      g_TradeOpen = false; g_ProfitLocked = false;
-      g_PeakProfit = 0; g_OpenBarCount = 0; g_Signal = "WAITING";
+   if(mode == 0) {
+      // === MODE 0: STANDARD ===
+      // Classic lock/trail. Lock at LockPct of TP, trail at TrailPct of TP.
+      if(!g_ProfitLocked && profit >= g_ScaledLockUSD) {
+         g_ProfitLocked = true;
+         g_LastMgmtAction = "LOCK@" + DoubleToString(profit,2);
+         Print("[STANDARD] PROFIT LOCK at $", DoubleToString(profit,2),
+               " lock=$", DoubleToString(g_ScaledLockUSD,2));
+      }
+      if(g_ProfitLocked && profit < g_PeakProfit - g_ScaledTrailUSD) {
+         g_LastMgmtAction = "TRAIL_CLOSE";
+         Print("[STANDARD] TRAILING CLOSE: peak=$", DoubleToString(g_PeakProfit,2),
+               " now=$", DoubleToString(profit,2), " trail=$", DoubleToString(g_ScaledTrailUSD,2));
+         trade.PositionClose(posInfo.Ticket());
+         ResetTradeGlobals(profit);
+      }
+
+   } else if(mode == 1) {
+      // === MODE 1: SENTINEL (conservative guardian) ===
+      // Early lock at 40% of TP, tight trail at 15% of TP.
+      // Time-decay: if profit dwindled for >12 bars after a significant peak, cut.
+      double earlyLockUSD  = g_DynamicTP_USD * 0.40 * scale;   // lock at 40% of TP
+      double tightTrailUSD = g_DynamicTP_USD * 0.15 * scale;   // trail gap = 15% of TP
+
+      // Early lock engagement
+      if(!g_EarlyLockEngaged && profit >= earlyLockUSD) {
+         g_EarlyLockEngaged = true;
+         g_LastMgmtAction = "EARLY_LOCK@" + DoubleToString(profit,2);
+         Print("[SENTINEL] EARLY LOCK at $", DoubleToString(profit,2),
+               " threshold=$", DoubleToString(earlyLockUSD,2));
+      }
+      // Standard lock (higher threshold)
+      if(!g_ProfitLocked && profit >= g_ScaledLockUSD) {
+         g_ProfitLocked = true;
+         g_LastMgmtAction = "FULL_LOCK@" + DoubleToString(profit,2);
+         Print("[SENTINEL] FULL LOCK at $", DoubleToString(profit,2));
+      }
+
+      // Time-decay exit: peak was significant but profit has been dwindling
+      // Fires when: had meaningful profit (>40% TP), now below 50% of peak, 12+ bars since peak
+      if(g_EarlyLockEngaged && g_BarsSincePeak >= 12 && g_PeakProfit > earlyLockUSD) {
+         if(profit < g_PeakProfit * 0.50 && profit > 0) {
+            g_LastMgmtAction = "TIME_DECAY_EXIT";
+            Print("[SENTINEL] TIME DECAY: peak=$", DoubleToString(g_PeakProfit,2),
+                  " now=$", DoubleToString(profit,2), " bars_since_peak=", g_BarsSincePeak,
+                  " — profit dwindled too long, protecting capital");
+            trade.PositionClose(posInfo.Ticket());
+            ResetTradeGlobals(profit);
+            return;
+         }
+      }
+
+      // Structure reversal exit: H1 CHoCH against trade → tighten immediately
+      bool structAgainst = false;
+      if(g_CHoCHActive && g_CHoCHDir != 0 && g_CHoCHDir != g_TradeDir)
+         structAgainst = true;
+      if(g_BOSActive && g_StructureLabel != "" && g_EntryStructLabel != "" && g_StructureLabel != g_EntryStructLabel) {
+         // BOS now confirms opposite direction to entry
+         bool bosAgainst = (g_TradeDir == 1 && g_StructureLabel == "BEARISH") ||
+                           (g_TradeDir == -1 && g_StructureLabel == "BULLISH");
+         if(bosAgainst) structAgainst = true;
+      }
+
+      // Trailing close with tighter trail when early-locked
+      double activeTrail = g_EarlyLockEngaged ? tightTrailUSD : g_ScaledTrailUSD;
+      if(structAgainst && g_EarlyLockEngaged) {
+         // Structure turned against us — use even tighter trail (10% of TP)
+         activeTrail = g_DynamicTP_USD * 0.10 * scale;
+         g_LastMgmtAction = "STRUCT_TIGHTEN";
+      }
+
+      if(g_EarlyLockEngaged && profit < g_PeakProfit - activeTrail && profit > 0) {
+         g_LastMgmtAction = "SENTINEL_TRAIL";
+         Print("[SENTINEL] TRAIL CLOSE: peak=$", DoubleToString(g_PeakProfit,2),
+               " now=$", DoubleToString(profit,2), " trail=$", DoubleToString(activeTrail,2),
+               structAgainst ? " (struct against!)" : "");
+         trade.PositionClose(posInfo.Ticket());
+         ResetTradeGlobals(profit);
+         return;
+      }
+      // Also respect standard lock/trail if engaged
+      if(g_ProfitLocked && profit < g_PeakProfit - tightTrailUSD) {
+         g_LastMgmtAction = "SENTINEL_FULL_TRAIL";
+         Print("[SENTINEL] FULL TRAIL CLOSE: peak=$", DoubleToString(g_PeakProfit,2),
+               " now=$", DoubleToString(profit,2));
+         trade.PositionClose(posInfo.Ticket());
+         ResetTradeGlobals(profit);
+      }
+
+   } else if(mode == 2) {
+      // === MODE 2: MOMENTUM (structure-informed, balanced) ===
+      // Lock at 50% of TP, trail at 25% normally.
+      // BOS with trade → widen trail to 40% of TP (let it run).
+      // CHoCH against trade → tighten trail to 12% of TP (protect).
+      double momLockUSD  = g_DynamicTP_USD * 0.50 * scale;
+      double baseTrail   = g_DynamicTP_USD * 0.25 * scale;
+      double wideTrail   = g_DynamicTP_USD * 0.40 * scale;
+      double tightTrail  = g_DynamicTP_USD * 0.12 * scale;
+
+      // Assess current structural alignment
+      bool structWithTrade    = false;
+      bool structAgainstTrade = false;
+
+      // H1 BOS in trade direction → strong continuation signal
+      if(g_BOSActive) {
+         if((g_TradeDir == 1 && g_StructureLabel == "BULLISH") ||
+            (g_TradeDir == -1 && g_StructureLabel == "BEARISH"))
+            structWithTrade = true;
+         if((g_TradeDir == 1 && g_StructureLabel == "BEARISH") ||
+            (g_TradeDir == -1 && g_StructureLabel == "BULLISH"))
+            structAgainstTrade = true;
+      }
+      // H1 CHoCH against trade → reversal warning
+      if(g_CHoCHActive && g_CHoCHDir != 0 && g_CHoCHDir != g_TradeDir)
+         structAgainstTrade = true;
+      // Macro still with trade → confidence boost
+      bool macroAligned = (g_TradeDir == 1 && g_MacroStructLabel == "BULLISH") ||
+                          (g_TradeDir == -1 && g_MacroStructLabel == "BEARISH");
+
+      // Select active trail width based on structure
+      double activeTrail = baseTrail;
+      if(structWithTrade && macroAligned)  activeTrail = wideTrail;    // both aligned → let it breathe
+      else if(structWithTrade)             activeTrail = baseTrail;     // H1 with us, macro neutral
+      else if(structAgainstTrade)          activeTrail = tightTrail;    // under threat → protect
+
+      // Lock engagement at 50% of TP
+      if(!g_ProfitLocked && profit >= momLockUSD) {
+         g_ProfitLocked = true;
+         g_LastMgmtAction = "MOM_LOCK@" + DoubleToString(profit,2);
+         Print("[MOMENTUM] LOCK at $", DoubleToString(profit,2),
+               " struct:", (structWithTrade ? "WITH" : structAgainstTrade ? "AGAINST" : "NEUTRAL"),
+               " macro:", (macroAligned ? "ALIGNED" : "—"));
+      }
+
+      // Trailing close
+      if(g_ProfitLocked && profit < g_PeakProfit - activeTrail) {
+         g_LastMgmtAction = "MOM_TRAIL";
+         Print("[MOMENTUM] TRAIL CLOSE: peak=$", DoubleToString(g_PeakProfit,2),
+               " now=$", DoubleToString(profit,2), " trail=$", DoubleToString(activeTrail,2),
+               " struct:", (structWithTrade ? "WITH" : structAgainstTrade ? "AGAINST" : "NEUTRAL"));
+         trade.PositionClose(posInfo.Ticket());
+         ResetTradeGlobals(profit);
+      }
+
+   } else {
+      // === MODE 3: ADAPTIVE (full smart) ===
+      // Graduated protection with three tiers:
+      //   Tier 1: Early protection at 35% of TP with a medium trail
+      //   Tier 2: Standard lock at LockPct of TP with structure-adjusted trail
+      //   Tier 3: Extended run when profit > TP and structure supports it
+      //
+      // Dwindling detection: if profit reached significant peak but has been
+      // oscillating/declining for many bars, accept the trade has stalled.
+      //
+      // Structure exits: H1 BOS/CHoCH during trade dynamically adjusts protection.
+
+      double earlyLockUSD = g_DynamicTP_USD * 0.35 * scale;   // Tier 1: 35% of TP
+      double stdLockUSD   = g_ScaledLockUSD;                   // Tier 2: standard LockPct
+      double tpUSD        = g_ScaledTPUSD;                     // full TP for reference
+
+      // --- Structural assessment ---
+      bool structWith    = false;
+      bool structAgainst = false;
+      bool macroAligned  = (g_TradeDir == 1 && g_MacroStructLabel == "BULLISH") ||
+                           (g_TradeDir == -1 && g_MacroStructLabel == "BEARISH");
+
+      if(g_BOSActive) {
+         if((g_TradeDir == 1 && g_StructureLabel == "BULLISH") ||
+            (g_TradeDir == -1 && g_StructureLabel == "BEARISH"))
+            structWith = true;
+         if((g_TradeDir == 1 && g_StructureLabel == "BEARISH") ||
+            (g_TradeDir == -1 && g_StructureLabel == "BULLISH"))
+            structAgainst = true;
+      }
+      if(g_CHoCHActive && g_CHoCHDir != 0 && g_CHoCHDir != g_TradeDir)
+         structAgainst = true;
+      // Macro CHoCH against trade = high-confidence reversal signal
+      bool macroCHoCHAgainst = (g_MacroCHoCH && g_MacroCHoCHDir != 0 && g_MacroCHoCHDir != g_TradeDir);
+
+      // --- Tier 1: Early protection ---
+      if(!g_EarlyLockEngaged && profit >= earlyLockUSD) {
+         g_EarlyLockEngaged = true;
+         g_LastMgmtAction = "ADAPT_EARLY@" + DoubleToString(profit,2);
+         Print("[ADAPTIVE] TIER1 EARLY LOCK at $", DoubleToString(profit,2),
+               " (35% of TP=$", DoubleToString(earlyLockUSD,2), ")");
+      }
+      // --- Tier 2: Standard lock ---
+      if(!g_ProfitLocked && profit >= stdLockUSD) {
+         g_ProfitLocked = true;
+         g_LastMgmtAction = "ADAPT_LOCK@" + DoubleToString(profit,2);
+         Print("[ADAPTIVE] TIER2 STANDARD LOCK at $", DoubleToString(profit,2));
+      }
+
+      // --- Calculate adaptive trail width ---
+      // Base: 25% of TP. Adjusted by structure:
+      //   +aligned BOS & macro: 40% (give room to run)
+      //   +aligned BOS only:    30%
+      //   +struct against:      12% (protect fast)
+      //   +macro CHoCH against: 10% (high-urgency protect)
+      //   +profit > TP:         45% (running hot — let it extend)
+      double adaptiveTrail;
+      if(macroCHoCHAgainst)                    adaptiveTrail = g_DynamicTP_USD * 0.10 * scale;
+      else if(structAgainst)                   adaptiveTrail = g_DynamicTP_USD * 0.12 * scale;
+      else if(profit >= tpUSD && structWith)   adaptiveTrail = g_DynamicTP_USD * 0.45 * scale;
+      else if(structWith && macroAligned)       adaptiveTrail = g_DynamicTP_USD * 0.40 * scale;
+      else if(structWith)                      adaptiveTrail = g_DynamicTP_USD * 0.30 * scale;
+      else                                     adaptiveTrail = g_DynamicTP_USD * 0.25 * scale;
+
+      // --- Dwindling detection ---
+      // If: (a) reached meaningful profit (>35% of TP),
+      //     (b) profit declined to <50% of peak for >10 bars,
+      //     (c) not currently ripping to new highs → trade has stalled, cut it
+      bool dwindling = false;
+      if(g_EarlyLockEngaged && g_PeakProfit > earlyLockUSD && profit > 0) {
+         if(g_BarsSincePeak >= 10 && profit < g_PeakProfit * 0.50) {
+            dwindling = true;
+         }
+         // Extended dwindling: if >20 bars since peak and below 70% of peak
+         if(g_BarsSincePeak >= 20 && profit < g_PeakProfit * 0.70) {
+            dwindling = true;
+         }
+      }
+
+      // --- Structure-accelerated exit ---
+      // If structure both CHoCH'd against trade AND profit is declining → urgent cut
+      bool structUrgent = structAgainst && g_EarlyLockEngaged && profit < g_PeakProfit * 0.65;
+
+      // --- Execute dwindling or structure-urgent exit ---
+      if(dwindling || structUrgent) {
+         string reason = dwindling ? "DWINDLING" : "STRUCT_URGENT";
+         g_LastMgmtAction = reason;
+         Print("[ADAPTIVE] ", reason, " EXIT: peak=$", DoubleToString(g_PeakProfit,2),
+               " now=$", DoubleToString(profit,2),
+               " bars_since_peak=", g_BarsSincePeak,
+               " struct:", (structWith ? "WITH" : structAgainst ? "AGAINST" : "NEUTRAL"),
+               " macro:", (macroAligned ? "ALIGNED" : macroCHoCHAgainst ? "CHoCH_AGAINST" : "—"));
+         trade.PositionClose(posInfo.Ticket());
+         ResetTradeGlobals(profit);
+         return;
+      }
+
+      // --- Trailing close (applies after early lock or standard lock) ---
+      if(g_EarlyLockEngaged || g_ProfitLocked) {
+         if(profit < g_PeakProfit - adaptiveTrail && profit > 0) {
+            g_LastMgmtAction = "ADAPT_TRAIL";
+            Print("[ADAPTIVE] TRAIL CLOSE: peak=$", DoubleToString(g_PeakProfit,2),
+                  " now=$", DoubleToString(profit,2),
+                  " trail=$", DoubleToString(adaptiveTrail,2),
+                  " struct:", (structWith ? "WITH" : structAgainst ? "AGAINST" : "NEUTRAL"),
+                  " tier:", (g_ProfitLocked ? "FULL" : "EARLY"));
+            trade.PositionClose(posInfo.Ticket());
+            ResetTradeGlobals(profit);
+            return;
+         }
+      }
+
+      // --- Time decay (ADAPTIVE specific): very long holds with modest profit ---
+      // After 32 bars (8 hours), if profit hasn't reached standard lock → progressive close
+      if(g_OpenBarCount >= 32 && profit > 0 && !g_ProfitLocked) {
+         double minAcceptable = earlyLockUSD * 0.60;   // at least 21% of TP after 8 hours
+         if(profit < minAcceptable) {
+            g_LastMgmtAction = "TIME_DECAY_STALL";
+            Print("[ADAPTIVE] TIME DECAY: ", g_OpenBarCount, " bars, profit=$",
+                  DoubleToString(profit,2), " below min acceptable $",
+                  DoubleToString(minAcceptable,2), " — closing stalled trade");
+            trade.PositionClose(posInfo.Ticket());
+            ResetTradeGlobals(profit);
+            return;
+         }
+      }
    }
 }
 
@@ -5748,9 +6121,9 @@ void UpdateDashboard()
       if(g_TradeOpen) {
          string modeStr = g_IsMeanRev ? "MEAN REV" : (g_IsNearMid ? "MID-validated" : "TREND");
          color  modeClr = g_IsMeanRev ? clrGold : (g_IsNearMid ? clrOrange : clrLime);
-         DashLine("R_mode", "Mode    : " + modeStr, rx, cy, rowR, lh, corner, modeClr, 9);
+         DashLine("R_mode", "Mode    : " + modeStr + " | " + g_TradeMgmtModeName, rx, cy, rowR, lh, corner, modeClr, 9);
       } else {
-         DashLine("R_mode", "Mode    : ---", rx, cy, rowR, lh, corner, clrDimGray, 9);
+         DashLine("R_mode", "Mode    : --- | " + g_TradeMgmtModeName, rx, cy, rowR, lh, corner, clrDimGray, 9);
       }
       rowR++;
 
@@ -5784,7 +6157,7 @@ void UpdateDashboard()
 
       if(g_TradeOpen) {
          DashLine("R_hold", "Hold    : " + IntegerToString(g_OpenBarCount) + "/" +
-                  IntegerToString(MaxHoldBars) + " bars",
+                  IntegerToString(MaxHoldBars) + " bars  SincePk:" + IntegerToString(g_BarsSincePeak),
                   rx, cy, rowR, lh, corner, clrWhite, 9);
       } else {
          DashLine("R_hold", "Hold    : ---", rx, cy, rowR, lh, corner, clrDimGray, 9);
@@ -5803,11 +6176,33 @@ void UpdateDashboard()
       if(g_TradeOpen) {
          string lockStr = g_ProfitLocked
                           ? "LOCKED  peak:$" + DoubleToString(g_PeakProfit, 2)
-                          : "Watch  lock@$" + DoubleToString(g_ScaledLockUSD, 2);
-         color  lColor  = g_ProfitLocked ? clrLime : clrOrange;
+                          : (g_EarlyLockEngaged ? "EARLY_LK" : "Watch") +
+                            "  lock@$" + DoubleToString(g_ScaledLockUSD, 2);
+         color  lColor  = g_ProfitLocked ? clrLime : g_EarlyLockEngaged ? clrYellow : clrOrange;
          DashLine("R_lock", "Lock    : " + lockStr, rx, cy, rowR, lh, corner, lColor, 9);
       } else {
          DashLine("R_lock", "Lock    : ---", rx, cy, rowR, lh, corner, clrDimGray, 9);
+      }
+      rowR++;
+
+      // --- In-trade tracking (peak/trough/struct shift) ---
+      if(g_TradeOpen) {
+         string trackStr = "Pk:$" + DoubleToString(g_PeakProfit, 2) +
+                           "  Lo:$" + DoubleToString(g_TroughProfit, 2) +
+                           "  Shifts:" + IntegerToString(g_StructShiftCount);
+         color  trackClr = (g_BarsSincePeak > 10) ? clrOrange :
+                           (g_PeakProfit > g_ScaledLockUSD) ? clrLime : clrSilver;
+         DashLine("R_track", "Track   : " + trackStr, rx, cy, rowR, lh, corner, trackClr, 8);
+      } else {
+         DashLine("R_track", "Track   : ---", rx, cy, rowR, lh, corner, clrDimGray, 8);
+      }
+      rowR++;
+
+      // --- Last management action ---
+      if(g_TradeOpen && g_LastMgmtAction != "") {
+         DashLine("R_mgmt", "MgmtAct : " + g_LastMgmtAction, rx, cy, rowR, lh, corner, clrCyan, 8);
+      } else {
+         DashLine("R_mgmt", "MgmtAct : ---", rx, cy, rowR, lh, corner, clrDimGray, 8);
       }
       rowR++;
    }

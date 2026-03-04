@@ -1,10 +1,10 @@
 //+------------------------------------------------------------------+
-//|  EURUSD Heiken Ashi Range Bot v6.28                              |
-//|  Fixed ADAPTIVE/CHRONO early-cut + Smart loss exit + Comeback    |
+//|  EURUSD Heiken Ashi Range Bot v6.29                              |
+//|  Volume gating + ATR SL/TP sizing + Real candle alignment        |
 //|  STANDARD / SENTINEL / MOMENTUM / ADAPTIVE / HARVESTER / CHRONO |
 //+------------------------------------------------------------------+
 #property copyright   "EURUSD HA Range Bot"
-#property version     "6.28"
+#property version     "6.29"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -73,6 +73,7 @@ input group "=== ASIAN SESSION MOMENTUM ==="
 input bool   AsianPrevDayMomEnabled = true;   // Enable prev-day last-hour momentum for Asian session
 input double AsianMomentumBonusPts  = 6.0;    // Confidence bonus when aligned (add-only, never penalises)
 input bool   AsianZoneStrictMode    = false;  // false=RELAX zone filter when momentum aligned; true=always enforce zones
+input int    AsianObserveBars      = 2;      // v6.29: first N bars of Asian session are observe-only (no entries)
 // RELAX mode: when prev-day momentum aligns with signal AND multiple factors agree,
 // the standard zone block (UPPER_THIRD for buy / LOWER_THIRD for sell) is lifted in Asian hours.
 // The trade is entered with standard (not narrowed) SL and a logged CAUTION note.
@@ -333,6 +334,7 @@ double   g_BollingerLower2 = 0;     // lower band bar 2
 // Prev-day last-hour momentum (for Asian session zone relaxation)
 int      g_PrevDayLastHourDir  = 0;    // +1 = prev day last hour was bullish, -1 = bearish, 0 = unknown
 bool     g_AsianZoneRelaxed    = false; // true = zone filter currently relaxed due to Asian momentum alignment
+int      g_AsianBarCount       = 0;    // v6.29: bars elapsed since Asian session started today
 
 // Mean reversion two-candle state machine
 bool     g_MRVArmed       = false;
@@ -389,6 +391,7 @@ string g_VolumeState   = "NORMAL";           // "HIGH" / "ABOVE_AVG" / "NORMAL" 
 double g_VolRatio      = 1.0;               // current vol / average vol
 bool   g_VolDivergence = false;              // price trending but volume declining
 bool   g_DivergenceCaution = false;          // true when TP was capped due to MTF/volume divergence
+bool   g_RealCandleAligned = false;          // v6.29: true when real candle direction matches HA on bars 1 & 2
 string g_LastBlockReason   = "";             // last TryEntry block message — only print when it changes
 
 // Macro Trend Ride state
@@ -810,6 +813,17 @@ void OnTick()
          // Reset outside Asian session so it is recalculated fresh each new day
          if(!inAsian)
             g_AsianZoneRelaxed = false;
+
+         // v6.29: Asian observation bar counter
+         // Increments each new bar during Asian session; resets when session starts or outside Asian
+         if(inAsian) {
+            if(bdT.hour == AsianStartHour && bdT.min == 0)
+               g_AsianBarCount = 1;  // first bar of session
+            else
+               g_AsianBarCount++;    // subsequent bars
+         } else {
+            g_AsianBarCount = 0;     // outside Asian — reset
+         }
       }
 
       // Market structure analysis (runs on new bar only — uses confirmed bars)
@@ -853,6 +867,14 @@ void OnTick()
          bool liveOK = (_body > 0) &&
                        ((_barH - _bid) < _rng * 0.33) &&
                        (_body >= _rng * 0.20);
+         // v6.29: Real candle alignment — confirmed bars 1 & 2 must also be bullish
+         if(liveOK) {
+            double _ftRC1 = iClose(_Symbol, PERIOD_M15, 1);
+            double _ftRO1 = iOpen (_Symbol, PERIOD_M15, 1);
+            double _ftRC2 = iClose(_Symbol, PERIOD_M15, 2);
+            double _ftRO2 = iOpen (_Symbol, PERIOD_M15, 2);
+            if(_ftRC1 < _ftRO1 && _ftRC2 < _ftRO2) liveOK = false;  // both confirmed bars bearish = block
+         }
          if(liveOK && LiveHABollingerOK(1)) {
             Print("[FAST-TRACK BUY] Preflight green + live bar bullish body=",
                   DoubleToString(_body/_Point/10.0, 1), "pip @", DoubleToString(_bid,5),
@@ -872,6 +894,14 @@ void OnTick()
          bool liveOK = (_body > 0) &&
                        ((_bid - _barL) < _rng * 0.33) &&
                        (_body >= _rng * 0.20);
+         // v6.29: Real candle alignment — confirmed bars 1 & 2 must also be bearish
+         if(liveOK) {
+            double _ftRC1 = iClose(_Symbol, PERIOD_M15, 1);
+            double _ftRO1 = iOpen (_Symbol, PERIOD_M15, 1);
+            double _ftRC2 = iClose(_Symbol, PERIOD_M15, 2);
+            double _ftRO2 = iOpen (_Symbol, PERIOD_M15, 2);
+            if(_ftRC1 > _ftRO1 && _ftRC2 > _ftRO2) liveOK = false;  // both confirmed bars bullish = block
+         }
          if(liveOK && LiveHABollingerOK(-1)) {
             Print("[FAST-TRACK SELL] Preflight green + live bar bearish body=",
                   DoubleToString(_body/_Point/10.0, 1), "pip @", DoubleToString(_bid,5),
@@ -2918,7 +2948,7 @@ double CalcConfidence(int tradeDir, string zone, bool isMeanRev, bool isSideways
          if(volWithTrade)  conf += 4.0;
          else              conf += 2.0;
       } else if(g_VolumeState == "LOW") {
-         conf -= 3.0;   // dead volume = unreliable
+         conf -= 8.0;   // dead volume = unreliable, ranging market (v6.29: was -3, now -8)
       }
       if(g_VolDivergence) conf -= 3.0;  // price trending but volume fading = weakening
    }
@@ -3095,6 +3125,24 @@ double CalcConfidence(int tradeDir, string zone, bool isMeanRev, bool isSideways
    }
    g_ConfBreakdown += " FVGovlp:" + DoubleToString(conf - prevConf, 0); prevConf = conf;
 
+   // --- FACTOR 18 — HA + REAL CANDLE ALIGNMENT (v6.29) ---
+   // When HA direction matches the real (OHLC) candle direction on bars 1 and 2,
+   // the signal has genuine price confirmation — not just a smoothed artifact.
+   // Both aligned = strong gift; both misaligned = strong penalty; mixed = slight penalty.
+   {
+      double _rc1 = iClose(_Symbol, PERIOD_M15, 1);
+      double _ro1 = iOpen (_Symbol, PERIOD_M15, 1);
+      double _rc2 = iClose(_Symbol, PERIOD_M15, 2);
+      double _ro2 = iOpen (_Symbol, PERIOD_M15, 2);
+      bool realMatch1 = (tradeDir == 1) ? (_rc1 > _ro1) : (_rc1 < _ro1);
+      bool realMatch2 = (tradeDir == 1) ? (_rc2 > _ro2) : (_rc2 < _ro2);
+      g_RealCandleAligned = (realMatch1 && realMatch2);
+      if(realMatch1 && realMatch2)       conf += 6.0;    // both aligned = genuine momentum
+      else if(!realMatch1 && !realMatch2) conf -= 6.0;   // both misaligned = HA is misleading
+      else                                conf -= 2.0;   // mixed = slight distrust
+   }
+   g_ConfBreakdown += " CdlAlign:" + DoubleToString(conf - prevConf, 0); prevConf = conf;
+
    // --- PENALTIES ---
    if(isSideways)  conf -= 8.0;
    if(isMeanRev)   conf -= 3.0;
@@ -3223,16 +3271,56 @@ double CalcStructuralSL(int tradeDir)
    // Clamp to user limits
    slUSD = MathMax(MinSL_USD, MathMin(MaxSL_USD, slUSD));
 
+   // === VOLUME / ATR / MOMENTUM SL/TP ADJUSTMENT (v6.29) ===
+   // Dynamic multipliers give the SL room to breathe in volatile/low-volume markets
+   // and let TP run when institutional volume is present.
+   double slMult = 1.0;
+   double tpMult = 1.0;
+
+   // Volume-driven: LOW = wider SL (needs room in choppy market), tighter TP (conservative)
+   //                HIGH = wider TP (let institutional move run)
+   if(g_VolumeState == "LOW")            { slMult *= 1.25; tpMult *= 0.80; }
+   else if(g_VolumeState == "HIGH")      { tpMult *= 1.15; }
+   else if(g_VolumeState == "ABOVE_AVG") { tpMult *= 1.05; }
+
+   // ATR-driven: elevated volatility requires wider SL to avoid premature stop-outs
+   double _atrPips = (g_ATR > 0) ? (g_ATR / _Point / 10.0) : 10.0;
+   if(_atrPips >= 20.0)      slMult *= 1.20;   // high volatility — give SL 20% more room
+   else if(_atrPips >= 14.0) slMult *= 1.10;   // moderate-high
+
+   // Bar momentum: average range of last 3 confirmed bars vs ATR
+   // Strong bars = price is moving decisively → widen both SL (room) and TP (capture)
+   double _avgBarRng = 0;
+   for(int m = 1; m <= 3; m++)
+      _avgBarRng += iHigh(_Symbol, PERIOD_M15, m) - iLow(_Symbol, PERIOD_M15, m);
+   _avgBarRng /= 3.0;
+   double _momRatio = (g_ATR > 0) ? _avgBarRng / g_ATR : 1.0;
+   if(_momRatio >= 1.5) { slMult *= 1.10; tpMult *= 1.10; }   // strong momentum
+
+   // Apply multipliers
+   double adjSL = slUSD * slMult;
+   double adjTP = slUSD * RRRatio * tpMult;
+
+   // Re-clamp: allow SL up to 30% above MaxSL_USD for dynamic adjustments, TP at least 1:1
+   adjSL = MathMax(MinSL_USD, MathMin(MaxSL_USD * 1.3, adjSL));
+   adjTP = MathMax(adjSL * 1.0, adjTP);   // TP floor = 1:1 R:R
+
    // Store globally
-   g_DynamicSL_USD = slUSD;
-   g_DynamicTP_USD = slUSD * RRRatio;   // TP = SL × R:R
+   g_DynamicSL_USD = adjSL;
+   g_DynamicTP_USD = adjTP;
 
-   Print("STRUCTURAL SL: $", DoubleToString(slUSD, 2), "/0.01lot",
-         " (", DoubleToString(slPips, 1), " pips)",
-         " TP: $", DoubleToString(g_DynamicTP_USD, 2),
-         " R:R=1:", DoubleToString(RRRatio, 1));
+   Print("STRUCTURAL SL: $", DoubleToString(adjSL, 2), "/0.01lot",
+         " (", DoubleToString(adjSL / 0.10, 1), " pips)",
+         " TP: $", DoubleToString(adjTP, 2),
+         " R:R=1:", DoubleToString(adjTP / adjSL, 1),
+         " [base=$", DoubleToString(slUSD, 2),
+         " slMult=", DoubleToString(slMult, 2),
+         " tpMult=", DoubleToString(tpMult, 2),
+         " Vol=", g_VolumeState,
+         " ATR=", DoubleToString(_atrPips, 1), "pip",
+         " Mom=", DoubleToString(_momRatio, 2), "]");
 
-   return slUSD;
+   return adjSL;
 }
 
 //+------------------------------------------------------------------+
@@ -3839,7 +3927,30 @@ void EvaluateHAPattern()
          } else if(bollOK) {
             g_BollOverridden = false; g_BollOverrideReason = "";
          }
+         // === REAL CANDLE ALIGNMENT GATE (v6.29) ===
+         // HA says bullish — verify real candles (OHLC) on bars 1 & 2 are also bullish.
+         // If both real candles are bearish, the HA signal is just a smoothing artifact — stay PREPARING.
+         bool realCandleOK = true;
          if(bollOK) {
+            double _rcB1 = iClose(_Symbol, PERIOD_M15, 1);
+            double _roB1 = iOpen (_Symbol, PERIOD_M15, 1);
+            double _rcB2 = iClose(_Symbol, PERIOD_M15, 2);
+            double _roB2 = iOpen (_Symbol, PERIOD_M15, 2);
+            bool _realBull1 = (_rcB1 > _roB1);
+            bool _realBull2 = (_rcB2 > _roB2);
+            g_RealCandleAligned = (_realBull1 && _realBull2);
+            if(!_realBull1 && !_realBull2) {
+               // Both real candles bearish while HA is bullish — block promotion
+               realCandleOK = false;
+               Print("PREPARING BUY: Real candle MISALIGNED — HA bullish but BOTH real candles bearish",
+                     " bar1=", DoubleToString(_rcB1-_roB1,5), " bar2=", DoubleToString(_rcB2-_roB2,5),
+                     " — waiting for real alignment.");
+            } else if(!_realBull1 || !_realBull2) {
+               Print("BUY: Real candle MIXED — bar1=", (_realBull1?"BULL":"BEAR"),
+                     " bar2=", (_realBull2?"BULL":"BEAR"), " — proceeding with caution");
+            }
+         }
+         if(bollOK && realCandleOK) {
             if(g_ConfirmCandleOpen == 0)
                g_ConfirmCandleOpen = iTime(_Symbol, PERIOD_M15, 1);
             g_Signal = "BUY INCOMING";
@@ -3848,14 +3959,16 @@ void EvaluateHAPattern()
          } else {
             g_Signal            = "PREPARING BUY";
             g_ConfirmCandleOpen = 0;
-            Print("PREPARING BUY: Bollinger gate BLOCKING",
-                  (isNarrow ? " [NARROW band=" + DoubleToString(bandWidthPips,1) + "pip]" : ""),
-                  " HA_H1=", DoubleToString(haH1b, 5),
-                  " BodyMid1=", DoubleToString(bodyMid1, 5),
-                  " BollMid=", DoubleToString(g_BollingerMid1, 5),
-                  " BollUpper=", DoubleToString(g_BollingerUpper1, 5),
-                  isNarrow ? " (need HA high >= BollMid)" : " (need body <= BollMid)",
-                  " | Override-check: ", g_BollOverrideReason);
+            if(!bollOK)
+               Print("PREPARING BUY: Bollinger gate BLOCKING",
+                     (isNarrow ? " [NARROW band=" + DoubleToString(bandWidthPips,1) + "pip]" : ""),
+                     " HA_H1=", DoubleToString(haH1b, 5),
+                     " BodyMid1=", DoubleToString(bodyMid1, 5),
+                     " BollMid=", DoubleToString(g_BollingerMid1, 5),
+                     " BollUpper=", DoubleToString(g_BollingerUpper1, 5),
+                     isNarrow ? " (need HA high >= BollMid)" : " (need body <= BollMid)",
+                     " | Override-check: ", g_BollOverrideReason);
+            // Note: realCandleOK=false already printed its own diagnostic above
          }
       } else {
          // === TREND BOLD TIER EVALUATION (consec > MaxConsecCandles) ===
@@ -3967,7 +4080,30 @@ void EvaluateHAPattern()
          } else if(bollOK) {
             g_BollOverridden = false; g_BollOverrideReason = "";
          }
+         // === REAL CANDLE ALIGNMENT GATE — SELL (v6.29) ===
+         // HA says bearish — verify real candles (OHLC) on bars 1 & 2 are also bearish.
+         // If both real candles are bullish, the HA signal is just a smoothing artifact.
+         bool realCandleOKS = true;
          if(bollOK) {
+            double _rcS1 = iClose(_Symbol, PERIOD_M15, 1);
+            double _roS1 = iOpen (_Symbol, PERIOD_M15, 1);
+            double _rcS2 = iClose(_Symbol, PERIOD_M15, 2);
+            double _roS2 = iOpen (_Symbol, PERIOD_M15, 2);
+            bool _realBear1 = (_rcS1 < _roS1);
+            bool _realBear2 = (_rcS2 < _roS2);
+            g_RealCandleAligned = (_realBear1 && _realBear2);
+            if(!_realBear1 && !_realBear2) {
+               // Both real candles bullish while HA is bearish — block promotion
+               realCandleOKS = false;
+               Print("PREPARING SELL: Real candle MISALIGNED — HA bearish but BOTH real candles bullish",
+                     " bar1=", DoubleToString(_rcS1-_roS1,5), " bar2=", DoubleToString(_rcS2-_roS2,5),
+                     " — waiting for real alignment.");
+            } else if(!_realBear1 || !_realBear2) {
+               Print("SELL: Real candle MIXED — bar1=", (_realBear1?"BEAR":"BULL"),
+                     " bar2=", (_realBear2?"BEAR":"BULL"), " — proceeding with caution");
+            }
+         }
+         if(bollOK && realCandleOKS) {
             if(g_ConfirmCandleOpen == 0)
                g_ConfirmCandleOpen = iTime(_Symbol, PERIOD_M15, 1);
             g_Signal = "SELL INCOMING";
@@ -3976,14 +4112,15 @@ void EvaluateHAPattern()
          } else {
             g_Signal            = "PREPARING SELL";
             g_ConfirmCandleOpen = 0;
-            Print("PREPARING SELL: Bollinger gate BLOCKING",
-                  (isNarrow ? " [NARROW band=" + DoubleToString(bandWidthPips,1) + "pip]" : ""),
-                  " HA_L1=", DoubleToString(haL1s, 5),
-                  " BodyMid1=", DoubleToString(bodyMid1s, 5),
-                  " BollMid=", DoubleToString(g_BollingerMid1, 5),
-                  " BollLower=", DoubleToString(g_BollingerLower1, 5),
-                  isNarrow ? " (need HA low <= BollMid)" : " (need body >= BollMid)",
-                  " | Override-check: ", g_BollOverrideReason);
+            if(!bollOK)
+               Print("PREPARING SELL: Bollinger gate BLOCKING",
+                     (isNarrow ? " [NARROW band=" + DoubleToString(bandWidthPips,1) + "pip]" : ""),
+                     " HA_L1=", DoubleToString(haL1s, 5),
+                     " BodyMid1=", DoubleToString(bodyMid1s, 5),
+                     " BollMid=", DoubleToString(g_BollingerMid1, 5),
+                     " BollLower=", DoubleToString(g_BollingerLower1, 5),
+                     isNarrow ? " (need HA low <= BollMid)" : " (need body >= BollMid)",
+                     " | Override-check: ", g_BollOverrideReason);
          }
       } else {
          // === TREND BOLD TIER EVALUATION (consec > MaxConsecCandles) ===
@@ -4177,6 +4314,9 @@ void EvaluateHAPattern()
       // MTF / volume divergence flag
       if(!g_MTFAligned)  confirmed += " | ⚠️MTF-DIVERGED";
       if(g_VolDivergence) confirmed += " | ⚠️VOL-DIVERGED";
+      // v6.29: Volume state + real candle alignment in diagnostic
+      confirmed += " | Vol=" + g_VolumeState + "(x" + DoubleToString(g_VolRatio,2) + ")";
+      confirmed += " | RealCdl=" + (g_RealCandleAligned ? "ALIGNED" : "MIXED/MISS");
       if(!g_MTFAligned && g_VolDivergence)
          confirmed += " → BOTH diverged: will BLOCK entry (DivergenceCautionEnabled)";
       else if(!g_MTFAligned || g_VolDivergence)
@@ -4223,6 +4363,18 @@ void EvaluateHAPattern()
       nextGates += " | Struct=" + g_StructureLabel + " MacroStr=" + g_MacroStructLabel;
       nextGates += " | H4zones=" + hpH4;
       if(g_BoldBet) nextGates += " | BOLD BET active";
+      // v6.29: Volume and candle alignment status in next-gates
+      bool hpVolOK = !(UseVolumeAnalysis && g_VolumeState == "LOW");
+      bool hpAsianObsOK = true;
+      {
+         MqlDateTime _pfAdt; TimeToStruct(TimeCurrent(), _pfAdt);
+         bool _pfInAsian = (_pfAdt.hour >= AsianStartHour && _pfAdt.hour < AsianEndHour);
+         if(_pfInAsian && AsianObserveBars > 0 && g_AsianBarCount <= AsianObserveBars)
+            hpAsianObsOK = false;
+      }
+      nextGates += "\n  " + (hpVolOK ? "✓" : "✗") + " Vol=" + g_VolumeState + "(x" + DoubleToString(g_VolRatio,2) + ")";
+      nextGates += " | RealCdlAlign=" + (g_RealCandleAligned ? "ALIGNED" : "mixed/miss");
+      nextGates += " | " + (hpAsianObsOK ? "✓" : "✗") + " AsianObs=" + IntegerToString(g_AsianBarCount) + "/" + IntegerToString(AsianObserveBars);
 
       Print("STILL " + g_Signal + " — bar " + IntegerToString(g_HAConsecCount) + " of max " + IntegerToString(MaxConsecCandles) + "\n",
             "  CONFIRMED:\n", confirmed, "\n",
@@ -4240,13 +4392,15 @@ void EvaluateHAPattern()
       bool macroBOSBlockPF = _macroBOSRawPF && !_chochExmptPF;
       bool allDownGatesOK = hpZoneOK && hpBiasOK && hpConfOK && hpTimeOK &&
                             hpCooldownOK && hpForeignOK && hpDailyOK && hpDailyLossOK &&
-                            !macroBOSBlockPF && !g_TradeOpen;
+                            !macroBOSBlockPF && !g_TradeOpen && hpVolOK && hpAsianObsOK;
 
       if(isBuy)  g_PreflightBullOK = allDownGatesOK;
       else       g_PreflightBearOK = allDownGatesOK;
 
       if(!allDownGatesOK) {
-         if(!hpTimeOK)         g_PreflightBlocker = "NoEntryAfter=" + IntegerToString(NoEntryAfterHour) + ":00";
+         if(!hpVolOK)          g_PreflightBlocker = "LOW volume (ratio=" + DoubleToString(g_VolRatio,2) + ")";
+         else if(!hpAsianObsOK) g_PreflightBlocker = "AsianObs bar " + IntegerToString(g_AsianBarCount) + "/" + IntegerToString(AsianObserveBars);
+         else if(!hpTimeOK)         g_PreflightBlocker = "NoEntryAfter=" + IntegerToString(NoEntryAfterHour) + ":00";
          else if(!hpCooldownOK) g_PreflightBlocker = cooldownInfo;
          else if(!hpDailyOK)    g_PreflightBlocker = "DailyTrades=" + IntegerToString(g_DailyTradeCount) + "/" + IntegerToString(MaxDailyTrades);
          else if(!hpDailyLossOK)g_PreflightBlocker = "DailyLoss=$" + DoubleToString(g_DailyPnL,2);
@@ -5003,6 +5157,30 @@ void TryEntry()
       string _br = "SELL blocked by STRONG BULL bias (" + IntegerToString(g_TotalBias) + ")";
       if(_br != g_LastBlockReason) { Print(_br); g_LastBlockReason = _br; }
       return;
+   }
+// === VOLUME LOW HARD BLOCK (v6.29) ===
+   // LOW volume (ratio <= 0.5) = ranging/dwindling/tap-in zones — unreliable for trending entries.
+   // Block all new entries when volume is dead to avoid getting chopped in a directionless market.
+   if(UseVolumeAnalysis && g_VolumeState == "LOW") {
+      string _br = (tradeDir == 1 ? "BUY" : "SELL") + " blocked: LOW volume (ratio="
+                   + DoubleToString(g_VolRatio, 2) + ") — ranging/dwindling market, no entries";
+      if(_br != g_LastBlockReason) { Print(_br); g_LastBlockReason = _br; }
+      return;
+   }
+
+   // === ASIAN OBSERVATION DELAY (v6.29) ===
+   // First 2 bars of Asian session are observation-only: track signals but don't enter.
+   // These bars establish the tone for the session — trades that follow benefit from this context.
+   if(AsianObserveBars > 0) {
+      MqlDateTime _aOdt; TimeToStruct(TimeCurrent(), _aOdt);
+      bool _inAsianNow = (_aOdt.hour >= AsianStartHour && _aOdt.hour < AsianEndHour);
+      if(_inAsianNow && g_AsianBarCount <= AsianObserveBars) {
+         string _br = (tradeDir == 1 ? "BUY" : "SELL") + " blocked: Asian observation (bar "
+                      + IntegerToString(g_AsianBarCount) + "/" + IntegerToString(AsianObserveBars)
+                      + ") — watching market before entering";
+         if(_br != g_LastBlockReason) { Print(_br); g_LastBlockReason = _br; }
+         return;
+      }
    }
 
    // === MACRO BOS DIRECTIONAL BLOCK ===

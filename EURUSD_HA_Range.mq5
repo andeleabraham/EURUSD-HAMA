@@ -1,10 +1,10 @@
 //+------------------------------------------------------------------+
-//|  EURUSD Heiken Ashi Range Bot v6.27                              |
-//|  H1 BOS coherence gate + Adaptive trade management modes:       |
-//|  STANDARD / SENTINEL / MOMENTUM / ADAPTIVE                      |
+//|  EURUSD Heiken Ashi Range Bot v6.27a                             |
+//|  H1 BOS coherence gate + 5 trade management modes:              |
+//|  STANDARD / SENTINEL / MOMENTUM / ADAPTIVE / HARVESTER          |
 //+------------------------------------------------------------------+
 #property copyright   "EURUSD HA Range Bot"
-#property version     "6.27"
+#property version     "6.27a"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -36,7 +36,8 @@ input double TrailPct         = 0.30;   // Trail gap = 30% of TP — generous ro
 //   1 = SENTINEL  — conservative guardian. Early lock (40% TP), tighter trail, time decay exit.
 //   2 = MOMENTUM  — structure-informed. Widens trail on aligned BOS, tightens on adverse CHoCH.
 //   3 = ADAPTIVE  — full smart mode. Tracks peak/trough, dwindling detection, structure exits.
-input int    TradeMgmtMode    = 3;      // 0=STANDARD | 1=SENTINEL | 2=MOMENTUM | 3=ADAPTIVE
+//   4 = HARVESTER — profit-tier slasher. Closes at $1/$1.50/$2 (per 0.01 lot) based on context.
+input int    TradeMgmtMode    = 3;      // 0-4: STD|SENT|MOM|ADAPT|HARVEST
 // Mid-range time-exit: close if stalling in LOSS after MidRangeMaxBars
 input double MidRangeStallUSD = 0.00;   // Stall exit disabled — trust the SL/TP
 input int    MidRangeMaxBars  = 16;     // Bars before mid-range stall check (only if MidRangeStallUSD > 0)
@@ -532,7 +533,8 @@ void RestoreExistingTrade()
       g_LastMgmtAction   = "RESTORED";
       g_TradeMgmtModeName = (TradeMgmtMode == 0) ? "STANDARD" :
                              (TradeMgmtMode == 1) ? "SENTINEL" :
-                             (TradeMgmtMode == 2) ? "MOMENTUM" : "ADAPTIVE";
+                             (TradeMgmtMode == 2) ? "MOMENTUM" :
+                             (TradeMgmtMode == 3) ? "ADAPTIVE" : "HARVESTER";
 
       Print("RESTORED position | Ticket:", posInfo.Ticket(),
             "  Lot:", DoubleToString(lot, 2),
@@ -5174,7 +5176,8 @@ void TryEntry()
       g_LastMgmtAction   = "";
       g_TradeMgmtModeName = (TradeMgmtMode == 0) ? "STANDARD" :
                              (TradeMgmtMode == 1) ? "SENTINEL" :
-                             (TradeMgmtMode == 2) ? "MOMENTUM" : "ADAPTIVE";
+                             (TradeMgmtMode == 2) ? "MOMENTUM" :
+                             (TradeMgmtMode == 3) ? "ADAPTIVE" : "HARVESTER";
       g_DailyTradeCount++;
       if(MaxDailyTrades > 0 && g_DailyTradeCount >= MaxDailyTrades)
          Print("DAILY TRADE LIMIT reached (", g_DailyTradeCount, "/", MaxDailyTrades, ")");
@@ -5226,8 +5229,9 @@ void ResetTradeGlobals(double closePnL)
 }
 
 //+------------------------------------------------------------------+
-//| TRADE MANAGEMENT v8 — MULTI-MODE ADAPTIVE                        |
-//| Modes: STANDARD(0), SENTINEL(1), MOMENTUM(2), ADAPTIVE(3)       |
+//| TRADE MANAGEMENT v9 — 5-MODE SYSTEM                              |
+//| Modes: STANDARD(0), SENTINEL(1), MOMENTUM(2), ADAPTIVE(3),     |
+//|        HARVESTER(4)                                             |
 //|                                                                  |
 //| All modes share:                                                 |
 //|   - Hard MaxLossUSD cap (absolute safety net)                   |
@@ -5241,6 +5245,9 @@ void ResetTradeGlobals(double closePnL)
 //|          BOS, tightens on adverse CHoCH. Balanced approach.     |
 //| MODE 3 — ADAPTIVE: Full smart. Peak/trough tracking, dwindling  |
 //|          detection, structure exits, graduated protection.      |
+//| MODE 4 — HARVESTER: Profit-tier slasher. Closes at $1/$1.5/$2  |
+//|          per 0.01 lot based on structure/momentum context.      |
+//|          Quick materialisation — slashes once a tier is hit.    |
 //+------------------------------------------------------------------+
 void ManageOpenTrade()
 {
@@ -5292,7 +5299,7 @@ void ManageOpenTrade()
 
    // --- Resolve effective mode ---
    int mode = TradeMgmtMode;
-   if(mode < 0 || mode > 3) mode = 0;
+   if(mode < 0 || mode > 4) mode = 0;
 
    // === HARD LOSS CAP — MaxLossUSD per 0.01 lot, ALWAYS (all modes) ===
    double hardLossLimit = -(MaxLossUSD * scale);
@@ -5477,7 +5484,7 @@ void ManageOpenTrade()
          ResetTradeGlobals(profit);
       }
 
-   } else {
+   } else if(mode == 3) {
       // === MODE 3: ADAPTIVE (full smart) ===
       // Graduated protection with three tiers:
       //   Tier 1: Early protection at 35% of TP with a medium trail
@@ -5598,6 +5605,120 @@ void ManageOpenTrade()
             Print("[ADAPTIVE] TIME DECAY: ", g_OpenBarCount, " bars, profit=$",
                   DoubleToString(profit,2), " below min acceptable $",
                   DoubleToString(minAcceptable,2), " — closing stalled trade");
+            trade.PositionClose(posInfo.Ticket());
+            ResetTradeGlobals(profit);
+            return;
+         }
+      }
+
+   } else {
+      // === MODE 4: HARVESTER (profit-tier slasher) ===
+      // Philosophy: entries are strong — materialise profits at fixed dollar
+      // thresholds instead of trailing.  The TARGET tier is selected once when
+      // profit first reaches the base ($1.00/0.01 lot), informed by current
+      // structure, macro alignment, and momentum.  Once the tier is hit the
+      // trade is immediately "slashed" (closed).
+      //
+      // Tiers (per 0.01 lot, scaled to actual lot):
+      //   QUICK  = $1.00   — structure against / neutral, dwindling risk
+      //   MID    = $1.50   — partial alignment (one of H1 BOS or macro)
+      //   FULL   = $2.00   — strong alignment (H1 BOS with + macro aligned)
+      //
+      // Safety nets:
+      //   - If profit reached 85%+ of base tier then drops back 30%+ from
+      //     peak within 6 bars → protect gains (don't let $0.90 → $0)
+      //   - Dwindling: reached tier but stalling → close immediately
+
+      double hvBase = 1.00 * scale;     // $1.00 per 0.01 lot
+      double hvMid  = 1.50 * scale;     // $1.50 per 0.01 lot
+      double hvFull = 2.00 * scale;     // $2.00 per 0.01 lot
+
+      // --- Structural assessment ---
+      bool hvStructWith    = false;
+      bool hvStructAgainst = false;
+      bool hvMacroAligned  = (g_TradeDir == 1 && g_MacroStructLabel == "BULLISH") ||
+                             (g_TradeDir == -1 && g_MacroStructLabel == "BEARISH");
+
+      if(g_BOSActive) {
+         if((g_TradeDir == 1 && g_StructureLabel == "BULLISH") ||
+            (g_TradeDir == -1 && g_StructureLabel == "BEARISH"))
+            hvStructWith = true;
+         if((g_TradeDir == 1 && g_StructureLabel == "BEARISH") ||
+            (g_TradeDir == -1 && g_StructureLabel == "BULLISH"))
+            hvStructAgainst = true;
+      }
+      if(g_CHoCHActive && g_CHoCHDir != 0 && g_CHoCHDir != g_TradeDir)
+         hvStructAgainst = true;
+      bool hvMacroCHoCH = (g_MacroCHoCH && g_MacroCHoCHDir != 0 && g_MacroCHoCHDir != g_TradeDir);
+
+      // --- Select harvest tier based on current context ---
+      double harvestTarget = hvBase;   // default: quick harvest
+      string tierLabel     = "QUICK";
+
+      if(hvStructWith && hvMacroAligned && !hvMacroCHoCH) {
+         harvestTarget = hvFull;       // both aligned → max $2.00
+         tierLabel     = "FULL";
+      } else if((hvStructWith || hvMacroAligned) && !hvStructAgainst) {
+         harvestTarget = hvMid;        // one aligned → mid $1.50
+         tierLabel     = "MID";
+      }
+      // Force quick if structure actively against trade
+      if(hvStructAgainst || hvMacroCHoCH) {
+         harvestTarget = hvBase;
+         tierLabel     = "QUICK";
+      }
+
+      // Update dashboard with target info
+      if(profit < hvBase && g_LastMgmtAction == "")
+         g_LastMgmtAction = "TARGET:" + tierLabel + "($" + DoubleToString(harvestTarget / scale, 2) + ")";
+
+      // --- SLASH: profit hit the selected tier → close immediately ---
+      if(profit >= harvestTarget) {
+         g_LastMgmtAction = "SLASH_" + tierLabel;
+         Print("[HARVESTER] SLASH ", tierLabel, " at $", DoubleToString(profit, 2),
+               " target=$", DoubleToString(harvestTarget, 2),
+               " struct:", (hvStructWith ? "WITH" : hvStructAgainst ? "AGAINST" : "NEUTRAL"),
+               " macro:", (hvMacroAligned ? "ALIGNED" : hvMacroCHoCH ? "CHoCH_AGT" : "---"));
+         trade.PositionClose(posInfo.Ticket());
+         ResetTradeGlobals(profit);
+         return;
+      }
+
+      // --- Step-down: if targeting MID/FULL but structure turns against → slash at base ---
+      if(harvestTarget > hvBase && profit >= hvBase && hvStructAgainst) {
+         g_LastMgmtAction = "SLASH_DOWNGRADE";
+         Print("[HARVESTER] DOWNGRADE SLASH: target was ", tierLabel,
+               " but struct turned against — closing at $", DoubleToString(profit, 2));
+         trade.PositionClose(posInfo.Ticket());
+         ResetTradeGlobals(profit);
+         return;
+      }
+
+      // --- Safety net: profit reached near-base (85%+) but dwindling back ---
+      // Protect: don't let a $0.85+ profit turn into a loss
+      double nearBaseThresh = hvBase * 0.85;   // $0.85 per 0.01 lot
+      if(g_PeakProfit >= nearBaseThresh && profit > 0) {
+         // Peak was near/above $1 — monitor for pullback
+         if(g_BarsSincePeak >= 6 && profit < g_PeakProfit * 0.70) {
+            g_LastMgmtAction = "HARVEST_PROTECT";
+            Print("[HARVESTER] PROTECT: peak=$", DoubleToString(g_PeakProfit, 2),
+                  " now=$", DoubleToString(profit, 2),
+                  " bars_since_peak=", g_BarsSincePeak,
+                  " — profit dwindling before tier, protecting gains");
+            trade.PositionClose(posInfo.Ticket());
+            ResetTradeGlobals(profit);
+            return;
+         }
+      }
+
+      // --- Extended dwindling: reached base tier but now sinking ---
+      // Reached $1+ but has been declining for 8+ bars and below 60% of peak
+      if(g_PeakProfit >= hvBase && g_BarsSincePeak >= 8 && profit > 0) {
+         if(profit < g_PeakProfit * 0.60) {
+            g_LastMgmtAction = "HARVEST_DWINDLE";
+            Print("[HARVESTER] DWINDLE EXIT: peak=$", DoubleToString(g_PeakProfit, 2),
+                  " now=$", DoubleToString(profit, 2),
+                  " — profit decaying after reaching $1+ zone");
             trade.PositionClose(posInfo.Ticket());
             ResetTradeGlobals(profit);
             return;
@@ -6195,6 +6316,18 @@ void UpdateDashboard()
          DashLine("R_track", "Track   : " + trackStr, rx, cy, rowR, lh, corner, trackClr, 8);
       } else {
          DashLine("R_track", "Track   : ---", rx, cy, rowR, lh, corner, clrDimGray, 8);
+      }
+      rowR++;
+
+      // --- HARVESTER tier info (only when mode 4) ---
+      if(g_TradeOpen && TradeMgmtMode == 4) {
+         double hvScale = g_CurrentLot / 0.01;
+         string hvStr = "$" + DoubleToString(1.00 * hvScale, 2) + " / " +
+                        "$" + DoubleToString(1.50 * hvScale, 2) + " / " +
+                        "$" + DoubleToString(2.00 * hvScale, 2);
+         DashLine("R_hvtier", "Harvest : " + hvStr, rx, cy, rowR, lh, corner, clrGold, 8);
+      } else {
+         DashLine("R_hvtier", "", rx, cy, rowR, lh, corner, clrDimGray, 8);
       }
       rowR++;
 

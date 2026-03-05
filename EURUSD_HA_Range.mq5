@@ -655,6 +655,40 @@ void ScanForeignTrades()
 }
 
 //+------------------------------------------------------------------+
+// v6.33: Seed session bar counters at startup so they reflect the correct value
+// even when the EA loads mid-session (not just on the next new-bar event).
+// Uses iBarShift on PERIOD_M15 from the session-start datetime today.
+void SeedSessionBarCounts()
+{
+   MqlDateTime dt; TimeToStruct(TimeCurrent(), dt);
+   bool _sInAsian  = (dt.hour >= AsianStartHour   && dt.hour < AsianEndHour);
+   bool _sInLondon = (dt.hour >= LondonStartHour  && dt.hour < LondonEndHour);
+   bool _sInNY     = (dt.hour >= NewYorkStartHour && dt.hour < NewYorkEndHour);
+   datetime _today = (TimeCurrent() / 86400) * 86400;  // midnight of server today
+   if(_sInAsian) {
+      datetime _sessStart = _today + (datetime)(AsianStartHour * 3600);
+      int _bars = (int)iBarShift(_Symbol, PERIOD_M15, _sessStart, false);
+      g_AsianBarCount = (_bars >= 0) ? _bars + 1 : 1;
+      Print("[SEED] AsianBarCount=", g_AsianBarCount, " (now ", dt.hour, ":",
+            IntegerToString(dt.min, 2, '0'), " Asian started ", AsianStartHour, ":00)");
+   }
+   if(_sInLondon) {
+      datetime _sessStart = _today + (datetime)(LondonStartHour * 3600);
+      int _bars = (int)iBarShift(_Symbol, PERIOD_M15, _sessStart, false);
+      g_LondonBarCount = (_bars >= 0) ? _bars + 1 : 1;
+      Print("[SEED] LondonBarCount=", g_LondonBarCount, " (now ", dt.hour, ":",
+            IntegerToString(dt.min, 2, '0'), " London started ", LondonStartHour, ":00)");
+   }
+   if(_sInNY) {
+      datetime _sessStart = _today + (datetime)(NewYorkStartHour * 3600);
+      int _bars = (int)iBarShift(_Symbol, PERIOD_M15, _sessStart, false);
+      g_NYBarCount = (_bars >= 0) ? _bars + 1 : 1;
+      Print("[SEED] NYBarCount=", g_NYBarCount, " (now ", dt.hour, ":",
+            IntegerToString(dt.min, 2, '0'), " NY started ", NewYorkStartHour, ":00)");
+   }
+}
+
+//+------------------------------------------------------------------+
 int OnInit()
 {
    trade.SetExpertMagicNumber(202502);
@@ -673,6 +707,8 @@ int OnInit()
 
    // Warm up HA chain cache immediately so cold-start recovery has accurate values
    BuildHACache();
+   // v6.33: Seed session bar counters so observe windows are correct when EA loads mid-session
+   SeedSessionBarCounts();
 
    // Startup grace period: wait N minutes before allowing entries after a TRUE COLD START.
    // Skipped on warm restarts where market data is already in memory:

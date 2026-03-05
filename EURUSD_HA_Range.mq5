@@ -1438,6 +1438,55 @@ void DetectSwingStructure()
       g_CHoCHActive = true;
    }
 
+   // === H1 CONSECUTIVE OVERRIDE ===
+   // The swing-point algorithm requires 3 confirmed bars each side, so during a fast
+   // run of same-direction candles the label can lag by several bars.  If the last 4+
+   // closed H1 HA candles are all the same direction but the label disagrees, override
+   // it immediately — this is what the trader sees on the chart.
+   {
+      // Compute H1 HA via a 10-bar recursive chain (same formula as BuildHACache)
+      const int H1_SEED = 10;
+      double h1haO[11], h1haC[11];
+      h1haO[H1_SEED] = (iOpen(_Symbol, PERIOD_H1, H1_SEED) + iClose(_Symbol, PERIOD_H1, H1_SEED)) / 2.0;
+      h1haC[H1_SEED] = (iOpen(_Symbol, PERIOD_H1, H1_SEED) + iHigh(_Symbol, PERIOD_H1, H1_SEED)
+                       + iLow(_Symbol, PERIOD_H1, H1_SEED) + iClose(_Symbol, PERIOD_H1, H1_SEED)) / 4.0;
+      for(int k = H1_SEED - 1; k >= 1; k--) {
+         double bO = iOpen(_Symbol, PERIOD_H1, k), bH = iHigh(_Symbol, PERIOD_H1, k);
+         double bL = iLow (_Symbol, PERIOD_H1, k), bC = iClose(_Symbol, PERIOD_H1, k);
+         h1haC[k] = (bO + bH + bL + bC) / 4.0;
+         h1haO[k] = (h1haO[k+1] + h1haC[k+1]) / 2.0;
+      }
+      // Count consecutive H1 HA direction from bar 1 outward
+      int h1ConsecDir = 0;
+      if     (h1haC[1] > h1haO[1] + _Point) h1ConsecDir =  1;
+      else if(h1haC[1] < h1haO[1] - _Point) h1ConsecDir = -1;
+      int h1Consec = 0;
+      for(int k = 1; k <= 6 && h1ConsecDir != 0; k++) {
+         int kDir = (h1haC[k] > h1haO[k] + _Point) ? 1 : ((h1haC[k] < h1haO[k] - _Point) ? -1 : 0);
+         if(kDir == h1ConsecDir) h1Consec++;
+         else break;
+      }
+      // Override when 4+ consecutive H1 HA bars disagree with current label
+      if(h1Consec >= 4) {
+         string ovLabel = (h1ConsecDir == 1) ? "BULLISH" : "BEARISH";
+         if(g_StructureLabel != ovLabel) {
+            Print("[H1 CONSEC OVERRIDE] ", h1Consec,
+                  " consecutive H1 HA candles = ", ovLabel,
+                  " — overriding stale label (was ", g_StructureLabel, ")");
+            g_StructureLabel = ovLabel;
+            // If the new label is the opposite of current, fire a synthetic CHoCH
+            // so the entry block (below in TryEntry) also activates.
+            int synthDir = h1ConsecDir;   // +1=bull override, -1=bear override
+            if(!g_CHoCHActive || g_CHoCHDir != synthDir) {
+               g_CHoCHDir    = synthDir;
+               g_CHoCHTime   = h1BarTime;
+               g_CHoCHActive = true;
+               Print("[H1 CONSEC OVERRIDE] Synthetic CHoCH fired: dir=", synthDir);
+            }
+         }
+      }
+   }
+
    // Expose to confidence scorer & other consumers
    g_BOS   = g_BOSActive;
    g_CHoCH = g_CHoCHActive;
@@ -5418,6 +5467,38 @@ void TryEntry()
          else
             Print("[MACRO CHoCH EXEMPT] H1 BOS=", g_StructureLabel, " would block ",
                   (tradeDir==1?"BUY":"SELL"), " but MacroCHoCH(dir=", g_MacroCHoCHDir, ") overrides H1");
+      }
+   }
+
+   // === H1 CHoCH DIRECTIONAL BLOCK ===
+   // CHoCH signals the END of the previous trend direction. A trade in the pre-CHoCH
+   // direction (against the reversal) must be blocked — CHoCH is active evidence that
+   // the structure has changed, regardless of whether a BOS is also active.
+   //
+   //  CHoCHDir = -1 (bearish reversal) → block BUY  (pre-CHoCH direction was up)
+   //  CHoCHDir = +1 (bullish reversal) → block SELL (pre-CHoCH direction was down)
+   //
+   // Exemptions:
+   //  • isMeanRev: explicit counter-trend bounce at range extreme — own logic
+   //  • MacroCHoCH in the trade direction: higher-TF reversal overrides H1 CHoCH
+   //  • isMacroTrend: MacroBOS structural ride already gated separately above
+   if(UseSwingStructure && g_CHoCHActive && g_CHoCHDir != 0 && !isMeanRev && !isMacroTrend) {
+      bool tradeAgainstCHoCH = (tradeDir == -g_CHoCHDir);
+      if(tradeAgainstCHoCH) {
+         bool _macroExempt = (g_MacroCHoCH && g_MacroCHoCHDir == tradeDir);
+         if(!_macroExempt) {
+            string _br = "TRADE BLOCKED: H1 CHoCH=" + (g_CHoCHDir > 0 ? "Bull" : "Bear") +
+                         " — refusing " + (tradeDir == 1 ? "BUY" : "SELL") +
+                         " in pre-CHoCH direction (reversal underway)";
+            if(_br != g_LastBlockReason) {
+               Print(_br, " | CHoCHTime:", TimeToString(g_CHoCHTime, TIME_MINUTES),
+                     " StructNow:", g_StructureLabel);
+               g_LastBlockReason = _br;
+            }
+            return;
+         }
+         Print("[CHoCH-MACRO EXEMPT] H1 CHoCH(dir=", g_CHoCHDir, ") would block ",
+               (tradeDir==1?"BUY":"SELL"), " but MacroCHoCH(dir=", g_MacroCHoCHDir, ") overrides");
       }
    }
 

@@ -1,10 +1,10 @@
 //+------------------------------------------------------------------+
-//|  EURUSD Heiken Ashi Range Bot v6.35                              |
+//|  EURUSD Heiken Ashi Range Bot v6.36                              |
 //|  Volume gating + ATR SL/TP sizing + Real candle alignment        |
 //|  STANDARD / SENTINEL / MOMENTUM / ADAPTIVE / HARVESTER / CHRONO |
 //+------------------------------------------------------------------+
 #property copyright   "EURUSD HA Range Bot"
-#property version     "6.35"
+#property version     "6.36"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -199,6 +199,8 @@ input double MidZonePct       = 0.30;   // Mid zone = middle 30% of range (15% e
 input double ExtremePct       = 0.15;   // Extreme zone = outer 15% near H/L (avoid for trend)
 // Mean reversion: enter when HA confirms bounce from range extreme
 input bool   AllowMeanReversion = true; // Enable HA-confirmed mean reversion trades at range extremes
+input double MRV_SLScale        = 0.75; // v6.36: SL multiplier for MRV trades (tighter SL since range-bound)
+input double MRV_TPScale        = 0.60; // v6.36: TP multiplier for MRV trades (shorter target to midrange)
 //
 // Zone strictness controls how "wrong zone" trend trades are treated:
 //   0 = STRICT        — Hard block. Zone is an absolute barrier; no exceptions ever.
@@ -248,6 +250,10 @@ input int    NoEntryAfterHour   = 21;    // No new entries after this server hou
 input int    PrepMaxBars        = 8;     // Max bars PREPARING can wait for Bollinger confirm before expiring (0=no limit)
 input int    FridayCloseHour    = 20;    // Force close open trades on Friday at this hour (0=disabled)
 
+input group "=== RISK MANAGEMENT (v6.36) ==="
+input double MaxSpreadPips       = 2.5;   // Block entry when spread exceeds this (0=disabled)
+input double MaxDrawdownPct      = 5.0;   // Block entries when account drawdown exceeds this % from peak equity (0=disabled)
+
 input group "=== DASHBOARD POSITION ==="
 input int    DashboardCorner  = 0;
 input int    DashboardX       = 10;
@@ -258,6 +264,7 @@ input int    DashboardY       = 20;
 // Foreign trade tracking (non-bot positions on this account)
 int    g_ForeignCountSymbol = 0;    // foreign trades on THIS symbol (EURUSD)
 int    g_ForeignCountTotal  = 0;    // foreign trades on ALL symbols
+double g_PeakEquity         = 0;    // v6.36: peak equity watermark for drawdown tracking
 double g_ForeignLotsSymbol  = 0.0;  // total lots of foreign trades on this symbol
 string g_ForeignSummary     = "";   // human-readable summary for dashboard
 
@@ -446,6 +453,11 @@ string g_LastBlockReason   = "";             // last TryEntry block message — 
 int    g_hMA200 = INVALID_HANDLE;
 int    g_hMA50  = INVALID_HANDLE;
 int    g_hMA20  = INVALID_HANDLE;
+// v6.36: Persistent indicator handles (avoid create/destroy per bar)
+int    g_hATR   = INVALID_HANDLE;   // H1 ATR handle
+int    g_hBands = INVALID_HANDLE;   // M15 Bollinger Bands handle
+datetime g_LastH4BarTime = 0;        // v6.36: track H4 bar for frequency gating
+datetime g_M1M5BlockStart = 0;       // v6.36: when M1/M5 double-oppose started (soft timeout)
 double g_MA200 = 0, g_MA50 = 0, g_MA20 = 0;  // current MA levels (bar 0 live)
 bool   g_AboveMA200   = false;  // current bid > MA200
 bool   g_AboveMA50    = false;  // current bid > MA50
@@ -947,6 +959,11 @@ int OnInit()
       else
          Print("[MA INIT] M15 MA handles ready: MA", MA200Period, "/MA", MA50Period, "/MA", MA20Period);
    }
+   // v6.36: Create persistent ATR and Bollinger handles (avoid per-bar create/destroy overhead)
+   g_hATR   = iATR  (_Symbol, PERIOD_H1,  ATRPeriod);
+   g_hBands = iBands(_Symbol, PERIOD_M15, BollingerPeriod, 0, 2.0, PRICE_CLOSE);
+   if(g_hATR == INVALID_HANDLE)   Print("[INIT] WARNING: ATR handle creation failed");
+   if(g_hBands == INVALID_HANDLE) Print("[INIT] WARNING: Bollinger handle creation failed");
    // v6.33: Seed session bar counters so observe windows are correct when EA loads mid-session
    SeedSessionBarCounts();
    UpdateMAValues();  // v6.34: seed MA values at startup
@@ -983,8 +1000,18 @@ int OnInit()
    }
 
    UpdateDashboard();
-   Print("HA Range Bot v5 initialized. Range H=", g_RangeHigh, " L=", g_RangeLow);
+   // v6.36: Timer-driven dashboard (1 Hz instead of per-tick)
+   EventSetTimer(1);
+   Print("HA Range Bot v6.36 initialized. Range H=", g_RangeHigh, " L=", g_RangeLow);
    return INIT_SUCCEEDED;
+}
+
+//+------------------------------------------------------------------+
+//| TIMER — dashboard refresh at 1 Hz (v6.36)                       |
+//+------------------------------------------------------------------+
+void OnTimer()
+{
+   UpdateDashboard();
 }
 
 //+------------------------------------------------------------------+
@@ -993,10 +1020,14 @@ void OnDeinit(const int reason)
    ObjectsDeleteAll(0, DASH_PREFIX);
    ObjectsDeleteAll(0, "HABOT_LVL_");
    ObjectsDeleteAll(0, "HABOT_FVG_");
+   EventKillTimer();  // v6.36: stop dashboard timer
    // v6.34: Release MA indicator handles
    if(g_hMA200 != INVALID_HANDLE) { IndicatorRelease(g_hMA200); g_hMA200 = INVALID_HANDLE; }
    if(g_hMA50  != INVALID_HANDLE) { IndicatorRelease(g_hMA50);  g_hMA50  = INVALID_HANDLE; }
    if(g_hMA20  != INVALID_HANDLE) { IndicatorRelease(g_hMA20);  g_hMA20  = INVALID_HANDLE; }
+   // v6.36: Release persistent ATR and Bollinger handles
+   if(g_hATR   != INVALID_HANDLE) { IndicatorRelease(g_hATR);   g_hATR   = INVALID_HANDLE; }
+   if(g_hBands != INVALID_HANDLE) { IndicatorRelease(g_hBands); g_hBands = INVALID_HANDLE; }
    // v6.35: Cancel any live MA200 pending order on EA removal/deinit
    if(g_PendingMA200Ticket != 0) {
       if(OrderSelect(g_PendingMA200Ticket))
@@ -1014,6 +1045,10 @@ void OnTick()
    // Track ticks since attach — D1[0] data may be stale on first few ticks
    // while the terminal syncs history. We wait 20 ticks before trusting it.
    if(g_InitTickCount < 100) g_InitTickCount++;
+
+   // v6.36: track peak equity watermark for drawdown protection
+   double _eq = AccountInfoDouble(ACCOUNT_EQUITY);
+   if(_eq > g_PeakEquity) g_PeakEquity = _eq;
 
    // Scan for foreign (non-bot) trades every tick
    ScanForeignTrades();
@@ -1085,8 +1120,6 @@ void OnTick()
 
    // Ensure HA chain cache is current (O(1) check; rebuilds only on new bar or first tick)
    BuildHACache();
-   // v6.34: Update MA values and daily extension tracking every tick
-   UpdateMAValues();
 
    // New bar processing
    datetime barTime = iTime(_Symbol, PERIOD_M15, 0);
@@ -1115,6 +1148,7 @@ void OnTick()
       g_CurrentLot = CalcLot();
       ComputeATR();
       CalcBollinger();
+      UpdateMAValues();  // v6.36: moved from per-tick to per-bar (values only change on bar close)
       SetActiveRange();
       RecalcBias();
       CalcFibPivotLevels();   // recalc on every new bar
@@ -1300,7 +1334,13 @@ void OnTick()
       if(UseVolumeAnalysis)  AnalyzeVolume();
       if(UseLiquiditySweep)  DetectLiquiditySweep();
       if(UseFairValueGaps)   { DetectFairValueGaps(); DrawFVGZones(); }
-      if(UseH4SMC)           { DetectH4OrderBlocks(); DetectH4FairValueGaps(); DrawH4SMCZones(); }
+      if(UseH4SMC) {
+         datetime h4t = iTime(_Symbol, PERIOD_H4, 0);
+         if(h4t != g_LastH4BarTime) {   // v6.36: only recompute on new H4 bar
+            g_LastH4BarTime = h4t;
+            DetectH4OrderBlocks(); DetectH4FairValueGaps(); DrawH4SMCZones();
+         }
+      }
 
       // --- FVG H1+H4 overlap confluence detection ---
       DetectFVGOverlap();
@@ -1385,8 +1425,6 @@ void OnTick()
 
    // Keep range fresh every tick (g_TodayHigh/Low grows on each tick)
    SetActiveRange();
-
-   UpdateDashboard();
 }
 
 //+------------------------------------------------------------------+
@@ -1710,14 +1748,12 @@ void SetActiveRange()
 //+------------------------------------------------------------------+
 void ComputeATR()
 {
-   int handle = iATR(_Symbol, PERIOD_H1, ATRPeriod);
-   if(handle == INVALID_HANDLE) return;
+   if(g_hATR == INVALID_HANDLE) return;
    double buf[];
    ArraySetAsSeries(buf, true);
-   if(CopyBuffer(handle, 0, 0, 3, buf) > 0) {
+   if(CopyBuffer(g_hATR, 0, 0, 3, buf) > 0) {
       g_ATR = buf[1];  // use confirmed bar
    }
-   IndicatorRelease(handle);
 
    if(g_TodayHigh > 0 && g_TodayLow > 0) {
       double mid   = (g_TodayHigh + g_TodayLow) / 2.0;
@@ -1769,15 +1805,14 @@ void CalcPrevDayLastHourDir()
 //+------------------------------------------------------------------+
 void CalcBollinger()
 {
-   int handle = iBands(_Symbol, PERIOD_M15, BollingerPeriod, 0, 2.0, PRICE_CLOSE);
-   if(handle == INVALID_HANDLE) return;
+   if(g_hBands == INVALID_HANDLE) return;
    double mid[], upper[], lower[];
    ArraySetAsSeries(mid,   true);
    ArraySetAsSeries(upper, true);
    ArraySetAsSeries(lower, true);
-   bool midOK   = (CopyBuffer(handle, 0, 0, 4, mid)   >= 3);  // buffer 0 = SMA midline
-   bool upperOK = (CopyBuffer(handle, 1, 0, 4, upper) >= 3);  // buffer 1 = upper band
-   bool lowerOK = (CopyBuffer(handle, 2, 0, 4, lower) >= 3);  // buffer 2 = lower band
+   bool midOK   = (CopyBuffer(g_hBands, 0, 0, 4, mid)   >= 3);  // buffer 0 = SMA midline
+   bool upperOK = (CopyBuffer(g_hBands, 1, 0, 4, upper) >= 3);  // buffer 1 = upper band
+   bool lowerOK = (CopyBuffer(g_hBands, 2, 0, 4, lower) >= 3);  // buffer 2 = lower band
    if(midOK) {
       g_BollingerMid1 = mid[1];   g_BollingerMid2 = mid[2];
    }
@@ -1787,7 +1822,6 @@ void CalcBollinger()
    if(lowerOK) {
       g_BollingerLower1 = lower[1]; g_BollingerLower2 = lower[2];
    }
-   IndicatorRelease(handle);
 }
 
 //+------------------------------------------------------------------+
@@ -2204,6 +2238,7 @@ void AnalyzeVolume()
 
    if(g_VolRatio >= 1.8)       g_VolumeState = "HIGH";
    else if(g_VolRatio >= 1.3)  g_VolumeState = "ABOVE_AVG";
+   else if(g_VolRatio <= 0.3)  g_VolumeState = "DEAD";     // v6.36: new tier — hard block
    else if(g_VolRatio <= 0.5)  g_VolumeState = "LOW";
    else                        g_VolumeState = "NORMAL";
 
@@ -2395,30 +2430,41 @@ void DetectFairValueGaps()
    int scanBars = MathMin((3 * 24 * 60) / MathMax(tfMins, 1), 200);  // ~3 days, cap at 200 bars
    double minGap = FVGMinGapPips * _Point * 10;
 
+   // v6.36: batch copy price arrays instead of per-bar iHigh/iLow
+   int copyBars = scanBars + 2;  // need bars 0..scanBars+1
+   double fvgHigh[], fvgLow[];
+   datetime fvgTime[];
+   ArraySetAsSeries(fvgHigh, true);
+   ArraySetAsSeries(fvgLow,  true);
+   ArraySetAsSeries(fvgTime, true);
+   if(CopyHigh(_Symbol, FVGTimeframe, 0, copyBars, fvgHigh) < copyBars) return;
+   if(CopyLow (_Symbol, FVGTimeframe, 0, copyBars, fvgLow)  < copyBars) return;
+   if(CopyTime(_Symbol, FVGTimeframe, 0, copyBars, fvgTime) < copyBars) return;
+
    for(int i = 2; i < scanBars; i++)
    {
       // 3-candle pattern: bar i+1 (oldest), bar i (middle), bar i-1 (newest)
-      double bar1_high = iHigh(_Symbol, FVGTimeframe, i + 1);
-      double bar1_low  = iLow (_Symbol, FVGTimeframe, i + 1);
-      double bar3_high = iHigh(_Symbol, FVGTimeframe, i - 1);
-      double bar3_low  = iLow (_Symbol, FVGTimeframe, i - 1);
+      double bar1_high = fvgHigh[i + 1];
+      double bar1_low  = fvgLow [i + 1];
+      double bar3_high = fvgHigh[i - 1];
+      double bar3_low  = fvgLow [i - 1];
 
       // Bullish FVG: bar3's low > bar1's high (gap between them = unfilled demand)
       if(bar3_low > bar1_high + minGap) {
          double gapHigh = bar3_low;
          double gapLow  = bar1_high;
-         datetime gapTime = iTime(_Symbol, FVGTimeframe, i);
+         datetime gapT  = fvgTime[i];
          if(!FVGExists(gapHigh, gapLow, 1))
-            AddFVG(gapHigh, gapLow, 1, gapTime);
+            AddFVG(gapHigh, gapLow, 1, gapT);
       }
 
       // Bearish FVG: bar3's high < bar1's low (gap between them = unfilled supply)
       if(bar3_high < bar1_low - minGap) {
          double gapHigh = bar1_low;
          double gapLow  = bar3_high;
-         datetime gapTime = iTime(_Symbol, FVGTimeframe, i);
+         datetime gapT  = fvgTime[i];
          if(!FVGExists(gapHigh, gapLow, -1))
-            AddFVG(gapHigh, gapLow, -1, gapTime);
+            AddFVG(gapHigh, gapLow, -1, gapT);
       }
    }
 
@@ -2687,18 +2733,29 @@ void DetectH4FairValueGaps()
    double minGap   = H4FVGMinGapPips * _Point * 10;
    double tol      = 2.0 * _Point * 10;
 
+   // v6.36: batch copy price arrays
+   int copyBars = scanBars + 2;
+   double h4High[], h4Low[];
+   datetime h4Time[];
+   ArraySetAsSeries(h4High, true);
+   ArraySetAsSeries(h4Low,  true);
+   ArraySetAsSeries(h4Time, true);
+   if(CopyHigh(_Symbol, PERIOD_H4, 0, copyBars, h4High) < copyBars) return;
+   if(CopyLow (_Symbol, PERIOD_H4, 0, copyBars, h4Low)  < copyBars) return;
+   if(CopyTime(_Symbol, PERIOD_H4, 0, copyBars, h4Time) < copyBars) return;
+
    for(int i = 2; i < scanBars; i++)
    {
-      double bar1_high = iHigh(_Symbol, PERIOD_H4, i + 1);
-      double bar1_low  = iLow (_Symbol, PERIOD_H4, i + 1);
-      double bar3_high = iHigh(_Symbol, PERIOD_H4, i - 1);
-      double bar3_low  = iLow (_Symbol, PERIOD_H4, i - 1);
+      double bar1_high = h4High[i + 1];
+      double bar1_low  = h4Low [i + 1];
+      double bar3_high = h4High[i - 1];
+      double bar3_low  = h4Low [i - 1];
 
       // Bullish H4 FVG
       if(bar3_low > bar1_high + minGap) {
          double   gapHigh = bar3_low;
          double   gapLow  = bar1_high;
-         datetime gapTime = iTime(_Symbol, PERIOD_H4, i);
+         datetime gapTime = h4Time[i];
          bool exists = false;
          for(int f = 0; f < g_H4FVGCount; f++) {
             if(g_H4FVGs[f].dir == 1 &&
@@ -2721,7 +2778,7 @@ void DetectH4FairValueGaps()
       if(bar3_high < bar1_low - minGap) {
          double   gapHigh = bar1_low;
          double   gapLow  = bar3_high;
-         datetime gapTime = iTime(_Symbol, PERIOD_H4, i);
+         datetime gapTime = h4Time[i];
          bool exists = false;
          for(int f = 0; f < g_H4FVGCount; f++) {
             if(g_H4FVGs[f].dir == -1 &&
@@ -3491,6 +3548,8 @@ double CalcConfidence(int tradeDir, string zone, bool isMeanRev, bool isSideways
       } else if(g_VolumeState == "ABOVE_AVG") {
          if(volWithTrade)  conf += 4.0;
          else              conf += 2.0;
+      } else if(g_VolumeState == "DEAD") {
+         conf -= 15.0;  // v6.36: dead volume = near-zero liquidity, very unreliable
       } else if(g_VolumeState == "LOW") {
          conf -= 8.0;   // dead volume = unreliable, ranging market (v6.29: was -3, now -8)
       }
@@ -5016,7 +5075,7 @@ void EvaluateHAPattern()
       nextGates += " | H4zones=" + hpH4;
       if(g_BoldBet) nextGates += " | BOLD BET active";
       // v6.29: Volume and candle alignment   v6.32: all-session observe + fake-out watch
-      bool hpVolOK     = !(UseVolumeAnalysis && g_VolumeState == "LOW");
+      bool hpVolOK     = !(UseVolumeAnalysis && g_VolumeState == "DEAD");  // v6.36: only DEAD blocks; LOW is penalty
       bool hpSessObsOK = true;
       string hpSessObsBlocker = "";
       {
@@ -5093,7 +5152,7 @@ void EvaluateHAPattern()
       else       g_PreflightBearOK = allDownGatesOK;
 
       if(!allDownGatesOK) {
-         if(!hpVolOK)          g_PreflightBlocker = "LOW volume (ratio=" + DoubleToString(g_VolRatio,2) + ")";
+         if(!hpVolOK)          g_PreflightBlocker = "DEAD volume (ratio=" + DoubleToString(g_VolRatio,2) + ")";
          else if(!hpSessObsOK) g_PreflightBlocker = hpSessObsBlocker;
          else if(!hpTimeOK)         g_PreflightBlocker = "NoEntryAfter=" + IntegerToString(NoEntryAfterHour) + ":00";
          else if(!hpCooldownOK) g_PreflightBlocker = cooldownInfo;
@@ -5394,9 +5453,10 @@ bool LiveHABollingerOK(int tradeDir)
       if(tradeDir ==  1) return (barH >= g_BollingerMid1 && bodyMid <= g_BollingerUpper1);
       else               return (barL <= g_BollingerMid1 && bodyMid >= g_BollingerLower1);
    } else {
-      // Standard: live body mid on the correct side of midline
-      if(tradeDir ==  1) return (bodyMid <= g_BollingerMid1);
-      else               return (bodyMid >= g_BollingerMid1);
+      // Standard: live body mid on the correct side of midline  (v6.36: +2 pip tolerance)
+      double bollTol = 2.0 * _Point * 10;
+      if(tradeDir ==  1) return (bodyMid <= g_BollingerMid1 + bollTol);
+      else               return (bodyMid >= g_BollingerMid1 - bollTol);
    }
 }
 
@@ -5407,6 +5467,21 @@ bool LiveHABollingerOK(int tradeDir)
 void TryEntry()
 {
    if(g_TradeOpen) return;
+
+   // v6.36: equity drawdown protection
+   if(MaxDrawdownPct > 0 && g_PeakEquity > 0) {
+      double curEquity = AccountInfoDouble(ACCOUNT_EQUITY);
+      double ddPct = (g_PeakEquity - curEquity) / g_PeakEquity * 100.0;
+      if(ddPct > MaxDrawdownPct) {
+         static datetime lastDDPrint = 0;
+         if(TimeCurrent() - lastDDPrint > 300) {  // print every 5 min max
+            Print("[DRAWDOWN BLOCK] Equity DD=", DoubleToString(ddPct,1), "% > max ",
+                  DoubleToString(MaxDrawdownPct,1), "% — entries paused");
+            lastDDPrint = TimeCurrent();
+         }
+         return;
+      }
+   }
 
    // Throttle block diagnostics: print once per M15 bar, not every tick
    datetime _blockBar = iTime(_Symbol, PERIOD_M15, 0);
@@ -5631,13 +5706,23 @@ void TryEntry()
       bool   _m5OK   = (_m5D == 0 || _m5D == tradeDir);   // flat or aligned
       if(!_m1OK && !_m5OK) {
          // Both M1 and M5 actively oppose the trade direction
-         string _brM = ((tradeDir == 1) ? "BUY" : "SELL") +
-                       " BLOCKED: M1=" + IntegerToString(_m1D) +
-                       " M5=" + IntegerToString(_m5D) +
-                       " oppose trade dir — short-term tick misaligned (" +
-                       DoubleToString(_bidNow, 5) + ")";
-         if(_brM != g_LastBlockReason) { Print(_brM); g_LastBlockReason = _brM; }
-         return;
+         // v6.36: soft timeout — allow after 30 seconds with CAUTION instead of permanent block
+         if(g_M1M5BlockStart == 0) g_M1M5BlockStart = TimeCurrent();
+         int blockSecs = (int)(TimeCurrent() - g_M1M5BlockStart);
+         if(blockSecs < 30) {
+            string _brM = ((tradeDir == 1) ? "BUY" : "SELL") +
+                          " BLOCKED: M1=" + IntegerToString(_m1D) +
+                          " M5=" + IntegerToString(_m5D) +
+                          " oppose trade dir — waiting (" + IntegerToString(blockSecs) + "s/30s)";
+            if(_brM != g_LastBlockReason) { Print(_brM); g_LastBlockReason = _brM; }
+            return;
+         }
+         // Timeout expired — proceed with caution
+         string _tmM = ((tradeDir == 1) ? "BUY" : "SELL") +
+                       " M1M5 TIMEOUT: allowing entry after " + IntegerToString(blockSecs) + "s despite opposition";
+         if(_tmM != g_LastBlockReason) { Print(_tmM); g_LastBlockReason = _tmM; }
+      } else {
+         g_M1M5BlockStart = 0;  // reset timeout when alignment restored
       }
       if(!_m1OK || !_m5OK) {
          // One TF aligned, one not — log once per bar as CAUTION
@@ -6285,6 +6370,18 @@ void TryEntry()
    // Widens SL to give the trend room to breathe and targets the next HTF level
    // (Fib / Pivot / SwingH/L) clamped to [MacroTrendMinTP_USD, MacroTrendMaxTP_USD].
    // This override runs AFTER the BOLD TIER block so it always wins on SL/TP.
+   if(isMeanRev && MRV_SLScale > 0 && MRV_TPScale > 0) {
+      // v6.36: Mean reversion uses tighter SL/TP — short bounce within range
+      double mrvSL = g_DynamicSL_USD * MRV_SLScale;
+      double mrvTP = baseTpUSD * MRV_TPScale;
+      mrvSL = MathMax(mrvSL, MinSL_USD);  // respect minimum SL
+      mrvTP = MathMax(mrvTP, mrvSL * 1.0); // at least 1:1 R:R
+      Print("[MRV SL/TP] SL: $", DoubleToString(g_DynamicSL_USD,2), " -> $", DoubleToString(mrvSL,2),
+            " TP: $", DoubleToString(baseTpUSD,2), " -> $", DoubleToString(mrvTP,2));
+      g_DynamicSL_USD = mrvSL;
+      baseTpUSD = mrvTP;
+      g_DynamicTP_USD = baseTpUSD;
+   }
    if(isMacroTrend) {
       g_DynamicSL_USD = MacroTrendSL_USD;   // wider SL ($2.75 vs normal $2.50)
 
@@ -6355,6 +6452,16 @@ void TryEntry()
              + "_TP" + DoubleToString(g_DynamicTP_USD, 2);
 
    // === EXECUTE ===
+   // v6.36: spread filter — block when spread is too wide (news, illiquid)
+   if(MaxSpreadPips > 0) {
+      long   spreadPts  = SymbolInfoInteger(_Symbol, SYMBOL_SPREAD);
+      double spreadPips = (double)spreadPts / 10.0;  // 5-digit broker: 1 pip = 10 points
+      if(spreadPips > MaxSpreadPips) {
+         string _brS = "SPREAD BLOCKED: " + DoubleToString(spreadPips,1) + " > " + DoubleToString(MaxSpreadPips,1) + " pips";
+         if(_brS != g_LastBlockReason) { Print(_brS); g_LastBlockReason = _brS; }
+         return;
+      }
+   }
    g_LastBlockReason = "";   // block cleared — trade is actually firing
    bool ok = false;
    if(tradeDir == 1) {

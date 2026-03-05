@@ -347,6 +347,19 @@ bool     g_SessionFakeoutWatch = false;  // true when observe-window move oppose
 int      g_FakeoutDir          = 0;      // direction of the fake move (+1=faked up, -1=faked down)
 datetime g_FakeoutExpiry       = 0;      // auto-expire after ~2 hours if no follow-through
 
+// Inter-session context (v6.33): compare what the PREVIOUS session delivered in its final hour
+// vs what the new session's observe window did — classifies the observe move as:
+//   BULL/BEAR TRAP [HIGH]  — observe opposes BOTH macro AND previous session (double-confirmed trap)
+//   BULL/BEAR TRAP [MEDIUM]— observe opposes macro; previous session context weak/mixed/unknown
+//   CONTINUATION           — observe aligns with macro (green light)
+//   SESS REVERSAL          — observe aligns with macro but NOT previous session (turn underway)
+int    g_PrevSessCloseDir    = 0;     // direction of last ~4 M15 bars of the previous session (+1/-1/0)
+int    g_PrevSessConsistency = 0;     // how many of the 4 bar-over-bar checks agreed (0-4)
+bool   g_PrevSessStrong      = false; // true when 3+ of 4 checks agreed (clean directional session close)
+string g_PrevSessName        = "";    // which session was "previous": "PrevDay" / "Asian" / "London"
+string g_InterSessContext    = "";    // e.g. "Asian-close:Bear(S) | Lon-obs:Bull | macro:Bear → BULL TRAP [HIGH]"
+string g_FakeoutConfidence   = "";    // "HIGH" / "MEDIUM" / "" (empty when no fakeout active)
+
 // Mean reversion two-candle state machine
 bool     g_MRVArmed       = false;
 int      g_MRVDir         = 0;       // 1=buy bounce, -1=sell bounce
@@ -863,47 +876,129 @@ void OnTick()
             g_NYBarCount = 0;
          }
 
-         // --- Session fake-out detection (v6.32) ---
+         // --- v6.33: Inter-session momentum — record what the previous session delivered ---
+         // On Asian open  : reuse g_PrevDayLastHourDir (already computed by CalcPrevDayLastHourDir).
+         // On London open : measure the last 4 confirmed M15 bars = last ~1hr of Asian session.
+         // On NY open     : measure the last 4 confirmed M15 bars = last ~1hr before NY (London mid).
+         // The stored direction is used below when the observe window completes to classify
+         // whether the observe move is a TRAP or a real CONTINUATION / SESSION REVERSAL.
+         bool inAsian2 = (bdT2.hour >= AsianStartHour && bdT2.hour < AsianEndHour);
+         if(inAsian2 && g_AsianBarCount == 1) {
+            // Re-use the prev-day last-hour momentum that the existing CalcPrevDayLastHourDir() computed
+            g_PrevSessCloseDir    = g_PrevDayLastHourDir;
+            g_PrevSessConsistency = (g_PrevDayLastHourDir != 0) ? 4 : 0;
+            g_PrevSessStrong      = (g_PrevDayLastHourDir != 0);
+            g_PrevSessName        = "PrevDay";
+            if(g_PrevDayLastHourDir != 0)
+               Print("[INTER-SESS] Asian open — prevDay closed ",
+                     (g_PrevDayLastHourDir > 0 ? "Bull" : "Bear"), " (prevDayMom)");
+         }
+         if(inLondon && g_LondonBarCount == 1) {
+            // bars[1..4] vs bars[2..5]: 4 consecutive mid-price comparisons → direction of Asian last hour
+            int _pv = 0;
+            for(int _pi = 1; _pi <= 4; _pi++) {
+               double _m0 = (iHigh(_Symbol,PERIOD_M15,_pi  ) + iLow(_Symbol,PERIOD_M15,_pi  )) / 2.0;
+               double _m1 = (iHigh(_Symbol,PERIOD_M15,_pi+1) + iLow(_Symbol,PERIOD_M15,_pi+1)) / 2.0;
+               if(_m0 > _m1 + _Point) _pv++; else if(_m0 < _m1 - _Point) _pv--;
+            }
+            g_PrevSessCloseDir    = (_pv > 0) ? 1 : (_pv < 0) ? -1 : 0;
+            g_PrevSessConsistency = MathAbs(_pv);
+            g_PrevSessStrong      = (MathAbs(_pv) >= 3);
+            g_PrevSessName        = "Asian";
+            Print("[INTER-SESS] London open — Asian closed ",
+                  (g_PrevSessCloseDir > 0 ? "Bull" : g_PrevSessCloseDir < 0 ? "Bear" : "Flat"),
+                  " consist=", IntegerToString(g_PrevSessConsistency), "/4",
+                  g_PrevSessStrong ? " [STRONG]" : " [mixed/weak]");
+         }
+         if(inNY && g_NYBarCount == 1) {
+            // bars[1..4]: last ~1hr before NY open (last hour of London mid-session)
+            int _pv = 0;
+            for(int _pi = 1; _pi <= 4; _pi++) {
+               double _m0 = (iHigh(_Symbol,PERIOD_M15,_pi  ) + iLow(_Symbol,PERIOD_M15,_pi  )) / 2.0;
+               double _m1 = (iHigh(_Symbol,PERIOD_M15,_pi+1) + iLow(_Symbol,PERIOD_M15,_pi+1)) / 2.0;
+               if(_m0 > _m1 + _Point) _pv++; else if(_m0 < _m1 - _Point) _pv--;
+            }
+            g_PrevSessCloseDir    = (_pv > 0) ? 1 : (_pv < 0) ? -1 : 0;
+            g_PrevSessConsistency = MathAbs(_pv);
+            g_PrevSessStrong      = (MathAbs(_pv) >= 3);
+            g_PrevSessName        = "London";
+            Print("[INTER-SESS] NY open — pre-NY (London) delivered ",
+                  (g_PrevSessCloseDir > 0 ? "Bull" : g_PrevSessCloseDir < 0 ? "Bear" : "Flat"),
+                  " consist=", IntegerToString(g_PrevSessConsistency), "/4",
+                  g_PrevSessStrong ? " [STRONG]" : " [mixed/weak]");
+         }
+
+         // --- Session fake-out detection (v6.33 — inter-session aware) ---
          // Fires on the bar AFTER each observe window completes (barCount == ObserveBars+1).
-         // Compares mid-price of the first observe bar vs the last observe bar to determine
-         // the direction price moved during the window.  If that direction opposes the macro
-         // structure label, flag g_SessionFakeoutWatch so TryEntry blocks entries in that
-         // direction until price rebounds.
-         bool justFinishedAsian  = (inAsian  && AsianObserveBars  > 0 && g_AsianBarCount  == AsianObserveBars  + 1);
+         //
+         // Combines three signals:
+         //   obsDir   = direction price moved during the observe window (net: first→last bar)
+         //   macroDir = macro structure direction (H4/D1 label)
+         //   prevDir  = g_PrevSessCloseDir (what the previous session did in its final hour)
+         //
+         // Classification:
+         //   HIGH TRAP   — obsDir opposes BOTH macro AND prevSess (prevSess was strong/clean)
+         //                 Example: Asian bearish(strong) + macro bearish → London observe bullish
+         //                 = BULL TRAP before London continues the bear.
+         //   MEDIUM TRAP — obsDir opposes macro; prevSess is weak/mixed/unknown (less certainty)
+         //   CONTINUATION— obsDir aligns with macro (safe to trade in macro direction)
+         //   SESS REVERSAL— obsDir aligns with macro but NOT prevSess (true session turn)
+         bool justFinishedAsian  = (inAsian2 && AsianObserveBars  > 0 && g_AsianBarCount  == AsianObserveBars  + 1);
          bool justFinishedLondon = (inLondon && LondonObserveBars > 0 && g_LondonBarCount == LondonObserveBars + 1);
          bool justFinishedNY     = (inNY     && NYObserveBars     > 0 && g_NYBarCount     == NYObserveBars     + 1);
          if(justFinishedAsian || justFinishedLondon || justFinishedNY) {
-            string sessName = justFinishedNY ? "NY" : (justFinishedLondon ? "London" : "Asian");
-            int    obsN     = justFinishedNY ? NYObserveBars : (justFinishedLondon ? LondonObserveBars : AsianObserveBars);
-            // bar[obsN] = first bar of observe window; bar[1] = last bar of observe window
-            double obsOldMid = (iHigh(_Symbol, PERIOD_M15, obsN) + iLow(_Symbol, PERIOD_M15, obsN)) / 2.0;
-            double obsNewMid = (iHigh(_Symbol, PERIOD_M15, 1   ) + iLow(_Symbol, PERIOD_M15, 1   )) / 2.0;
-            int obsDir  = (obsNewMid > obsOldMid + _Point) ? 1 : (obsNewMid < obsOldMid - _Point) ? -1 : 0;
+            string sessName  = justFinishedNY ? "NY" : (justFinishedLondon ? "London" : "Asian");
+            int    obsN      = justFinishedNY ? NYObserveBars : (justFinishedLondon ? LondonObserveBars : AsianObserveBars);
+            double obsOldMid = (iHigh(_Symbol,PERIOD_M15,obsN) + iLow(_Symbol,PERIOD_M15,obsN)) / 2.0;
+            double obsNewMid = (iHigh(_Symbol,PERIOD_M15,1   ) + iLow(_Symbol,PERIOD_M15,1   )) / 2.0;
+            int obsDir   = (obsNewMid > obsOldMid + _Point) ? 1 : (obsNewMid < obsOldMid - _Point) ? -1 : 0;
             int macroDir = (g_MacroStructLabel == "BULLISH") ? 1 : (g_MacroStructLabel == "BEARISH") ? -1 : 0;
-            if(obsDir != 0 && macroDir != 0 && obsDir != macroDir) {
-               // Observe window moved AGAINST macro structure — suspect fake-out
+            int prevDir  = g_PrevSessCloseDir;
+            string obsStr   = (obsDir   > 0) ? "Bull" : (obsDir   < 0) ? "Bear" : "Flat";
+            string macroStr = (macroDir > 0) ? "Bull" : (macroDir < 0) ? "Bear" : "Flat";
+            string prevStr  = (prevDir  > 0) ? "Bull" : (prevDir  < 0) ? "Bear" : "—";
+            bool prevKnown       = (prevDir  != 0);
+            bool obsAlignsMacro  = (obsDir   != 0 && obsDir  == macroDir);
+            bool obsAlignsPrev   = (prevKnown      && obsDir  == prevDir);
+            bool prevAlignsMacro = (prevKnown      && prevDir == macroDir);
+            // HIGH: observe opposes macro AND a strong clean prevSess that agreed with macro
+            bool highConf = (!obsAlignsMacro && !obsAlignsPrev && prevKnown
+                             && prevAlignsMacro && g_PrevSessStrong && obsDir != 0 && macroDir != 0);
+            // MEDIUM: observe opposes macro; prevSess context is weak/mixed/unavailable
+            bool medConf  = (!obsAlignsMacro && !highConf && obsDir != 0 && macroDir != 0);
+            if(highConf || medConf) {
                g_SessionFakeoutWatch = true;
                g_FakeoutDir          = obsDir;
                g_FakeoutExpiry       = TimeCurrent() + 8 * 15 * 60;  // auto-expire after 2 hours
-               Print("[SESS FAKEOUT] ", sessName, " open bars moved ", (obsDir > 0 ? "UP" : "DOWN"),
-                     " but MacroStr=", g_MacroStructLabel, " — fake-out watch ARMED, blocking ",
-                     (obsDir > 0 ? "BUY" : "SELL"), " direction until rebound");
-            } else {
-               // Observe window aligned with macro (or no macro bias) — clear any stale watch
+               g_FakeoutConfidence   = highConf ? "HIGH" : "MEDIUM";
+               g_InterSessContext    = g_PrevSessName + "-close:" + prevStr
+                                       + (g_PrevSessStrong ? "(S)" : "")
+                                       + " | " + sessName + "-obs:" + obsStr
+                                       + " | macro:" + macroStr
+                                       + " \u2192 " + (obsDir > 0 ? "BULL" : "BEAR")
+                                       + " TRAP [" + g_FakeoutConfidence + "]";
+               Print("[SESS FAKEOUT ", g_FakeoutConfidence, "] ", g_InterSessContext);
+            } else if(obsAlignsMacro) {
+               string tag = obsAlignsPrev ? "CONTINUATION" : "SESS REVERSAL";
+               g_InterSessContext  = g_PrevSessName + "-close:" + prevStr + " | " + sessName
+                                     + "-obs:" + obsStr + " | macro:" + macroStr + " \u2192 " + tag;
+               g_FakeoutConfidence = "";
                if(g_SessionFakeoutWatch) {
-                  Print("[SESS FAKEOUT CLEARED] ", sessName, " open aligned with macro ", g_MacroStructLabel);
-                  g_SessionFakeoutWatch = false;
-                  g_FakeoutDir          = 0;
-                  g_FakeoutExpiry       = 0;
+                  Print("[SESS FAKEOUT CLEARED] ", g_InterSessContext);
+                  g_SessionFakeoutWatch = false; g_FakeoutDir = 0; g_FakeoutExpiry = 0;
+               } else {
+                  Print("[INTER-SESS] ", g_InterSessContext);
                }
+            } else {
+               // obsDir==0 or macroDir==0 — no strong signal; update context only
+               g_InterSessContext = sessName + "-obs:" + obsStr + " | macro:" + macroStr + " (no bias)";
             }
          }
          // Auto-expire stale fakeout watch
          if(g_SessionFakeoutWatch && g_FakeoutExpiry > 0 && TimeCurrent() > g_FakeoutExpiry) {
-            Print("[SESS FAKEOUT EXPIRED] Fake-out watch auto-cleared (timeout)");
-            g_SessionFakeoutWatch = false;
-            g_FakeoutDir          = 0;
-            g_FakeoutExpiry       = 0;
+            Print("[SESS FAKEOUT EXPIRED] watch cleared after timeout | was: ", g_InterSessContext);
+            g_SessionFakeoutWatch = false; g_FakeoutDir = 0; g_FakeoutExpiry = 0;
+            g_FakeoutConfidence   = "";
          }
       }
 
@@ -4650,14 +4745,16 @@ void EvaluateHAPattern()
          }
          if(hpSessObsOK && g_SessionFakeoutWatch && g_FakeoutDir != 0 && g_FakeoutDir == (isBuy ? 1 : -1)) {
             hpSessObsOK = false;
-            hpSessObsBlocker = "FakeoutWatch(dir=" + IntegerToString(g_FakeoutDir) + " vs macro=" + g_MacroStructLabel + ")";
+            hpSessObsBlocker = "FakeoutWatch[" + g_FakeoutConfidence + "]: " + g_InterSessContext;
          }
       }
       nextGates += "\n  " + (hpVolOK     ? "✓" : "✗") + " Vol=" + g_VolumeState + "(x" + DoubleToString(g_VolRatio,2) + ")";
       nextGates += " | RealCdlAlign=" + (g_RealCandleAligned ? "ALIGNED" : "mixed/miss");
       nextGates += " | " + (hpSessObsOK  ? "✓" : "✗") + " SessObs=" + (hpSessObsOK ? "OK" : hpSessObsBlocker);
       if(g_SessionFakeoutWatch)
-         nextGates += " [FakeoutWatch dir=" + IntegerToString(g_FakeoutDir) + "]";
+         nextGates += " [" + g_FakeoutConfidence + " TRAP: " + g_InterSessContext + "]";
+      else if(g_InterSessContext != "")
+         nextGates += " [InterSess: " + g_InterSessContext + "]";
 
       Print("STILL " + g_Signal + " — bar " + IntegerToString(g_HAConsecCount) + " of max " + IntegerToString(MaxConsecCandles) + "\n",
             "  CONFIRMED:\n", confirmed, "\n",
@@ -5523,23 +5620,22 @@ void TryEntry()
          return;
       }
    }
-   // Fake-out rebound gate: if session open moved against macro, only enter in the rebound direction.
+   // Fake-out rebound gate: block trades in the trap direction; allow the rebound direction.
+   // g_FakeoutConfidence=HIGH means prevSess + macro both agree the observe move was a trap.
    if(g_SessionFakeoutWatch && g_FakeoutDir != 0) {
       if(tradeDir == g_FakeoutDir) {
-         // Trade direction = same as the fake-out move → likely chasing the trap
-         string _br = (tradeDir == 1 ? "BUY" : "SELL") + " blocked: SessionFakeout watch ("
-                      + (g_FakeoutDir > 0 ? "open faked up" : "open faked down")
-                      + " vs macro=" + g_MacroStructLabel + ") — wait for rebound";
+         string _br = (tradeDir == 1 ? "BUY" : "SELL") + " blocked: SessOpen "
+                      + g_FakeoutConfidence + " TRAP — " + g_InterSessContext + " — await rebound";
          if(_br != g_LastBlockReason) { Print(_br); g_LastBlockReason = _br; }
          return;
       }
-      // Trade direction opposes the fake-out (= the rebound) — allow it and clear the watch
+      // Trade direction opposes the trap (= the rebound we were waiting for) — allow and clear
       Print("[FAKEOUT REBOUND ENTRY] ", (tradeDir == 1 ? "BUY" : "SELL"),
-            " direction is the rebound from session fake-out (fake was ",
-            (g_FakeoutDir > 0 ? "up" : "down"), ") — watch cleared, proceeding");
+            " ↑↓ confirmed rebound from ", g_FakeoutConfidence, " trap | ", g_InterSessContext);
       g_SessionFakeoutWatch = false;
       g_FakeoutDir          = 0;
       g_FakeoutExpiry       = 0;
+      g_FakeoutConfidence   = "";
    }
 
    // === MACRO BOS DIRECTIONAL BLOCK ===
@@ -7253,8 +7349,16 @@ void UpdateDashboard()
          }
       }
       if(g_SessionFakeoutWatch)
-         sessObsStr += "  FAKEOUT" + (g_FakeoutDir > 0 ? "↑" : "↓") + " watch";
-      DashLine("13c_sessobs", "SessObs : " + sessObsStr, cx, cy, row, lh, corner, sessObsClr, 9); row++;
+         sessObsStr += "  " + g_FakeoutConfidence + " TRAP" + (g_FakeoutDir > 0 ? "↑" : "↓");
+      color sessObsClrFinal = g_SessionFakeoutWatch
+                              ? (g_FakeoutConfidence == "HIGH" ? clrRed : clrOrangeRed)
+                              : sessObsClr;
+      DashLine("13c_sessobs", "SessObs : " + sessObsStr, cx, cy, row, lh, corner, sessObsClrFinal, 9); row++;
+      if(g_InterSessContext != "") {
+         color isClr = g_SessionFakeoutWatch
+                       ? (g_FakeoutConfidence == "HIGH" ? clrRed : clrOrangeRed) : clrDimGray;
+         DashLine("13d_isess", "InterSess: " + g_InterSessContext, cx, cy, row, lh, corner, isClr, 8); row++;
+      }
    }
    {
       int    bgPad  = 5;

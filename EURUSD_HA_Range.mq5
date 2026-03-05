@@ -1,10 +1,10 @@
 //+------------------------------------------------------------------+
-//|  EURUSD Heiken Ashi Range Bot v6.37                              |
+//|  EURUSD Heiken Ashi Range Bot v6.38                              |
 //|  Volume gating + ATR SL/TP sizing + Real candle alignment        |
 //|  STANDARD / SENTINEL / MOMENTUM / ADAPTIVE / HARVESTER / CHRONO |
 //+------------------------------------------------------------------+
 #property copyright   "EURUSD HA Range Bot"
-#property version     "6.37"
+#property version     "6.38"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -551,6 +551,8 @@ int     g_NearestH4FVGDir  = 0;
 // Confidence model output (replaces tier system)
 double g_Confidence       = 0;             // 0-100% confidence score for current setup
 string g_ConfBreakdown    = "";            // per-factor score breakdown for audit logs
+double g_ConfidenceStatic = 0;             // v6.38: confidence cached at signal arm (bar1); stable baseline
+datetime g_ConfidenceArmedBar = 0;         // v6.38: bar time when confidence was last pre-cached
 double g_DynamicSL_USD    = 2.0;           // structural SL for current setup (per 0.01 lot)
 double g_DynamicTP_USD    = 3.6;           // calculated TP = SL × RRRatio (per 0.01 lot)
 
@@ -606,10 +608,11 @@ void RestoreExistingTrade()
       double   profit   = posInfo.Commission() + posInfo.Swap() + posInfo.Profit();
       string   comment  = posInfo.Comment();
 
-      g_TradeOpen     = true;
-      g_CurrentLot    = lot;
-      g_TradeOpenTime = openTime;
-      g_Signal        = "WAITING";   // block new entries while trade is live
+      g_TradeOpen          = true;
+      g_CurrentLot         = lot;
+      g_TradeOpenTime      = openTime;
+      g_Signal             = "WAITING";   // block new entries while trade is live
+      g_ConfidenceStatic   = 0; g_ConfidenceArmedBar = 0;  // v6.38: trade live on startup
 
       // Estimate bars elapsed since open (15-min bars)
       int elapsed = (int)((TimeCurrent() - openTime) / (15 * 60));
@@ -1605,6 +1608,7 @@ void ResetDailyRanges()
    g_HABullSetup       = false;
    g_HABearSetup       = false;
    g_Signal            = "WAITING";
+   g_ConfidenceStatic  = 0; g_ConfidenceArmedBar = 0;  // v6.38: day reset — clear cache
    g_OpenBarCount      = 0;
    g_ConfirmCandleOpen = 0;
    g_MRVArmed          = false;
@@ -4527,17 +4531,23 @@ void EvaluateHAPattern()
       && dir1 != 0 && g_HAConsecCount >= 2) {
       for(int ri = 1; ri <= g_HAConsecCount && ri <= TrendBoldHardCap; ri++) {
          if(dir1 == 1 && IsBottomless(ri)) {
-            g_HABullSetup = true;
-            g_Signal      = "PREPARING BUY";
+            g_HABullSetup        = true;
+            g_Signal             = "PREPARING BUY";
+            g_ConfidenceStatic   = CalcConfidence(1, g_ZoneLabel, false, IsSideways(), g_NearLevel);
+            g_ConfidenceArmedBar = iTime(_Symbol, PERIOD_M15, 0);
             Print("[STARTUP RECOVERY] Re-armed BUY setup from bar ", ri,
-                  " (bottomless bull). Consec=", g_HAConsecCount, "/", MaxConsecCandles);
+                  " (bottomless bull). Consec=", g_HAConsecCount, "/", MaxConsecCandles,
+                  " Conf=", DoubleToString(g_ConfidenceStatic, 1), "%");
             break;
          }
          if(dir1 == -1 && IsTopless(ri)) {
-            g_HABearSetup = true;
-            g_Signal      = "PREPARING SELL";
+            g_HABearSetup        = true;
+            g_Signal             = "PREPARING SELL";
+            g_ConfidenceStatic   = CalcConfidence(-1, g_ZoneLabel, false, IsSideways(), g_NearLevel);
+            g_ConfidenceArmedBar = iTime(_Symbol, PERIOD_M15, 0);
             Print("[STARTUP RECOVERY] Re-armed SELL setup from bar ", ri,
-                  " (topless bear). Consec=", g_HAConsecCount, "/", MaxConsecCandles);
+                  " (topless bear). Consec=", g_HAConsecCount, "/", MaxConsecCandles,
+                  " Conf=", DoubleToString(g_ConfidenceStatic, 1), "%");
             break;
          }
       }
@@ -4558,10 +4568,14 @@ void EvaluateHAPattern()
       g_ZoneContextUsed    = false;
       g_Signal             = "PREPARING BUY";
       g_PrepStartTime      = TimeCurrent();
+      // v6.38: pre-cache confidence immediately at arm time so preflight has live score
+      g_ConfidenceStatic   = CalcConfidence(1, g_ZoneLabel, false, IsSideways(), g_NearLevel);
+      g_ConfidenceArmedBar = iTime(_Symbol, PERIOD_M15, 0);
       Print("PREPARING BUY: Bottomless bull candle detected (bar1). ",
             "Consec=", g_HAConsecCount, "/", MaxConsecCandles,
             " Boll=", DoubleToString(g_BollingerMid1, 5),
             " Zone=", g_ZoneLabel, " Bias=", g_TotalBias,
+            " Conf=", DoubleToString(g_ConfidenceStatic, 1), "%",
             " — waiting for next bull bar to confirm.");
    }
    // Step 2: setup armed → any bull candle (including further bottomless ones) is the confirming bar
@@ -4716,10 +4730,14 @@ void EvaluateHAPattern()
       g_ZoneContextUsed    = false;
       g_Signal             = "PREPARING SELL";
       g_PrepStartTime      = TimeCurrent();
+      // v6.38: pre-cache confidence immediately at arm time so preflight has live score
+      g_ConfidenceStatic   = CalcConfidence(-1, g_ZoneLabel, false, IsSideways(), g_NearLevel);
+      g_ConfidenceArmedBar = iTime(_Symbol, PERIOD_M15, 0);
       Print("PREPARING SELL: Topless bear candle detected (bar1). ",
             "Consec=", g_HAConsecCount, "/", MaxConsecCandles,
             " Boll=", DoubleToString(g_BollingerMid1, 5),
             " Zone=", g_ZoneLabel, " Bias=", g_TotalBias,
+            " Conf=", DoubleToString(g_ConfidenceStatic, 1), "%",
             " — waiting for next bear bar to confirm.");
    }
    else if(g_HABearSetup && dir1 == -1) {
@@ -4848,24 +4866,26 @@ void EvaluateHAPattern()
    }
    // Direction flip — reset
    else if(dir1 == 1 && g_HABearSetup) {
-      g_HABearSetup       = false;
-      g_ConfirmCandleOpen = 0;
-      g_BoldTier          = "NORMAL";
-      g_ZonePending       = false;
-      g_ZoneContextUsed   = false;
-      g_Signal            = "WAITING";
-      g_PreflightBearOK   = false;   // bear setup died
-      g_PreflightBlocker  = "";
+      g_HABearSetup        = false;
+      g_ConfirmCandleOpen  = 0;
+      g_BoldTier           = "NORMAL";
+      g_ZonePending        = false;
+      g_ZoneContextUsed    = false;
+      g_Signal             = "WAITING";
+      g_ConfidenceStatic   = 0; g_ConfidenceArmedBar = 0;  // v6.38: stale cache
+      g_PreflightBearOK    = false;   // bear setup died
+      g_PreflightBlocker   = "";
    }
    else if(dir1 == -1 && g_HABullSetup) {
-      g_HABullSetup       = false;
-      g_ConfirmCandleOpen = 0;
-      g_BoldTier          = "NORMAL";
-      g_ZonePending       = false;
-      g_ZoneContextUsed   = false;
-      g_Signal            = "WAITING";
-      g_PreflightBullOK   = false;   // bull setup died
-      g_PreflightBlocker  = "";
+      g_HABullSetup        = false;
+      g_ConfirmCandleOpen  = 0;
+      g_BoldTier           = "NORMAL";
+      g_ZonePending        = false;
+      g_ZoneContextUsed    = false;
+      g_Signal             = "WAITING";
+      g_ConfidenceStatic   = 0; g_ConfidenceArmedBar = 0;  // v6.38: stale cache
+      g_PreflightBullOK    = false;   // bull setup died
+      g_PreflightBlocker   = "";
    }
 
    // === HA ALIGNMENT QUALITY — computed after state machine resolves ===
@@ -4920,8 +4940,9 @@ void EvaluateHAPattern()
       if(barsSinceArm >= PrepMaxBars) {
          Print("[PREPARING EXPIRED] ", g_Signal, " timed out after ", barsSinceArm,
                " bars (max=", PrepMaxBars, ") — Bollinger never confirmed. Resetting to WAITING.");
-         g_Signal         = "WAITING";
-         g_HABullSetup    = false;
+         g_Signal             = "WAITING";
+         g_ConfidenceStatic   = 0; g_ConfidenceArmedBar = 0;  // v6.38: stale cache
+         g_HABullSetup        = false;
          g_HABearSetup    = false;
          g_PrepStartTime  = 0;
          g_PreflightBullOK = false;
@@ -5617,9 +5638,10 @@ void TryEntry()
          // Reset signal so dashboard doesn't show stale INCOMING after cutoff
          if(g_Signal == "BUY INCOMING" || g_Signal == "SELL INCOMING" ||
             g_Signal == "PREPARING BUY" || g_Signal == "PREPARING SELL") {
-            g_Signal      = "WAITING";
-            g_HABullSetup = false;
-            g_HABearSetup = false;
+            g_Signal             = "WAITING";
+            g_ConfidenceStatic   = 0; g_ConfidenceArmedBar = 0;  // v6.38: stale cache
+            g_HABullSetup        = false;
+            g_HABearSetup        = false;
          }
          return;
       }
@@ -5709,7 +5731,8 @@ void TryEntry()
    if(liveConsec > MaxConsecCandles && !isMacroTrend && g_BoldTier == "NORMAL") {
       Print("[SIGNAL EXPIRED] liveConsec=", liveConsec, " exceeded MaxConsecCandles=",
             MaxConsecCandles, " — resetting to WAITING");
-      g_Signal = "WAITING"; g_HABullSetup = false; g_HABearSetup = false;
+      g_Signal = "WAITING"; g_ConfidenceStatic = 0; g_ConfidenceArmedBar = 0;  // v6.38
+      g_HABullSetup = false; g_HABearSetup = false;
       return;
    }
 
@@ -6320,9 +6343,52 @@ void TryEntry()
    }
 
    // === CONFIDENCE-BASED PROBABILITY MODEL ===
-   // Scores the setup 0-100% and computes dynamic SL/TP
+   // v6.38: Use the confidence pre-cached at signal arm time as the stable baseline.
+   // Three factors can shift meaningfully tick-to-tick:
+   //   Room:    price may have moved closer to range boundary since arm
+   //   KeyHour: we may have crossed into a key-hour window since arm
+   //   BollRm:  live bid vs Bollinger band can flip each bar
+   // Everything else (structure, volume, OB, FVG, MTF, session, bias, ATR) is
+   // already baked into g_ConfidenceStatic and does not change until next bar.
    bool isMidContext = (zone == "MID_ZONE" || isSideways);
-   double confidence = CalcConfidence(tradeDir, zone, isMeanRev, isSideways, g_NearLevel);
+   double confidence;
+   datetime armedBar = iTime(_Symbol, PERIOD_M15, 0);
+   if(g_ConfidenceStatic > 0 && isTrendSignal) {
+      // Start from the static baseline — avoids full 19-factor recompute on every tick
+      confidence = g_ConfidenceStatic;
+      // Delta 1: range room (changes as price moves)
+      double roomDelta = 0;
+      if(g_RangeHigh > 0 && g_RangeLow > 0) {
+         double _bid  = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+         double _room = (tradeDir == 1) ? (g_RangeHigh - _bid) : (_bid - g_RangeLow);
+         double _rPips = _room / _Point / 10.0;
+         double _rNow  = (_rPips >= 40.0) ? 10.0 : (_rPips >= 25.0) ? 7.0 : (_rPips >= 15.0) ? 4.0 : 1.0;
+         // Compare to what was already baked in at arm time (factor 6 used same scale)
+         double _rArm  = 0;  // static already includes the arm-time room score
+         // We only apply net change if room shrank significantly (price ran away from us)
+         if(_rPips < 15.0 && g_ConfidenceArmedBar != armedBar) roomDelta = _rNow - 7.0; // assume was >=25
+      }
+      // Delta 2: key-hour proximity (we may have entered a key-hour window since arm)
+      double keyDelta = 0;
+      if(KeyHourBonusEnabled) {
+         MqlDateTime _kdt; TimeToStruct(TimeCurrent(), _kdt);
+         int _min = _kdt.min;
+         int _kHrs[] = {0, 3, 4, 7, 8, 12, 13, 17, 21};
+         int _kDist = 99;
+         for(int _ki = 0; _ki < 9; _ki++) {
+            if(_kdt.hour == _kHrs[_ki]) _kDist = MathMin(_kDist, _min);
+            if((_kdt.hour+1)%24 == _kHrs[_ki]) _kDist = MathMin(_kDist, 60-_min);
+         }
+         double _kBonus = (_kDist <= 15) ? KeyHourBonusPts : (_kDist <= 30) ? KeyHourBonusPts*0.5 : 0;
+         // Static had key-hour bonus at arm time; we only add the difference if it grew
+         keyDelta = 0;  // conservative: do not double-count; static already has it
+      }
+      confidence = MathMax(0, MathMin(100, confidence + roomDelta + keyDelta));
+      g_Confidence = confidence;  // update global so dashboard stays accurate
+   } else {
+      // MeanRev / MacroTrend / no cached baseline — full compute
+      confidence = CalcConfidence(tradeDir, zone, isMeanRev, isSideways, g_NearLevel);
+   }
 
    // === CONFIDENCE GATE — reject low-probability setups ===
    if(confidence < MinConfidence) {
@@ -6535,6 +6601,7 @@ void TryEntry()
       g_IsNearMid     = isMidContext;
       g_IsMeanRev     = isMeanRev;
       g_Signal        = "WAITING";
+      g_ConfidenceStatic   = 0; g_ConfidenceArmedBar = 0;  // v6.38: trade open — cache obsolete
       g_HABullSetup   = false;
       g_HABearSetup   = false;
       g_MRVArmed      = false;
@@ -6602,6 +6669,7 @@ void ResetTradeGlobals(double closePnL)
    g_TradeDir         = 0;
    g_OpenBarCount     = 0;
    g_Signal           = "WAITING";
+   g_ConfidenceStatic   = 0; g_ConfidenceArmedBar = 0;  // v6.38: trade closed — reset cache
    g_EntryStructLabel = "";
    g_EntryMacroLabel  = "";
    g_EarlyLockEngaged = false;

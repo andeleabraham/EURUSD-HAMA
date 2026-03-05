@@ -1022,8 +1022,7 @@ void OnTimer()
 void OnDeinit(const int reason)
 {
    ObjectsDeleteAll(0, DASH_PREFIX);
-   ObjectsDeleteAll(0, "HABOT_LVL_");
-   ObjectsDeleteAll(0, "HABOT_FVG_");
+   ObjectsDeleteAll(0, "HABOT_");   // clears FVG, OB, H4OB, H4FVG, LVL, ZONE, all bot objects
    EventKillTimer();  // v6.36: stop dashboard timer
    // v6.34: Release MA indicator handles
    if(g_hMA200 != INVALID_HANDLE) { IndicatorRelease(g_hMA200); g_hMA200 = INVALID_HANDLE; }

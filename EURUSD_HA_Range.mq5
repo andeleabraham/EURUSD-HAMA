@@ -1,10 +1,10 @@
 //+------------------------------------------------------------------+
-//|  EURUSD Heiken Ashi Range Bot v6.30                              |
+//|  EURUSD Heiken Ashi Range Bot v6.32                              |
 //|  Volume gating + ATR SL/TP sizing + Real candle alignment        |
 //|  STANDARD / SENTINEL / MOMENTUM / ADAPTIVE / HARVESTER / CHRONO |
 //+------------------------------------------------------------------+
 #property copyright   "EURUSD HA Range Bot"
-#property version     "6.30"
+#property version     "6.32"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -73,7 +73,9 @@ input group "=== ASIAN SESSION MOMENTUM ==="
 input bool   AsianPrevDayMomEnabled = true;   // Enable prev-day last-hour momentum for Asian session
 input double AsianMomentumBonusPts  = 6.0;    // Confidence bonus when aligned (add-only, never penalises)
 input bool   AsianZoneStrictMode    = false;  // false=RELAX zone filter when momentum aligned; true=always enforce zones
-input int    AsianObserveBars      = 2;      // v6.29: first N bars of Asian session are observe-only (no entries)
+input int    AsianObserveBars      = 4;      // v6.32: first N M15 bars of Asian open = observe-only (4 = 1 hour)
+input int    LondonObserveBars     = 4;      // v6.32: first N M15 bars of London open = observe-only (4 = 1 hour)
+input int    NYObserveBars         = 4;      // v6.32: first N M15 bars of NY open (13:00) = observe-only (4 = 1 hour)
 // RELAX mode: when prev-day momentum aligns with signal AND multiple factors agree,
 // the standard zone block (UPPER_THIRD for buy / LOWER_THIRD for sell) is lifted in Asian hours.
 // The trade is entered with standard (not narrowed) SL and a logged CAUTION note.
@@ -336,6 +338,14 @@ double   g_BollingerLower2 = 0;     // lower band bar 2
 int      g_PrevDayLastHourDir  = 0;    // +1 = prev day last hour was bullish, -1 = bearish, 0 = unknown
 bool     g_AsianZoneRelaxed    = false; // true = zone filter currently relaxed due to Asian momentum alignment
 int      g_AsianBarCount       = 0;    // v6.29: bars elapsed since Asian session started today
+int      g_LondonBarCount      = 0;    // v6.32: bars elapsed since London session started today
+int      g_NYBarCount          = 0;    // v6.32: bars elapsed since NY session started today (from 13:00)
+
+// Session fake-out watch (v6.32): after the observe window, if price moved AGAINST macro structure,
+// block entries in the fake-out direction — wait for price to rebound back before allowing entry.
+bool     g_SessionFakeoutWatch = false;  // true when observe-window move opposed macro structure
+int      g_FakeoutDir          = 0;      // direction of the fake move (+1=faked up, -1=faked down)
+datetime g_FakeoutExpiry       = 0;      // auto-expire after ~2 hours if no follow-through
 
 // Mean reversion two-candle state machine
 bool     g_MRVArmed       = false;
@@ -830,6 +840,70 @@ void OnTick()
                g_AsianBarCount++;    // subsequent bars
          } else {
             g_AsianBarCount = 0;     // outside Asian — reset
+         }
+      }
+
+      // v6.32: London and NY observation bar counters — run unconditionally (not inside AsianPrevDayMomEnabled)
+      {
+         MqlDateTime bdT2; TimeToStruct(barTime, bdT2);
+         // London bar counter
+         bool inLondon = (bdT2.hour >= LondonStartHour && bdT2.hour < LondonEndHour);
+         if(inLondon) {
+            if(bdT2.hour == LondonStartHour && bdT2.min == 0) g_LondonBarCount = 1;
+            else                                               g_LondonBarCount++;
+         } else {
+            g_LondonBarCount = 0;
+         }
+         // NY bar counter — starts at 13:00, independent of London overlap
+         bool inNY = (bdT2.hour >= NewYorkStartHour && bdT2.hour < NewYorkEndHour);
+         if(inNY) {
+            if(bdT2.hour == NewYorkStartHour && bdT2.min == 0) g_NYBarCount = 1;
+            else                                                g_NYBarCount++;
+         } else {
+            g_NYBarCount = 0;
+         }
+
+         // --- Session fake-out detection (v6.32) ---
+         // Fires on the bar AFTER each observe window completes (barCount == ObserveBars+1).
+         // Compares mid-price of the first observe bar vs the last observe bar to determine
+         // the direction price moved during the window.  If that direction opposes the macro
+         // structure label, flag g_SessionFakeoutWatch so TryEntry blocks entries in that
+         // direction until price rebounds.
+         bool justFinishedAsian  = (inAsian  && AsianObserveBars  > 0 && g_AsianBarCount  == AsianObserveBars  + 1);
+         bool justFinishedLondon = (inLondon && LondonObserveBars > 0 && g_LondonBarCount == LondonObserveBars + 1);
+         bool justFinishedNY     = (inNY     && NYObserveBars     > 0 && g_NYBarCount     == NYObserveBars     + 1);
+         if(justFinishedAsian || justFinishedLondon || justFinishedNY) {
+            string sessName = justFinishedNY ? "NY" : (justFinishedLondon ? "London" : "Asian");
+            int    obsN     = justFinishedNY ? NYObserveBars : (justFinishedLondon ? LondonObserveBars : AsianObserveBars);
+            // bar[obsN] = first bar of observe window; bar[1] = last bar of observe window
+            double obsOldMid = (iHigh(_Symbol, PERIOD_M15, obsN) + iLow(_Symbol, PERIOD_M15, obsN)) / 2.0;
+            double obsNewMid = (iHigh(_Symbol, PERIOD_M15, 1   ) + iLow(_Symbol, PERIOD_M15, 1   )) / 2.0;
+            int obsDir  = (obsNewMid > obsOldMid + _Point) ? 1 : (obsNewMid < obsOldMid - _Point) ? -1 : 0;
+            int macroDir = (g_MacroStructLabel == "BULLISH") ? 1 : (g_MacroStructLabel == "BEARISH") ? -1 : 0;
+            if(obsDir != 0 && macroDir != 0 && obsDir != macroDir) {
+               // Observe window moved AGAINST macro structure — suspect fake-out
+               g_SessionFakeoutWatch = true;
+               g_FakeoutDir          = obsDir;
+               g_FakeoutExpiry       = TimeCurrent() + 8 * 15 * 60;  // auto-expire after 2 hours
+               Print("[SESS FAKEOUT] ", sessName, " open bars moved ", (obsDir > 0 ? "UP" : "DOWN"),
+                     " but MacroStr=", g_MacroStructLabel, " — fake-out watch ARMED, blocking ",
+                     (obsDir > 0 ? "BUY" : "SELL"), " direction until rebound");
+            } else {
+               // Observe window aligned with macro (or no macro bias) — clear any stale watch
+               if(g_SessionFakeoutWatch) {
+                  Print("[SESS FAKEOUT CLEARED] ", sessName, " open aligned with macro ", g_MacroStructLabel);
+                  g_SessionFakeoutWatch = false;
+                  g_FakeoutDir          = 0;
+                  g_FakeoutExpiry       = 0;
+               }
+            }
+         }
+         // Auto-expire stale fakeout watch
+         if(g_SessionFakeoutWatch && g_FakeoutExpiry > 0 && TimeCurrent() > g_FakeoutExpiry) {
+            Print("[SESS FAKEOUT EXPIRED] Fake-out watch auto-cleared (timeout)");
+            g_SessionFakeoutWatch = false;
+            g_FakeoutDir          = 0;
+            g_FakeoutExpiry       = 0;
          }
       }
 
@@ -4555,18 +4629,35 @@ void EvaluateHAPattern()
       nextGates += " | Struct=" + g_StructureLabel + " MacroStr=" + g_MacroStructLabel;
       nextGates += " | H4zones=" + hpH4;
       if(g_BoldBet) nextGates += " | BOLD BET active";
-      // v6.29: Volume and candle alignment status in next-gates
-      bool hpVolOK = !(UseVolumeAnalysis && g_VolumeState == "LOW");
-      bool hpAsianObsOK = true;
+      // v6.29: Volume and candle alignment   v6.32: all-session observe + fake-out watch
+      bool hpVolOK     = !(UseVolumeAnalysis && g_VolumeState == "LOW");
+      bool hpSessObsOK = true;
+      string hpSessObsBlocker = "";
       {
          MqlDateTime _pfAdt; TimeToStruct(TimeCurrent(), _pfAdt);
-         bool _pfInAsian = (_pfAdt.hour >= AsianStartHour && _pfAdt.hour < AsianEndHour);
-         if(_pfInAsian && AsianObserveBars > 0 && g_AsianBarCount <= AsianObserveBars)
-            hpAsianObsOK = false;
+         bool _pfInAsian  = (_pfAdt.hour >= AsianStartHour   && _pfAdt.hour < AsianEndHour);
+         bool _pfInLondon = (_pfAdt.hour >= LondonStartHour  && _pfAdt.hour < LondonEndHour);
+         bool _pfInNY     = (_pfAdt.hour >= NewYorkStartHour && _pfAdt.hour < NewYorkEndHour);
+         if(_pfInAsian  && AsianObserveBars  > 0 && g_AsianBarCount  <= AsianObserveBars) {
+            hpSessObsOK = false;
+            hpSessObsBlocker = "AsianObs "  + IntegerToString(g_AsianBarCount)  + "/" + IntegerToString(AsianObserveBars);
+         } else if(_pfInLondon && LondonObserveBars > 0 && g_LondonBarCount <= LondonObserveBars) {
+            hpSessObsOK = false;
+            hpSessObsBlocker = "LondonObs " + IntegerToString(g_LondonBarCount) + "/" + IntegerToString(LondonObserveBars);
+         } else if(_pfInNY && NYObserveBars > 0 && g_NYBarCount <= NYObserveBars) {
+            hpSessObsOK = false;
+            hpSessObsBlocker = "NYObs "     + IntegerToString(g_NYBarCount)     + "/" + IntegerToString(NYObserveBars);
+         }
+         if(hpSessObsOK && g_SessionFakeoutWatch && g_FakeoutDir != 0 && g_FakeoutDir == (isBuy ? 1 : -1)) {
+            hpSessObsOK = false;
+            hpSessObsBlocker = "FakeoutWatch(dir=" + IntegerToString(g_FakeoutDir) + " vs macro=" + g_MacroStructLabel + ")";
+         }
       }
-      nextGates += "\n  " + (hpVolOK ? "✓" : "✗") + " Vol=" + g_VolumeState + "(x" + DoubleToString(g_VolRatio,2) + ")";
+      nextGates += "\n  " + (hpVolOK     ? "✓" : "✗") + " Vol=" + g_VolumeState + "(x" + DoubleToString(g_VolRatio,2) + ")";
       nextGates += " | RealCdlAlign=" + (g_RealCandleAligned ? "ALIGNED" : "mixed/miss");
-      nextGates += " | " + (hpAsianObsOK ? "✓" : "✗") + " AsianObs=" + IntegerToString(g_AsianBarCount) + "/" + IntegerToString(AsianObserveBars);
+      nextGates += " | " + (hpSessObsOK  ? "✓" : "✗") + " SessObs=" + (hpSessObsOK ? "OK" : hpSessObsBlocker);
+      if(g_SessionFakeoutWatch)
+         nextGates += " [FakeoutWatch dir=" + IntegerToString(g_FakeoutDir) + "]";
 
       Print("STILL " + g_Signal + " — bar " + IntegerToString(g_HAConsecCount) + " of max " + IntegerToString(MaxConsecCandles) + "\n",
             "  CONFIRMED:\n", confirmed, "\n",
@@ -4584,14 +4675,14 @@ void EvaluateHAPattern()
       bool macroBOSBlockPF = _macroBOSRawPF && !_chochExmptPF;
       bool allDownGatesOK = hpZoneOK && hpBiasOK && hpConfOK && hpTimeOK &&
                             hpCooldownOK && hpForeignOK && hpDailyOK && hpDailyLossOK &&
-                            !macroBOSBlockPF && !g_TradeOpen && hpVolOK && hpAsianObsOK;
+                            !macroBOSBlockPF && !g_TradeOpen && hpVolOK && hpSessObsOK;
 
       if(isBuy)  g_PreflightBullOK = allDownGatesOK;
       else       g_PreflightBearOK = allDownGatesOK;
 
       if(!allDownGatesOK) {
          if(!hpVolOK)          g_PreflightBlocker = "LOW volume (ratio=" + DoubleToString(g_VolRatio,2) + ")";
-         else if(!hpAsianObsOK) g_PreflightBlocker = "AsianObs bar " + IntegerToString(g_AsianBarCount) + "/" + IntegerToString(AsianObserveBars);
+         else if(!hpSessObsOK) g_PreflightBlocker = hpSessObsBlocker;
          else if(!hpTimeOK)         g_PreflightBlocker = "NoEntryAfter=" + IntegerToString(NoEntryAfterHour) + ":00";
          else if(!hpCooldownOK) g_PreflightBlocker = cooldownInfo;
          else if(!hpDailyOK)    g_PreflightBlocker = "DailyTrades=" + IntegerToString(g_DailyTradeCount) + "/" + IntegerToString(MaxDailyTrades);
@@ -5397,19 +5488,58 @@ void TryEntry()
       return;
    }
 
-   // === ASIAN OBSERVATION DELAY (v6.29) ===
-   // First 2 bars of Asian session are observation-only: track signals but don't enter.
-   // These bars establish the tone for the session — trades that follow benefit from this context.
-   if(AsianObserveBars > 0) {
-      MqlDateTime _aOdt; TimeToStruct(TimeCurrent(), _aOdt);
-      bool _inAsianNow = (_aOdt.hour >= AsianStartHour && _aOdt.hour < AsianEndHour);
-      if(_inAsianNow && g_AsianBarCount <= AsianObserveBars) {
-         string _br = (tradeDir == 1 ? "BUY" : "SELL") + " blocked: Asian observation (bar "
+   // === SESSION OBSERVATION DELAY + FAKE-OUT REBOUND GATE (v6.32) ===
+   // The first N M15 bars of each session open are observe-only — map the tone before entering.
+   // Asian: 00:00–end  London: 08:00–end  NY: 13:00–end (NY starts mid-London, tracked independently).
+   // After the observe window: if price moved AGAINST macro structure during those bars, the move
+   // is treated as a potential fake-out.  Block trades in the fake-out direction until price rebounces.
+   {
+      MqlDateTime _sOdt; TimeToStruct(TimeCurrent(), _sOdt);
+      bool _inAsianNow  = (_sOdt.hour >= AsianStartHour   && _sOdt.hour < AsianEndHour);
+      bool _inLondonNow = (_sOdt.hour >= LondonStartHour  && _sOdt.hour < LondonEndHour);
+      bool _inNYNow     = (_sOdt.hour >= NewYorkStartHour && _sOdt.hour < NewYorkEndHour);
+      // Asian observe window
+      if(_inAsianNow && AsianObserveBars > 0 && g_AsianBarCount <= AsianObserveBars) {
+         string _br = (tradeDir == 1 ? "BUY" : "SELL") + " blocked: Asian observe (bar "
                       + IntegerToString(g_AsianBarCount) + "/" + IntegerToString(AsianObserveBars)
                       + ") — watching market before entering";
          if(_br != g_LastBlockReason) { Print(_br); g_LastBlockReason = _br; }
          return;
       }
+      // London observe window
+      if(_inLondonNow && LondonObserveBars > 0 && g_LondonBarCount <= LondonObserveBars) {
+         string _br = (tradeDir == 1 ? "BUY" : "SELL") + " blocked: London observe (bar "
+                      + IntegerToString(g_LondonBarCount) + "/" + IntegerToString(LondonObserveBars)
+                      + ") — watching market before entering";
+         if(_br != g_LastBlockReason) { Print(_br); g_LastBlockReason = _br; }
+         return;
+      }
+      // NY observe window, independent of London overlap (starts at 13:00)
+      if(_inNYNow && NYObserveBars > 0 && g_NYBarCount <= NYObserveBars) {
+         string _br = (tradeDir == 1 ? "BUY" : "SELL") + " blocked: NY observe (bar "
+                      + IntegerToString(g_NYBarCount) + "/" + IntegerToString(NYObserveBars)
+                      + ") — watching market before entering";
+         if(_br != g_LastBlockReason) { Print(_br); g_LastBlockReason = _br; }
+         return;
+      }
+   }
+   // Fake-out rebound gate: if session open moved against macro, only enter in the rebound direction.
+   if(g_SessionFakeoutWatch && g_FakeoutDir != 0) {
+      if(tradeDir == g_FakeoutDir) {
+         // Trade direction = same as the fake-out move → likely chasing the trap
+         string _br = (tradeDir == 1 ? "BUY" : "SELL") + " blocked: SessionFakeout watch ("
+                      + (g_FakeoutDir > 0 ? "open faked up" : "open faked down")
+                      + " vs macro=" + g_MacroStructLabel + ") — wait for rebound";
+         if(_br != g_LastBlockReason) { Print(_br); g_LastBlockReason = _br; }
+         return;
+      }
+      // Trade direction opposes the fake-out (= the rebound) — allow it and clear the watch
+      Print("[FAKEOUT REBOUND ENTRY] ", (tradeDir == 1 ? "BUY" : "SELL"),
+            " direction is the rebound from session fake-out (fake was ",
+            (g_FakeoutDir > 0 ? "up" : "down"), ") — watch cleared, proceeding");
+      g_SessionFakeoutWatch = false;
+      g_FakeoutDir          = 0;
+      g_FakeoutExpiry       = 0;
    }
 
    // === MACRO BOS DIRECTIONAL BLOCK ===
@@ -7100,7 +7230,32 @@ void UpdateDashboard()
                cx, cy, row, lh, corner, qualClr, 9); row++;
    }
 
-   // --- Left panel sizing (finalize height) ---
+   // Session Observe / Fake-out row (v6.32)
+   {
+      MqlDateTime _dashDt; TimeToStruct(TimeCurrent(), _dashDt);
+      bool _dInAsian  = (_dashDt.hour >= AsianStartHour   && _dashDt.hour < AsianEndHour);
+      bool _dInLondon = (_dashDt.hour >= LondonStartHour  && _dashDt.hour < LondonEndHour);
+      bool _dInNY     = (_dashDt.hour >= NewYorkStartHour && _dashDt.hour < NewYorkEndHour);
+      string sessObsStr = "—";
+      color  sessObsClr = clrDimGray;
+      int    sessBarN   = 0, sessObsMax = 0;
+      string sessSuffix = "";
+      if(_dInNY     && NYObserveBars     > 0) { sessBarN = g_NYBarCount;     sessObsMax = NYObserveBars;     sessSuffix = " NY"; }
+      else if(_dInLondon && LondonObserveBars > 0) { sessBarN = g_LondonBarCount; sessObsMax = LondonObserveBars; sessSuffix = " Lon"; }
+      else if(_dInAsian  && AsianObserveBars  > 0) { sessBarN = g_AsianBarCount;  sessObsMax = AsianObserveBars;  sessSuffix = " Asi"; }
+      if(sessObsMax > 0) {
+         if(sessBarN <= sessObsMax) {
+            sessObsStr = "OBSERVE" + sessSuffix + " " + IntegerToString(sessBarN) + "/" + IntegerToString(sessObsMax);
+            sessObsClr = clrOrange;
+         } else {
+            sessObsStr = "FREE" + sessSuffix + " (bar " + IntegerToString(sessBarN) + ")";
+            sessObsClr = clrLime;
+         }
+      }
+      if(g_SessionFakeoutWatch)
+         sessObsStr += "  FAKEOUT" + (g_FakeoutDir > 0 ? "↑" : "↓") + " watch";
+      DashLine("13c_sessobs", "SessObs : " + sessObsStr, cx, cy, row, lh, corner, sessObsClr, 9); row++;
+   }
    {
       int    bgPad  = 5;
       int    bgW    = 340;

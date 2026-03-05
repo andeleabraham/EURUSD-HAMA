@@ -1,0 +1,8 @@
+# Compiled MQL5 binaries
+*.ex5
+
+# Other Expert Advisors (not this project)
+ExpertMACD.mq5
+ExpertMAMA.mq5
+ExpertMAPSAR.mq5
+ExpertMAPSARSizeOptimized.mq5

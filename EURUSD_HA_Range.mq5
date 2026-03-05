@@ -788,8 +788,13 @@ void UpdateMAValues()
    // When g_MA200FakeJumpDn is true: price is below MA200 but MA50 is still above — bullish bounce likely.
    g_MA200FakeJumpUp = (g_MA200 > 0 && g_MA50 > 0 && g_AboveMA200  && g_MA50 < g_MA200);
    g_MA200FakeJumpDn = (g_MA200 > 0 && g_MA50 > 0 && !g_AboveMA200 && g_MA50 > g_MA200);
-   if(g_MA200FakeJumpUp || g_MA200FakeJumpDn)
-      g_MAStatusLabel += " [FKJMP" + (g_MA200FakeJumpUp ? "^" : "v") + "]";
+   if(g_MA200FakeJumpUp || g_MA200FakeJumpDn) {
+      // Label shows whether MA20 has also failed to follow (strongest false-breakout case)
+      bool _fkBothBehind = g_MA20 > 0
+                           && (g_MA200FakeJumpUp ? (g_MA20 < g_MA200) : (g_MA20 > g_MA200));
+      g_MAStatusLabel += " [FKJMP" + (g_MA200FakeJumpUp ? "^" : "v")
+                       + (_fkBothBehind ? "(50+20)" : "(50)") + "]";
+   }
 
    // --- Daily extension cap ---
    if(UseDailyExtCap) {
@@ -5147,10 +5152,14 @@ void EvaluateHAPattern()
       }
       // v6.34: MA200 macro block preflight check (declared here so nextGates can reference them)
       // v6.35: also factors in fake-jump guard and pending state
-      bool _fakeJumpBlockBuy  = UseMAFilter && MA200FakeJumpBlock && g_MA200FakeJumpUp  && isBuy
-                                && !(g_CHoCHActive && g_CHoCHDir==1) && !(g_MacroCHoCH && g_MacroCHoCHDir==1);
-      bool _fakeJumpBlockSell = UseMAFilter && MA200FakeJumpBlock && g_MA200FakeJumpDn  && !isBuy
-                                && !(g_CHoCHActive && g_CHoCHDir==-1) && !(g_MacroCHoCH && g_MacroCHoCHDir==-1);
+      // v6.38: CHoCH exemption suppressed when BOTH MA50 and MA20 haven't crossed MA200 —
+      //        neither MA confirming the move means the CHoCH itself was caused by the same false spike.
+      bool _fkBothBelowMA200 = g_MA20 > 0 && g_MA20 < g_MA200 && g_MA50 < g_MA200;
+      bool _fkBothAboveMA200 = g_MA20 > 0 && g_MA20 > g_MA200 && g_MA50 > g_MA200;
+      bool _fakeJumpBlockBuy  = UseMAFilter && MA200FakeJumpBlock && g_MA200FakeJumpUp && isBuy
+                                && !(!_fkBothBelowMA200 && ((g_CHoCHActive && g_CHoCHDir==1) || (g_MacroCHoCH && g_MacroCHoCHDir==1)));
+      bool _fakeJumpBlockSell = UseMAFilter && MA200FakeJumpBlock && g_MA200FakeJumpDn && !isBuy
+                                && !(!_fkBothAboveMA200 && ((g_CHoCHActive && g_CHoCHDir==-1) || (g_MacroCHoCH && g_MacroCHoCHDir==-1)));
       bool hpMAOK = !_fakeJumpBlockBuy && !_fakeJumpBlockSell &&
                     (!UseMAFilter || !MA200MacroHardBlock || g_MA200 <= 0 ||
                      (isBuy ? (g_AboveMA200 || g_MA200CrossUp ||
@@ -6205,22 +6214,31 @@ void TryEntry()
    if(UseMAFilter && MA200FakeJumpBlock && g_MA200 > 0 && g_MA50 > 0) {
       // FakeJumpUp: price above MA200, MA50 still below → expect reversal DOWN to MA50
       if(g_MA200FakeJumpUp && tradeDir == 1) {
-         bool _chochExempt = (g_CHoCHActive && g_CHoCHDir == 1) || (g_MacroCHoCH && g_MacroCHoCHDir == 1);
+         // v6.38: CHoCH exemption only applies when MA50 has crossed MA200 (softer lag case).
+         // When BOTH MA50 and MA20 are still below MA200, the CHoCH was likely triggered by
+         // the same false price spike — it is not a genuine structural reversal. Block hard.
+         bool _bothBehind  = (g_MA20 > 0 && g_MA20 < g_MA200);  // MA50<MA200 already guaranteed by FakeJumpUp
+         bool _chochExempt = !_bothBehind &&
+                             ((g_CHoCHActive && g_CHoCHDir == 1) || (g_MacroCHoCH && g_MacroCHoCHDir == 1));
          if(!_chochExempt) {
-            string _br = "BUY blocked: MA200 fake-jump (price above MA200 but MA50 still below="
-                         + DoubleToString(g_MA50,5) + ") — expect reversion to MA50 before genuine bull"
-                         + " | " + g_MAStatusLabel;
+            string _br = "BUY blocked: MA200 fake-jump — price above MA200 but MA50="
+                         + DoubleToString(g_MA50,5)
+                         + (_bothBehind ? " AND MA20=" + DoubleToString(g_MA20,5) + " both below" : " still below")
+                         + " MA200=" + DoubleToString(g_MA200,5) + " | " + g_MAStatusLabel;
             if(_br != g_LastBlockReason) { Print(_br); g_LastBlockReason = _br; }
             return;
          }
       }
       // FakeJumpDn: price below MA200, MA50 still above → expect reversal UP to MA50
       if(g_MA200FakeJumpDn && tradeDir == -1) {
-         bool _chochExempt = (g_CHoCHActive && g_CHoCHDir == -1) || (g_MacroCHoCH && g_MacroCHoCHDir == -1);
+         bool _bothBehind  = (g_MA20 > 0 && g_MA20 > g_MA200);  // MA50>MA200 already guaranteed by FakeJumpDn
+         bool _chochExempt = !_bothBehind &&
+                             ((g_CHoCHActive && g_CHoCHDir == -1) || (g_MacroCHoCH && g_MacroCHoCHDir == -1));
          if(!_chochExempt) {
-            string _br = "SELL blocked: MA200 fake-jump (price below MA200 but MA50 still above="
-                         + DoubleToString(g_MA50,5) + ") — expect reversion to MA50 before genuine bear"
-                         + " | " + g_MAStatusLabel;
+            string _br = "SELL blocked: MA200 fake-jump — price below MA200 but MA50="
+                         + DoubleToString(g_MA50,5)
+                         + (_bothBehind ? " AND MA20=" + DoubleToString(g_MA20,5) + " both above" : " still above")
+                         + " MA200=" + DoubleToString(g_MA200,5) + " | " + g_MAStatusLabel;
             if(_br != g_LastBlockReason) { Print(_br); g_LastBlockReason = _br; }
             return;
          }

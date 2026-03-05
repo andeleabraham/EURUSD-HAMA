@@ -1,10 +1,10 @@
 //+------------------------------------------------------------------+
-//|  EURUSD Heiken Ashi Range Bot v6.36                              |
+//|  EURUSD Heiken Ashi Range Bot v6.37                              |
 //|  Volume gating + ATR SL/TP sizing + Real candle alignment        |
 //|  STANDARD / SENTINEL / MOMENTUM / ADAPTIVE / HARVESTER / CHRONO |
 //+------------------------------------------------------------------+
 #property copyright   "EURUSD HA Range Bot"
-#property version     "6.36"
+#property version     "6.37"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -240,7 +240,8 @@ input group "=== FOREIGN TRADE AWARENESS ==="
 input bool   RespectForeignTrades = true;   // Block new entries if a non-bot trade exists on this symbol
 
 input group "=== OVERTRADING PROTECTION ==="
-input int    MaxDailyTrades     = 3;     // Max trades per day (0 = unlimited)
+input int    MaxDailyTrades     = 3;     // Max trades per day (0 = unlimited; recommend 3 with OneTradePerSession)
+input bool   OneTradePerSession  = true;  // Limit 1 trade per session: 1 Asian, 1 London, 1 NY
 input double MaxDailyLossUSD    = 5.0;   // Stop trading after cumulative daily loss exceeds this (0=disabled)
 input int    ConsecLossLimit    = 2;     // After N consecutive SL hits, pause trading
 input int    CooldownBars       = 8;     // Bars to pause after consecutive loss limit hit (8 = 2 hours)
@@ -564,7 +565,10 @@ string g_NearLevel = "";    // label of the nearest confluence level at entry
 string g_ZoneLabel    = "UNKNOWN";
 
 // Overtrading protection
-int      g_DailyTradeCount = 0;      // trades opened today
+int      g_DailyTradeCount   = 0;    // trades opened today
+int      g_AsianTradeCount   = 0;    // v6.37: trades opened during Asian session today
+int      g_LondonTradeCount  = 0;    // v6.37: trades opened during London session today
+int      g_NYTradeCount      = 0;    // v6.37: trades opened during NY session today
 int      g_ConsecLosses    = 0;      // consecutive SL/hard-loss exits
 datetime g_CooldownUntil   = 0;      // if > 0, no entries until this time
 datetime g_PostTradeCoolUntil = 0;   // if > 0, post-trade cooloff active until this time
@@ -1172,10 +1176,12 @@ void OnTick()
          // v6.29: Asian observation bar counter
          // Increments each new bar during Asian session; resets when session starts or outside Asian
          if(inAsian) {
-            if(bdT.hour == AsianStartHour && bdT.min == 0)
-               g_AsianBarCount = 1;  // first bar of session
-            else
-               g_AsianBarCount++;    // subsequent bars
+            if(bdT.hour == AsianStartHour && bdT.min == 0) {
+               g_AsianBarCount  = 1;  // first bar of session
+               g_AsianTradeCount = 0; // v6.37: reset slot for the new Asian session
+            } else {
+               g_AsianBarCount++;
+            }
          } else {
             g_AsianBarCount = 0;     // outside Asian — reset
          }
@@ -1187,16 +1193,24 @@ void OnTick()
          // London bar counter
          bool inLondon = (bdT2.hour >= LondonStartHour && bdT2.hour < LondonEndHour);
          if(inLondon) {
-            if(bdT2.hour == LondonStartHour && bdT2.min == 0) g_LondonBarCount = 1;
-            else                                               g_LondonBarCount++;
+            if(bdT2.hour == LondonStartHour && bdT2.min == 0) {
+               g_LondonBarCount  = 1;
+               g_LondonTradeCount = 0; // v6.37: reset slot for the new London session
+            } else {
+               g_LondonBarCount++;
+            }
          } else {
             g_LondonBarCount = 0;
          }
          // NY bar counter — starts at 13:00, independent of London overlap
          bool inNY = (bdT2.hour >= NewYorkStartHour && bdT2.hour < NewYorkEndHour);
          if(inNY) {
-            if(bdT2.hour == NewYorkStartHour && bdT2.min == 0) g_NYBarCount = 1;
-            else                                                g_NYBarCount++;
+            if(bdT2.hour == NewYorkStartHour && bdT2.min == 0) {
+               g_NYBarCount  = 1;
+               g_NYTradeCount = 0; // v6.37: reset slot for the new NY session
+            } else {
+               g_NYBarCount++;
+            }
          } else {
             g_NYBarCount = 0;
          }
@@ -1598,6 +1612,9 @@ void ResetDailyRanges()
    g_MRVDir            = 0;
    g_MRVConfirmOpen    = 0;
    g_DailyTradeCount   = 0;
+   g_AsianTradeCount   = 0;   // v6.37: full day reset
+   g_LondonTradeCount  = 0;
+   g_NYTradeCount      = 0;
    g_DailyWins         = 0;
    g_DailyLosses       = 0;
    g_DailyPnL          = 0.0;
@@ -4971,6 +4988,16 @@ void EvaluateHAPattern()
       bool hpBiasOK      = isBuy ? (g_TotalBias > -2) : (g_TotalBias < 2);
       bool hpConfOK      = (g_Confidence >= MinConfidence);
       bool hpDailyOK     = (MaxDailyTrades == 0 || g_DailyTradeCount < MaxDailyTrades);
+      // v6.37: per-session slot check for preflight
+      if(hpDailyOK && OneTradePerSession) {
+         MqlDateTime _pfSdt; TimeToStruct(TimeCurrent(), _pfSdt);
+         bool _pfAsian  = (_pfSdt.hour >= AsianStartHour   && _pfSdt.hour < AsianEndHour);
+         bool _pfLondon = (_pfSdt.hour >= LondonStartHour  && _pfSdt.hour < LondonEndHour);
+         bool _pfNY     = (_pfSdt.hour >= NewYorkStartHour && _pfSdt.hour < NewYorkEndHour);
+         if(_pfAsian  && g_AsianTradeCount  >= 1) hpDailyOK = false;
+         if(_pfLondon && g_LondonTradeCount >= 1) hpDailyOK = false;
+         if(_pfNY     && g_NYTradeCount     >= 1) hpDailyOK = false;
+      }
       bool hpCooldownOK  = !(g_CooldownUntil > 0 && TimeCurrent() < g_CooldownUntil)
                            && !(g_PostTradeCoolUntil > 0 && TimeCurrent() < g_PostTradeCoolUntil)
                            && !(g_StartupGraceUntil > 0 && TimeCurrent() < g_StartupGraceUntil);
@@ -5506,6 +5533,22 @@ void TryEntry()
          g_LastBlockPrintBar = _blockBar;
       }
       return;
+   }
+   // === PER-SESSION TRADE LIMIT (v6.37) ===
+   if(OneTradePerSession) {
+      MqlDateTime _sdt; TimeToStruct(TimeCurrent(), _sdt);
+      bool _inAsian  = (_sdt.hour >= AsianStartHour   && _sdt.hour < AsianEndHour);
+      bool _inLondon = (_sdt.hour >= LondonStartHour  && _sdt.hour < LondonEndHour);
+      bool _inNY     = (_sdt.hour >= NewYorkStartHour && _sdt.hour < NewYorkEndHour);
+      string _sesName = _inAsian ? "Asian" : _inLondon ? "London" : _inNY ? "NY" : "";
+      int    _sesCnt  = _inAsian ? g_AsianTradeCount : _inLondon ? g_LondonTradeCount : _inNY ? g_NYTradeCount : 0;
+      if(_sesName != "" && _sesCnt >= 1) {
+         if(_canPrintBlock) {
+            Print("[ENTRY WAIT] ", _sesName, " session slot already used (1/1) | Signal=", g_Signal);
+            g_LastBlockPrintBar = _blockBar;
+         }
+         return;
+      }
    }
 
    // === DAILY LOSS LIMIT ===
@@ -6510,6 +6553,16 @@ void TryEntry()
       g_DailyTradeCount++;
       if(MaxDailyTrades > 0 && g_DailyTradeCount >= MaxDailyTrades)
          Print("DAILY TRADE LIMIT reached (", g_DailyTradeCount, "/", MaxDailyTrades, ")");
+      // v6.37: increment per-session slot
+      if(OneTradePerSession) {
+         MqlDateTime _odt; TimeToStruct(TimeCurrent(), _odt);
+         bool _oAsian  = (_odt.hour >= AsianStartHour   && _odt.hour < AsianEndHour);
+         bool _oLondon = (_odt.hour >= LondonStartHour  && _odt.hour < LondonEndHour);
+         bool _oNY     = (_odt.hour >= NewYorkStartHour && _odt.hour < NewYorkEndHour);
+         if(_oAsian)       { g_AsianTradeCount++;  Print("[SESSION] Asian slot used  (1/1)"); }
+         else if(_oLondon) { g_LondonTradeCount++; Print("[SESSION] London slot used (1/1)"); }
+         else if(_oNY)     { g_NYTradeCount++;     Print("[SESSION] NY slot used     (1/1)"); }
+      }
       Print(tag, " OPENED | Conf:", DoubleToString(confidence,1), "%",
             " SL=$", DoubleToString(g_ScaledSLUSD,2),
             " TP=$", DoubleToString(g_ScaledTPUSD,2),

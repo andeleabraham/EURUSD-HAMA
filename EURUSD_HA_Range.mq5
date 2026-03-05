@@ -89,7 +89,26 @@ input group "=== EARLY SESSION RANGE ==="
 input int    EarlySessionHours = 4;     // Use prev-day range when today's range is narrower than MinRangePips
 input double MinRangePips      = 30.0;  // Minimum range width in pips before switching to prev-day reference
 
-input group "=== HEIKEN ASHI SETTINGS ==="
+input group "=== MOVING AVERAGES (M15) ==="
+// MA200 = macro direction filter (above=bull, below=bear).
+// MA50/20 = intraday trend alignment and touch/cross entry gate.
+input bool   UseMAFilter           = true;   // Master toggle for all MA gates
+input int    MA200Period           = 200;
+input int    MA50Period            = 50;
+input int    MA20Period            = 20;
+input ENUM_MA_METHOD MAMethod      = MODE_EMA;  // MA calculation method
+input double MA50TouchPips         = 5.0;   // Max pips from MA50 to count as touching/crossing
+input double MA20TouchPips         = 3.0;   // Max pips from MA20 (bonus) to count as touching
+input bool   MA200MacroHardBlock   = true;  // Block buy below MA200 / sell above MA200 (unless CHoCH override)
+input bool   MA5020EntryRequired   = true;  // Require price touching or having crossed MA50 for entry
+
+input group "=== DAILY EXTENSION CAP ==="
+// Prevents chasing moves already extended far from today's open.
+// Extension is measured as % of the D1 ATR already consumed in one direction from daily open.
+// 30% cap example: if D1 ATR=80 pips and price has fallen 24+ pips from today's open, block sells.
+// Block lifts when price retraces back inside the cap (e.g. rebound from -34% to -7%).
+input bool   UseDailyExtCap        = true;   // Toggle daily extension cap
+input double DailyExtCapPct        = 30.0;   // % of D1 ATR: block if current move from open exceeds this
 input int    MaxConsecCandles    = 4;
 input bool   TrendBoldEnabled    = true;   // Evaluate trend bold bet when MaxConsecCandles exceeded (instead of hard reset)
 input int    SmallBoldMinScore   = 4;      // Min confluence score (0-10) for SMALL_BOLD tier (conservative TP)
@@ -418,6 +437,27 @@ bool   g_DivergenceCaution = false;          // true when TP was capped due to M
 bool   g_RealCandleAligned = false;          // v6.29: true when real candle direction matches HA on bars 1 & 2
 string g_LastBlockReason   = "";             // last TryEntry block message — only print when it changes
 
+// Moving Average values (v6.34) — M15 EMA200/50/20 for macro + intraday gates
+int    g_hMA200 = INVALID_HANDLE;
+int    g_hMA50  = INVALID_HANDLE;
+int    g_hMA20  = INVALID_HANDLE;
+double g_MA200 = 0, g_MA50 = 0, g_MA20 = 0;  // current MA levels (bar 0 live)
+bool   g_AboveMA200   = false;  // current bid > MA200
+bool   g_AboveMA50    = false;  // current bid > MA50
+bool   g_AboveMA20    = false;  // current bid > MA20
+bool   g_MA50Touch    = false;  // price touching or has crossed MA50 (within MA50TouchPips)
+bool   g_MA20Touch    = false;  // price touching or has crossed MA20 (bonus — tighter)
+bool   g_MA200CrossUp = false;  // bar 1 closed above MA200 while bar 2 was below (fresh bull cross)
+bool   g_MA200CrossDn = false;  // bar 1 closed below MA200 while bar 2 was above (fresh bear cross)
+bool   g_MA50CrossUp  = false;  // bar 1 crossed MA50 upward — augments CHoCH in bear macro
+bool   g_MA50CrossDn  = false;  // bar 1 crossed MA50 downward — augments CHoCH in bull macro
+string g_MAStatusLabel = "";    // dashboard summary string
+
+// Daily extension cap (v6.34)
+double g_DailyOpenPx      = 0;   // open of first M15 bar today (server midnight)
+double g_DailyExtDownPct  = 0;   // how far below daily open as % of D1 ATR (positive = below)
+double g_DailyExtUpPct    = 0;   // how far above daily open as % of D1 ATR (positive = above)
+
 // HA alignment quality — updated by EvaluateHAPattern each bar
 string g_HAQualityLabel = "—";  // PURE / MIXED / IMPURE / DOJI
 int    g_HAQualityScore = 0;    // count of bottomless (bull) or topless (bear) bars in last chain (0-4)
@@ -655,6 +695,87 @@ void ScanForeignTrades()
 }
 
 //+------------------------------------------------------------------+
+// v6.34: Update M15 MA values and daily extension cap each tick.
+// Handles are created in OnInit; this just reads the latest buffer values.
+void UpdateMAValues()
+{
+   if(!UseMAFilter) return;
+   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double pipSize = _Point * ((int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS) % 2 == 1 ? 10 : 1);
+   // --- MA levels: use bar-0 (live) for gate checks ---
+   double ma200_0[], ma50_0[], ma20_0[];
+   double ma200_1[], ma50_1[], ma200_2[], ma50_2[], ma20_1[], ma20_2[];
+   if(g_hMA200 != INVALID_HANDLE && CopyBuffer(g_hMA200, 0, 0, 3, ma200_0) == 3) {
+      g_MA200       = ma200_0[2];   // index 2 = newest (bar 0)
+      double ma200_b1 = ma200_0[1]; // bar 1
+      double ma200_b2 = ma200_0[0]; // bar 2
+      g_AboveMA200   = (bid > g_MA200);
+      double cl1_raw[], cl2_raw[];  // bar 1 / bar 2 M15 close prices
+      double c1 = iClose(_Symbol, PERIOD_M15, 1);
+      double c2 = iClose(_Symbol, PERIOD_M15, 2);
+      g_MA200CrossUp = (c1 > ma200_b1 && c2 <= ma200_b2);  // fresh bull cross bar1
+      g_MA200CrossDn = (c1 < ma200_b1 && c2 >= ma200_b2);  // fresh bear cross bar1
+   }
+   if(g_hMA50 != INVALID_HANDLE && CopyBuffer(g_hMA50, 0, 0, 3, ma50_0) == 3) {
+      g_MA50      = ma50_0[2];     // bar 0
+      double ma50_b1 = ma50_0[1];  // bar 1
+      double ma50_b2 = ma50_0[0];  // bar 2
+      g_AboveMA50 = (bid > g_MA50);
+      double distPips = MathAbs(bid - g_MA50) / pipSize;
+      g_MA50Touch = (distPips <= MA50TouchPips);
+      double c1 = iClose(_Symbol, PERIOD_M15, 1);
+      double c2 = iClose(_Symbol, PERIOD_M15, 2);
+      g_MA50CrossUp = (c1 > ma50_b1 && c2 <= ma50_b2);
+      g_MA50CrossDn = (c1 < ma50_b1 && c2 >= ma50_b2);
+   }
+   if(g_hMA20 != INVALID_HANDLE && CopyBuffer(g_hMA20, 0, 0, 1, ma20_0) == 1) {
+      g_MA20      = ma20_0[0];
+      g_AboveMA20 = (bid > g_MA20);
+      g_MA20Touch = (MathAbs(bid - g_MA20) / pipSize <= MA20TouchPips);
+   }
+   // --- Build status label ---
+   string above200 = g_AboveMA200 ? "A200" : "B200";
+   string above50  = g_AboveMA50  ? "A50"  : "B50";
+   string above20  = g_AboveMA20  ? "A20"  : "B20";
+   string cross    = g_MA200CrossUp ? " X200^" : (g_MA200CrossDn ? " X200v" :
+                    (g_MA50CrossUp  ? " X50^"  : (g_MA50CrossDn  ? " X50v" : "")));
+   string touch    = (g_MA50Touch ? " T50" : "") + (g_MA20Touch ? "+T20" : "");
+   g_MAStatusLabel = above200 + " " + above50 + " " + above20 + cross + touch;
+
+   // --- Daily extension cap ---
+   if(UseDailyExtCap) {
+      // Seed daily open once per day (or on first call)
+      MqlDateTime _ddt; TimeToStruct(TimeCurrent(), _ddt);
+      datetime _todayMidnight = (TimeCurrent() / 86400) * 86400;
+      if(g_DailyOpenPx == 0) {
+         // Try to find the first M15 bar that opened at or after midnight
+         int _dayBar = iBarShift(_Symbol, PERIOD_M15, _todayMidnight, false);
+         g_DailyOpenPx = (_dayBar >= 0) ? iOpen(_Symbol, PERIOD_M15, _dayBar) : bid;
+      }
+      // D1 ATR for reference distance
+      double _d1atr = 0;
+      int _hATRd1 = iATR(_Symbol, PERIOD_D1, 14);
+      double _atrBuf[];
+      if(_hATRd1 != INVALID_HANDLE && CopyBuffer(_hATRd1, 0, 1, 1, _atrBuf) == 1)
+         _d1atr = _atrBuf[0];
+      if(_d1atr > 0 && g_DailyOpenPx > 0) {
+         double _moveDn = g_DailyOpenPx - bid;   // positive when below open
+         double _moveUp = bid - g_DailyOpenPx;   // positive when above open
+         g_DailyExtDownPct = MathMax(0, _moveDn / _d1atr * 100.0);
+         g_DailyExtUpPct   = MathMax(0, _moveUp / _d1atr * 100.0);
+      }
+      // Reset daily open at midnight
+      static datetime _lastDay = 0;
+      if(_lastDay != _todayMidnight) {
+         _lastDay       = _todayMidnight;
+         g_DailyOpenPx  = 0;   // will be re-seeded above next tick
+         g_DailyExtDownPct = 0;
+         g_DailyExtUpPct   = 0;
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
 // v6.33: Seed session bar counters at startup so they reflect the correct value
 // even when the EA loads mid-session (not just on the next new-bar event).
 // Uses iBarShift on PERIOD_M15 from the session-start datetime today.
@@ -707,8 +828,19 @@ int OnInit()
 
    // Warm up HA chain cache immediately so cold-start recovery has accurate values
    BuildHACache();
+   // v6.34: Create M15 MA indicator handles
+   if(UseMAFilter) {
+      g_hMA200 = iMA(_Symbol, PERIOD_M15, MA200Period, 0, MAMethod, PRICE_CLOSE);
+      g_hMA50  = iMA(_Symbol, PERIOD_M15, MA50Period,  0, MAMethod, PRICE_CLOSE);
+      g_hMA20  = iMA(_Symbol, PERIOD_M15, MA20Period,  0, MAMethod, PRICE_CLOSE);
+      if(g_hMA200==INVALID_HANDLE || g_hMA50==INVALID_HANDLE || g_hMA20==INVALID_HANDLE)
+         Print("[MA INIT] WARNING: one or more MA handles failed to create");
+      else
+         Print("[MA INIT] M15 MA handles ready: MA", MA200Period, "/MA", MA50Period, "/MA", MA20Period);
+   }
    // v6.33: Seed session bar counters so observe windows are correct when EA loads mid-session
    SeedSessionBarCounts();
+   UpdateMAValues();  // v6.34: seed MA values at startup
 
    // Startup grace period: wait N minutes before allowing entries after a TRUE COLD START.
    // Skipped on warm restarts where market data is already in memory:
@@ -752,6 +884,10 @@ void OnDeinit(const int reason)
    ObjectsDeleteAll(0, DASH_PREFIX);
    ObjectsDeleteAll(0, "HABOT_LVL_");
    ObjectsDeleteAll(0, "HABOT_FVG_");
+   // v6.34: Release MA indicator handles
+   if(g_hMA200 != INVALID_HANDLE) { IndicatorRelease(g_hMA200); g_hMA200 = INVALID_HANDLE; }
+   if(g_hMA50  != INVALID_HANDLE) { IndicatorRelease(g_hMA50);  g_hMA50  = INVALID_HANDLE; }
+   if(g_hMA20  != INVALID_HANDLE) { IndicatorRelease(g_hMA20);  g_hMA20  = INVALID_HANDLE; }
    Comment("");
 }
 
@@ -832,6 +968,8 @@ void OnTick()
 
    // Ensure HA chain cache is current (O(1) check; rebuilds only on new bar or first tick)
    BuildHACache();
+   // v6.34: Update MA values and daily extension tracking every tick
+   UpdateMAValues();
 
    // New bar processing
    datetime barTime = iTime(_Symbol, PERIOD_M15, 0);
@@ -4791,6 +4929,10 @@ void EvaluateHAPattern()
          nextGates += " [" + g_FakeoutConfidence + " TRAP: " + g_InterSessContext + "]";
       else if(g_InterSessContext != "")
          nextGates += " [InterSess: " + g_InterSessContext + "]";
+      // v6.34: MA and daily ext cap status in preflight
+      nextGates += "\n  " + (hpMAOK    ? "✓" : "✗") + " MA200=" + (g_MAStatusLabel != "" ? g_MAStatusLabel : "not ready");
+      nextGates += " | " + (hpMA50OK  ? "✓" : "✗") + " MA50touch=" + (g_MA50Touch ? "YES" : "no") + " cross=" + (g_MA50CrossUp ? "UP" : g_MA50CrossDn ? "DN" : "no");
+      nextGates += " | " + (hpExtCapOK ? "✓" : "✗") + " DayExt D:" + DoubleToString(g_DailyExtDownPct,0) + "% U:" + DoubleToString(g_DailyExtUpPct,0) + "% (cap=" + DoubleToString(DailyExtCapPct,0) + "%%)";
 
       Print("STILL " + g_Signal + " — bar " + IntegerToString(g_HAConsecCount) + " of max " + IntegerToString(MaxConsecCandles) + "\n",
             "  CONFIRMED:\n", confirmed, "\n",
@@ -4806,10 +4948,22 @@ void EvaluateHAPattern()
                                (!isBuy && g_MacroStructLabel == "BULLISH"));
       bool _chochExmptPF   = g_MacroCHoCH && (g_MacroCHoCHDir == (isBuy ? 1 : -1));
       bool macroBOSBlockPF = _macroBOSRawPF && !_chochExmptPF;
+      // v6.34: MA200 macro block preflight check
+      bool hpMAOK = !UseMAFilter || !MA200MacroHardBlock || g_MA200 <= 0 ||
+                    (isBuy ? (g_AboveMA200 || g_MA200CrossUp ||
+                              (g_CHoCHActive && g_CHoCHDir == 1) || (g_MacroCHoCH && g_MacroCHoCHDir == 1))
+                           : (!g_AboveMA200 || g_MA200CrossDn ||
+                              (g_CHoCHActive && g_CHoCHDir == -1) || (g_MacroCHoCH && g_MacroCHoCHDir == -1)));
+      bool hpMA50OK = !UseMAFilter || !MA5020EntryRequired || g_MA50 <= 0 ||
+                      (isBuy ? (g_AboveMA50 || g_MA50Touch || g_MA50CrossUp)
+                             : (!g_AboveMA50 || g_MA50Touch || g_MA50CrossDn));
+      bool hpExtCapOK = !UseDailyExtCap || DailyExtCapPct <= 0 ||
+                        (isBuy ? (g_DailyExtUpPct   <= DailyExtCapPct)
+                               : (g_DailyExtDownPct <= DailyExtCapPct));
       bool allDownGatesOK = hpZoneOK && hpBiasOK && hpConfOK && hpTimeOK &&
                             hpCooldownOK && hpForeignOK && hpDailyOK && hpDailyLossOK &&
-                            !macroBOSBlockPF && !g_TradeOpen && hpVolOK && hpSessObsOK;
-
+                            !macroBOSBlockPF && !g_TradeOpen && hpVolOK && hpSessObsOK &&
+                            hpMAOK && hpMA50OK && hpExtCapOK;
       if(isBuy)  g_PreflightBullOK = allDownGatesOK;
       else       g_PreflightBearOK = allDownGatesOK;
 
@@ -4824,6 +4978,9 @@ void EvaluateHAPattern()
          else if(!hpZoneOK)     g_PreflightBlocker = "Zone=" + g_ZoneLabel;
          else if(!hpBiasOK)     g_PreflightBlocker = "Bias=" + IntegerToString(g_TotalBias);
          else if(macroBOSBlockPF)g_PreflightBlocker = "MacroBOS=" + g_MacroStructLabel;
+         else if(!hpMAOK)       g_PreflightBlocker = "MA200 macro block (" + g_MAStatusLabel + ")";
+         else if(!hpMA50OK)     g_PreflightBlocker = "MA50 not touched (" + g_MAStatusLabel + ") dist>" + DoubleToString(MA50TouchPips,1) + "pip";
+         else if(!hpExtCapOK)   g_PreflightBlocker = "DayExt cap " + DoubleToString(isBuy?g_DailyExtUpPct:g_DailyExtDownPct,1) + "% (max=" + DoubleToString(DailyExtCapPct,1) + "%)";
          else if(!hpConfOK)     g_PreflightBlocker = "Conf=" + DoubleToString(g_Confidence,1) + "% (min " + DoubleToString(MinConfidence,1) + "%";
          Print("[PREFLIGHT ", (isBuy?"BUY":"SELL"), " BLOCKED] ", g_PreflightBlocker,
                " — live bar fast-track disabled until this clears");
@@ -5761,6 +5918,53 @@ void TryEntry()
          }
          Print("[CHoCH-MACRO EXEMPT] H1 CHoCH(dir=", g_CHoCHDir, ") would block ",
                (tradeDir==1?"BUY":"SELL"), " but MacroCHoCH(dir=", g_MacroCHoCHDir, ") overrides");
+      }
+   }
+
+   // === MA200 MACRO HARD BLOCK (v6.34) ===
+   if(UseMAFilter && MA200MacroHardBlock && g_MA200 > 0) {
+      bool ma200BlockBuy  = (tradeDir ==  1 && !g_AboveMA200 && !g_MA200CrossUp);
+      bool ma200BlockSell = (tradeDir == -1 &&  g_AboveMA200 && !g_MA200CrossDn);
+      if(ma200BlockBuy || ma200BlockSell) {
+         bool _chochExempt = (g_CHoCHActive && g_CHoCHDir == tradeDir) ||
+                             (g_MacroCHoCH  && g_MacroCHoCHDir == tradeDir);
+         if(!_chochExempt) {
+            string _br = (tradeDir==1?"BUY":"SELL") + " blocked: MA200="
+                         + DoubleToString(g_MA200,5) + " price "
+                         + (g_AboveMA200 ? "above" : "below")
+                         + " MA200 macro block | " + g_MAStatusLabel;
+            if(_br != g_LastBlockReason) { Print(_br); g_LastBlockReason = _br; }
+            return;
+         }
+         Print("[MA200 CHoCH EXEMPT] trade proceeds despite MA200 block | ", g_MAStatusLabel);
+      }
+   }
+
+   // === MA50/20 TOUCH GATE (v6.34) ===
+   if(UseMAFilter && MA5020EntryRequired && g_MA50 > 0) {
+      bool ma50OK = (tradeDir ==  1) ? (g_AboveMA50 || g_MA50Touch || g_MA50CrossUp)
+                                     : (!g_AboveMA50 || g_MA50Touch || g_MA50CrossDn);
+      if(!ma50OK) {
+         string _br = (tradeDir==1?"BUY":"SELL") + " blocked: MA50 not touched/crossed ("
+                      + g_MAStatusLabel + ") dist > " + DoubleToString(MA50TouchPips,1) + " pip";
+         if(_br != g_LastBlockReason) { Print(_br); g_LastBlockReason = _br; }
+         return;
+      }
+      if(g_MA20Touch)
+         Print("[MA20 BONUS] touching MA20 — extra entry quality | ", g_MAStatusLabel);
+   }
+
+   // === DAILY EXTENSION CAP (v6.34) ===
+   if(UseDailyExtCap && DailyExtCapPct > 0) {
+      bool extBlockSell = (tradeDir == -1 && g_DailyExtDownPct > DailyExtCapPct);
+      bool extBlockBuy  = (tradeDir ==  1 && g_DailyExtUpPct   > DailyExtCapPct);
+      if(extBlockSell || extBlockBuy) {
+         double _extPct = extBlockSell ? g_DailyExtDownPct : g_DailyExtUpPct;
+         string _br = (tradeDir==1?"BUY":"SELL") + " blocked: DailyExt "
+                      + DoubleToString(_extPct,1) + "% of D1ATR (cap="
+                      + DoubleToString(DailyExtCapPct,1) + "%) — await retracement";
+         if(_br != g_LastBlockReason) { Print(_br); g_LastBlockReason = _br; }
+         return;
       }
    }
 
@@ -7395,6 +7599,24 @@ void UpdateDashboard()
                        ? (g_FakeoutConfidence == "HIGH" ? clrRed : clrOrangeRed) : clrDimGray;
          DashLine("13d_isess", "InterSess: " + g_InterSessContext, cx, cy, row, lh, corner, isClr, 8); row++;
       }
+   }
+   // v6.34: MA status row
+   if(UseMAFilter && g_MAStatusLabel != "") {
+      bool allAbove = g_AboveMA200 && g_AboveMA50 && g_AboveMA20;
+      bool allBelow = !g_AboveMA200 && !g_AboveMA50 && !g_AboveMA20;
+      color maClr = allAbove ? clrLime : allBelow ? clrTomato : clrYellow;
+      DashLine("14_ma", "MA15   : " + g_MAStatusLabel, cx, cy, row, lh, corner, maClr, 9); row++;
+   }
+   // v6.34: Daily extension cap row
+   if(UseDailyExtCap) {
+      bool _extBlocked = (g_DailyExtDownPct > DailyExtCapPct || g_DailyExtUpPct > DailyExtCapPct);
+      bool _extWarn    = (!_extBlocked && (g_DailyExtDownPct > DailyExtCapPct * 0.7 || g_DailyExtUpPct > DailyExtCapPct * 0.7));
+      color extClr = _extBlocked ? clrRed : _extWarn ? clrOrange : clrDimGray;
+      string extStr = "D:" + DoubleToString(g_DailyExtDownPct,0) + "% U:"
+                      + DoubleToString(g_DailyExtUpPct,0) + "% cap="
+                      + DoubleToString(DailyExtCapPct,0) + "%";
+      if(_extBlocked) extStr += " BLOCKED";
+      DashLine("14b_ext", "DayExt : " + extStr, cx, cy, row, lh, corner, extClr, 9); row++;
    }
    {
       int    bgPad  = 5;

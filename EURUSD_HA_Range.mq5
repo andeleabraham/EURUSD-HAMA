@@ -1,10 +1,10 @@
 //+------------------------------------------------------------------+
-//|  EURUSD Heiken Ashi Range Bot v6.32                              |
+//|  EURUSD Heiken Ashi Range Bot v6.33                              |
 //|  Volume gating + ATR SL/TP sizing + Real candle alignment        |
 //|  STANDARD / SENTINEL / MOMENTUM / ADAPTIVE / HARVESTER / CHRONO |
 //+------------------------------------------------------------------+
 #property copyright   "EURUSD HA Range Bot"
-#property version     "6.32"
+#property version     "6.33"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -975,13 +975,13 @@ void OnTick()
                                        + (g_PrevSessStrong ? "(S)" : "")
                                        + " | " + sessName + "-obs:" + obsStr
                                        + " | macro:" + macroStr
-                                       + " \u2192 " + (obsDir > 0 ? "BULL" : "BEAR")
+                                       + " -> " + (obsDir > 0 ? "BULL" : "BEAR")
                                        + " TRAP [" + g_FakeoutConfidence + "]";
                Print("[SESS FAKEOUT ", g_FakeoutConfidence, "] ", g_InterSessContext);
             } else if(obsAlignsMacro) {
                string tag = obsAlignsPrev ? "CONTINUATION" : "SESS REVERSAL";
                g_InterSessContext  = g_PrevSessName + "-close:" + prevStr + " | " + sessName
-                                     + "-obs:" + obsStr + " | macro:" + macroStr + " \u2192 " + tag;
+                                     + "-obs:" + obsStr + " | macro:" + macroStr + " -> " + tag;
                g_FakeoutConfidence = "";
                if(g_SessionFakeoutWatch) {
                   Print("[SESS FAKEOUT CLEARED] ", g_InterSessContext);

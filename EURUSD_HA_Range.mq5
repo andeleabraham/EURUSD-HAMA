@@ -1,10 +1,10 @@
 //+------------------------------------------------------------------+
-//|  EURUSD Heiken Ashi Range Bot v6.33                              |
+//|  EURUSD Heiken Ashi Range Bot v6.35                              |
 //|  Volume gating + ATR SL/TP sizing + Real candle alignment        |
 //|  STANDARD / SENTINEL / MOMENTUM / ADAPTIVE / HARVESTER / CHRONO |
 //+------------------------------------------------------------------+
 #property copyright   "EURUSD HA Range Bot"
-#property version     "6.33"
+#property version     "6.35"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -100,6 +100,11 @@ input ENUM_MA_METHOD MAMethod      = MODE_EMA;  // MA calculation method
 input double MA50TouchPips         = 5.0;   // Max pips from MA50 to count as touching/crossing
 input double MA20TouchPips         = 3.0;   // Max pips from MA20 (bonus) to count as touching
 input bool   MA200MacroHardBlock   = true;  // Block buy below MA200 / sell above MA200 (unless CHoCH override)
+// When MA200MacroHardBlock fires but signals are strong, place a pending BuyStop/SellStop at MA200+buffer
+// so the trade only opens once price actually crosses the MA200 line, avoiding premature entries.
+input double MA200PendingPips      = 2.0;   // Buffer pips above/below MA200 for pending order entry price
+input int    MA200PendingMaxBars   = 8;     // Auto-cancel pending order after this many M15 bars (8 = 2 hrs)
+input bool   MA200FakeJumpBlock    = true;  // Block buys when price jumped above MA200 but MA50 hasn't followed (likely reversal)
 input bool   MA5020EntryRequired   = true;  // Require price touching or having crossed MA50 for entry
 
 input group "=== DAILY EXTENSION CAP ==="
@@ -452,6 +457,15 @@ bool   g_MA200CrossDn = false;  // bar 1 closed below MA200 while bar 2 was abov
 bool   g_MA50CrossUp  = false;  // bar 1 crossed MA50 upward — augments CHoCH in bear macro
 bool   g_MA50CrossDn  = false;  // bar 1 crossed MA50 downward — augments CHoCH in bull macro
 string g_MAStatusLabel = "";    // dashboard summary string
+// v6.35: MA convergence / fake-jump detection
+bool   g_MAsAligned      = false; // true when MA50 and MA20 are both on the same side of MA200 (genuine alignment)
+bool   g_MA200FakeJumpUp = false; // price jumped above MA200 but MA50 still below → likely false BOS, expect reversal to MA50
+bool   g_MA200FakeJumpDn = false; // price dropped below MA200 but MA50 still above → likely false BOS, expect reversal to MA50
+// v6.35: Pending order state for MA200 boundary crossings
+int      g_PendingMA200Ticket = 0;     // order ticket of live pending order (0 = none)
+int      g_PendingMA200Dir    = 0;     // direction of pending: 1=BuyStop, -1=SellStop
+datetime g_PendingMA200Bar    = 0;     // bar time when pending was placed (for age tracking)
+double   g_PendingMA200Entry  = 0;     // entry price of the pending order
 
 // Daily extension cap (v6.34)
 double g_DailyOpenPx      = 0;   // open of first M15 bar today (server midnight)
@@ -742,6 +756,22 @@ void UpdateMAValues()
    string touch    = (g_MA50Touch ? " T50" : "") + (g_MA20Touch ? "+T20" : "");
    g_MAStatusLabel = above200 + " " + above50 + " " + above20 + cross + touch;
 
+   // --- v6.35: MA alignment and fake-jump detection ---
+   // "Aligned" means all three MAs stacked in the same direction:
+   //   Bull aligned: price > MA200 AND MA50 > MA200 AND MA20 > MA200 (golden-stack territory)
+   //   Bear aligned: price < MA200 AND MA50 < MA200 AND MA20 < MA200
+   g_MAsAligned      = (g_AboveMA200 && g_MA50 > g_MA200 && g_MA20 > g_MA200)
+                     || (!g_AboveMA200 && g_MA50 < g_MA200 && g_MA20 < g_MA200);
+   // Fake jump: price has crossed MA200 but MA50 has NOT followed yet.
+   // This is the most common false BOS — institutions push price through MA200 briefly
+   // then sell/buy it back towards MA50 (mean reversion to the slower average).
+   // When g_MA200FakeJumpUp is true: price is above MA200 but MA50 is still below — bearish reversal likely.
+   // When g_MA200FakeJumpDn is true: price is below MA200 but MA50 is still above — bullish bounce likely.
+   g_MA200FakeJumpUp = (g_MA200 > 0 && g_MA50 > 0 && g_AboveMA200  && g_MA50 < g_MA200);
+   g_MA200FakeJumpDn = (g_MA200 > 0 && g_MA50 > 0 && !g_AboveMA200 && g_MA50 > g_MA200);
+   if(g_MA200FakeJumpUp || g_MA200FakeJumpDn)
+      g_MAStatusLabel += " [FKJMP" + (g_MA200FakeJumpUp ? "^" : "v") + "]";
+
    // --- Daily extension cap ---
    if(UseDailyExtCap) {
       // Seed daily open once per day (or on first call)
@@ -771,6 +801,85 @@ void UpdateMAValues()
          g_DailyOpenPx  = 0;   // will be re-seeded above next tick
          g_DailyExtDownPct = 0;
          g_DailyExtUpPct   = 0;
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+// v6.35: Manage the MA200 pending BuyStop / SellStop order.
+// Called every tick. Handles:
+//   1. Age expiry — cancel after MA200PendingMaxBars bars
+//   2. Signal lost — cancel if HA signal is no longer in the pending direction
+//   3. MA200 drift — modify entry price each bar to track the moving MA200
+//   4. Trade opened — clear state once the pending fills (detected via g_TradeOpen)
+void ManageMA200Pending()
+{
+   if(g_PendingMA200Ticket == 0) return;
+
+   // If a market trade is now open (pending filled), clear state
+   if(g_TradeOpen) {
+      g_PendingMA200Ticket = 0; g_PendingMA200Dir = 0;
+      g_PendingMA200Bar    = 0; g_PendingMA200Entry = 0;
+      return;
+   }
+
+   // Confirm the order still exists in the terminal
+   if(!OrderSelect(g_PendingMA200Ticket)) {
+      g_PendingMA200Ticket = 0; g_PendingMA200Dir = 0;
+      g_PendingMA200Bar    = 0; g_PendingMA200Entry = 0;
+      return;
+   }
+
+   datetime curBar = iTime(_Symbol, PERIOD_M15, 0);
+
+   // Age check — cancel if too old
+   if(MA200PendingMaxBars > 0 && g_PendingMA200Bar > 0) {
+      int barsOld = (int)iBarShift(_Symbol, PERIOD_M15, g_PendingMA200Bar, false);
+      if(barsOld >= MA200PendingMaxBars) {
+         Print("[MA200 PENDING] Expired (", barsOld, " bars old, max=", MA200PendingMaxBars, ") — cancelling #", g_PendingMA200Ticket);
+         trade.OrderDelete(g_PendingMA200Ticket);
+         g_PendingMA200Ticket = 0; g_PendingMA200Dir = 0;
+         g_PendingMA200Bar    = 0; g_PendingMA200Entry = 0;
+         return;
+      }
+   }
+
+   // Signal check — cancel if HA signal no longer supports pending direction
+   bool sigStillValid = (g_PendingMA200Dir == 1  && (g_HABullSetup || g_Signal == "PREPARING BUY"))
+                      || (g_PendingMA200Dir == -1 && (g_HABearSetup || g_Signal == "PREPARING SELL"));
+   if(!sigStillValid) {
+      Print("[MA200 PENDING] Signal gone — cancelling #", g_PendingMA200Ticket);
+      trade.OrderDelete(g_PendingMA200Ticket);
+      g_PendingMA200Ticket = 0; g_PendingMA200Dir = 0;
+      g_PendingMA200Bar    = 0; g_PendingMA200Entry = 0;
+      return;
+   }
+
+   // MA200 drift — update entry price on each new bar so it tracks the MA
+   if(g_MA200 > 0 && curBar != g_PendingMA200Bar) {
+      double pipSize  = _Point * ((int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS) % 2 == 1 ? 10 : 1);
+      double bufDist  = MA200PendingPips * pipSize;
+      double newEntry = (g_PendingMA200Dir == 1) ? NormalizeDouble(g_MA200 + bufDist, _Digits)
+                                                  : NormalizeDouble(g_MA200 - bufDist, _Digits);
+      if(MathAbs(newEntry - g_PendingMA200Entry) >= _Point * 2) {
+         // Re-derive SL/TP from the new entry
+         double lot     = g_CurrentLot;
+         double _slUSD  = g_DynamicSL_USD * (lot / 0.01);
+         double _tpUSD  = g_DynamicTP_USD * (lot / 0.01);
+         double _slDist = USDtoPoints(_slUSD, lot);
+         double _tpDist = USDtoPoints(_tpUSD, lot);
+         double _minSp  = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL) * _Point;
+         if(_slDist < _minSp + _Point * 5) _slDist = _minSp + _Point * 5;
+         if(_tpDist < _minSp + _Point * 5) _tpDist = _minSp + _Point * 5;
+         double newSL = (g_PendingMA200Dir == 1) ? NormalizeDouble(newEntry - _slDist, _Digits)
+                                                  : NormalizeDouble(newEntry + _slDist, _Digits);
+         double newTP = (g_PendingMA200Dir == 1) ? NormalizeDouble(newEntry + _tpDist, _Digits)
+                                                  : NormalizeDouble(newEntry - _tpDist, _Digits);
+         if(trade.OrderModify(g_PendingMA200Ticket, newEntry, newSL, newTP, ORDER_TIME_GTC, 0)) {
+            g_PendingMA200Entry = newEntry;
+            Print("[MA200 PENDING] Modified entry to ", DoubleToString(newEntry,5),
+                  " (MA200=", DoubleToString(g_MA200,5), ")");
+         }
       }
    }
 }
@@ -888,6 +997,12 @@ void OnDeinit(const int reason)
    if(g_hMA200 != INVALID_HANDLE) { IndicatorRelease(g_hMA200); g_hMA200 = INVALID_HANDLE; }
    if(g_hMA50  != INVALID_HANDLE) { IndicatorRelease(g_hMA50);  g_hMA50  = INVALID_HANDLE; }
    if(g_hMA20  != INVALID_HANDLE) { IndicatorRelease(g_hMA20);  g_hMA20  = INVALID_HANDLE; }
+   // v6.35: Cancel any live MA200 pending order on EA removal/deinit
+   if(g_PendingMA200Ticket != 0) {
+      if(OrderSelect(g_PendingMA200Ticket))
+         trade.OrderDelete(g_PendingMA200Ticket);
+      g_PendingMA200Ticket = 0;
+   }
    Comment("");
 }
 
@@ -924,6 +1039,8 @@ void OnTick()
 
    // Always manage open trade on every tick
    if(g_TradeOpen) ManageOpenTrade();
+   // v6.35: Manage MA200 boundary pending order (cancel if stale/signal-lost/filled)
+   if(g_PendingMA200Ticket != 0) ManageMA200Pending();
 
    // --- Retry session seeding if data wasn't ready on OnInit ---
    // Key: use !g_AsianSeeded / !g_LondonSeeded flags (NOT g_AsianHigh==0),
@@ -4922,6 +5039,26 @@ void EvaluateHAPattern()
             hpSessObsBlocker = "FakeoutWatch[" + g_FakeoutConfidence + "]: " + g_InterSessContext;
          }
       }
+      // v6.34: MA200 macro block preflight check (declared here so nextGates can reference them)
+      // v6.35: also factors in fake-jump guard and pending state
+      bool _fakeJumpBlockBuy  = UseMAFilter && MA200FakeJumpBlock && g_MA200FakeJumpUp  && isBuy
+                                && !(g_CHoCHActive && g_CHoCHDir==1) && !(g_MacroCHoCH && g_MacroCHoCHDir==1);
+      bool _fakeJumpBlockSell = UseMAFilter && MA200FakeJumpBlock && g_MA200FakeJumpDn  && !isBuy
+                                && !(g_CHoCHActive && g_CHoCHDir==-1) && !(g_MacroCHoCH && g_MacroCHoCHDir==-1);
+      bool hpMAOK = !_fakeJumpBlockBuy && !_fakeJumpBlockSell &&
+                    (!UseMAFilter || !MA200MacroHardBlock || g_MA200 <= 0 ||
+                     (isBuy ? (g_AboveMA200 || g_MA200CrossUp ||
+                               (g_CHoCHActive && g_CHoCHDir == 1) || (g_MacroCHoCH && g_MacroCHoCHDir == 1)
+                               || (g_PendingMA200Ticket != 0 && g_PendingMA200Dir == 1))
+                            : (!g_AboveMA200 || g_MA200CrossDn ||
+                               (g_CHoCHActive && g_CHoCHDir == -1) || (g_MacroCHoCH && g_MacroCHoCHDir == -1)
+                               || (g_PendingMA200Ticket != 0 && g_PendingMA200Dir == -1))));
+      bool hpMA50OK = !UseMAFilter || !MA5020EntryRequired || g_MA50 <= 0 ||
+                      (isBuy ? (g_AboveMA50 || g_MA50Touch || g_MA50CrossUp)
+                             : (!g_AboveMA50 || g_MA50Touch || g_MA50CrossDn));
+      bool hpExtCapOK = !UseDailyExtCap || DailyExtCapPct <= 0 ||
+                        (isBuy ? (g_DailyExtUpPct   <= DailyExtCapPct)
+                               : (g_DailyExtDownPct <= DailyExtCapPct));
       nextGates += "\n  " + (hpVolOK     ? "✓" : "✗") + " Vol=" + g_VolumeState + "(x" + DoubleToString(g_VolRatio,2) + ")";
       nextGates += " | RealCdlAlign=" + (g_RealCandleAligned ? "ALIGNED" : "mixed/miss");
       nextGates += " | " + (hpSessObsOK  ? "✓" : "✗") + " SessObs=" + (hpSessObsOK ? "OK" : hpSessObsBlocker);
@@ -4948,18 +5085,6 @@ void EvaluateHAPattern()
                                (!isBuy && g_MacroStructLabel == "BULLISH"));
       bool _chochExmptPF   = g_MacroCHoCH && (g_MacroCHoCHDir == (isBuy ? 1 : -1));
       bool macroBOSBlockPF = _macroBOSRawPF && !_chochExmptPF;
-      // v6.34: MA200 macro block preflight check
-      bool hpMAOK = !UseMAFilter || !MA200MacroHardBlock || g_MA200 <= 0 ||
-                    (isBuy ? (g_AboveMA200 || g_MA200CrossUp ||
-                              (g_CHoCHActive && g_CHoCHDir == 1) || (g_MacroCHoCH && g_MacroCHoCHDir == 1))
-                           : (!g_AboveMA200 || g_MA200CrossDn ||
-                              (g_CHoCHActive && g_CHoCHDir == -1) || (g_MacroCHoCH && g_MacroCHoCHDir == -1)));
-      bool hpMA50OK = !UseMAFilter || !MA5020EntryRequired || g_MA50 <= 0 ||
-                      (isBuy ? (g_AboveMA50 || g_MA50Touch || g_MA50CrossUp)
-                             : (!g_AboveMA50 || g_MA50Touch || g_MA50CrossDn));
-      bool hpExtCapOK = !UseDailyExtCap || DailyExtCapPct <= 0 ||
-                        (isBuy ? (g_DailyExtUpPct   <= DailyExtCapPct)
-                               : (g_DailyExtDownPct <= DailyExtCapPct));
       bool allDownGatesOK = hpZoneOK && hpBiasOK && hpConfOK && hpTimeOK &&
                             hpCooldownOK && hpForeignOK && hpDailyOK && hpDailyLossOK &&
                             !macroBOSBlockPF && !g_TradeOpen && hpVolOK && hpSessObsOK &&
@@ -4978,7 +5103,9 @@ void EvaluateHAPattern()
          else if(!hpZoneOK)     g_PreflightBlocker = "Zone=" + g_ZoneLabel;
          else if(!hpBiasOK)     g_PreflightBlocker = "Bias=" + IntegerToString(g_TotalBias);
          else if(macroBOSBlockPF)g_PreflightBlocker = "MacroBOS=" + g_MacroStructLabel;
-         else if(!hpMAOK)       g_PreflightBlocker = "MA200 macro block (" + g_MAStatusLabel + ")";
+         else if(!hpMAOK)       g_PreflightBlocker = (_fakeJumpBlockBuy || _fakeJumpBlockSell)
+                                                       ? "MA200 fake-jump (" + g_MAStatusLabel + ") — await MA50 catch-up"
+                                                       : "MA200 macro block (" + g_MAStatusLabel + ")";
          else if(!hpMA50OK)     g_PreflightBlocker = "MA50 not touched (" + g_MAStatusLabel + ") dist>" + DoubleToString(MA50TouchPips,1) + "pip";
          else if(!hpExtCapOK)   g_PreflightBlocker = "DayExt cap " + DoubleToString(isBuy?g_DailyExtUpPct:g_DailyExtDownPct,1) + "% (max=" + DoubleToString(DailyExtCapPct,1) + "%)";
          else if(!hpConfOK)     g_PreflightBlocker = "Conf=" + DoubleToString(g_Confidence,1) + "% (min " + DoubleToString(MinConfidence,1) + "%";
@@ -5921,22 +6048,105 @@ void TryEntry()
       }
    }
 
-   // === MA200 MACRO HARD BLOCK (v6.34) ===
+   // === MA FAKE-JUMP GUARD (v6.35) ===
+   // Price has crossed MA200 but MA50 has not followed — common false BOS.
+   // The move typically reverses back towards MA50 before any genuine continuation.
+   // Block trades that would chase the fake jump; allow trades in the reversion direction.
+   if(UseMAFilter && MA200FakeJumpBlock && g_MA200 > 0 && g_MA50 > 0) {
+      // FakeJumpUp: price above MA200, MA50 still below → expect reversal DOWN to MA50
+      if(g_MA200FakeJumpUp && tradeDir == 1) {
+         bool _chochExempt = (g_CHoCHActive && g_CHoCHDir == 1) || (g_MacroCHoCH && g_MacroCHoCHDir == 1);
+         if(!_chochExempt) {
+            string _br = "BUY blocked: MA200 fake-jump (price above MA200 but MA50 still below="
+                         + DoubleToString(g_MA50,5) + ") — expect reversion to MA50 before genuine bull"
+                         + " | " + g_MAStatusLabel;
+            if(_br != g_LastBlockReason) { Print(_br); g_LastBlockReason = _br; }
+            return;
+         }
+      }
+      // FakeJumpDn: price below MA200, MA50 still above → expect reversal UP to MA50
+      if(g_MA200FakeJumpDn && tradeDir == -1) {
+         bool _chochExempt = (g_CHoCHActive && g_CHoCHDir == -1) || (g_MacroCHoCH && g_MacroCHoCHDir == -1);
+         if(!_chochExempt) {
+            string _br = "SELL blocked: MA200 fake-jump (price below MA200 but MA50 still above="
+                         + DoubleToString(g_MA50,5) + ") — expect reversion to MA50 before genuine bear"
+                         + " | " + g_MAStatusLabel;
+            if(_br != g_LastBlockReason) { Print(_br); g_LastBlockReason = _br; }
+            return;
+         }
+      }
+   }
+
+   // === MA200 MACRO GATE — PENDING ORDER or HARD BLOCK (v6.34/v6.35) ===
+   // When signals are valid but price has not yet crossed MA200:
+   //   If MA200MacroHardBlock = true AND MA200PendingPips > 0 AND no pending already open:
+   //     → Place a BuyStop / SellStop at MA200 ± buffer so the trade fires only on a real cross.
+   //   If pending already exists in the same direction: let it stand (managed by ManageMA200Pending).
+   //   CHoCH in the trade direction always exempts the gate entirely (reversal confirmed — enter now).
    if(UseMAFilter && MA200MacroHardBlock && g_MA200 > 0) {
       bool ma200BlockBuy  = (tradeDir ==  1 && !g_AboveMA200 && !g_MA200CrossUp);
       bool ma200BlockSell = (tradeDir == -1 &&  g_AboveMA200 && !g_MA200CrossDn);
       if(ma200BlockBuy || ma200BlockSell) {
          bool _chochExempt = (g_CHoCHActive && g_CHoCHDir == tradeDir) ||
                              (g_MacroCHoCH  && g_MacroCHoCHDir == tradeDir);
-         if(!_chochExempt) {
+         if(_chochExempt) {
+            Print("[MA200 CHoCH EXEMPT] trade proceeds despite MA200 block | ", g_MAStatusLabel);
+         } else if(MA200PendingPips > 0 && !g_TradeOpen
+                   && (g_PendingMA200Ticket == 0 || g_PendingMA200Dir != tradeDir)) {
+            // --- Place pending order at MA200 ± buffer ---
+            double pipSize  = _Point * ((int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS) % 2 == 1 ? 10 : 1);
+            double bufDist  = MA200PendingPips * pipSize;
+            double pendEntry = (tradeDir == 1) ? NormalizeDouble(g_MA200 + bufDist, _Digits)
+                                               : NormalizeDouble(g_MA200 - bufDist, _Digits);
+            // SL / TP in price distance — reuse USDtoPoints with current lot
+            double _slUSD   = g_DynamicSL_USD * (lot / 0.01);
+            double _tpUSD   = g_DynamicTP_USD * (lot / 0.01);
+            double _slDist  = USDtoPoints(_slUSD, lot);
+            double _tpDist  = USDtoPoints(_tpUSD, lot);
+            double _minStop = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL) * _Point;
+            if(_slDist < _minStop + _Point * 5) _slDist = _minStop + _Point * 5;
+            if(_tpDist < _minStop + _Point * 5) _tpDist = _minStop + _Point * 5;
+            double pendSL  = (tradeDir == 1) ? NormalizeDouble(pendEntry - _slDist, _Digits)
+                                             : NormalizeDouble(pendEntry + _slDist, _Digits);
+            double pendTP  = (tradeDir == 1) ? NormalizeDouble(pendEntry + _tpDist, _Digits)
+                                             : NormalizeDouble(pendEntry - _tpDist, _Digits);
+            string pendTag = (tradeDir == 1 ? "PEND_BS_MA200" : "PEND_SS_MA200")
+                             + "_SL" + DoubleToString(g_DynamicSL_USD,2)
+                             + "_TP" + DoubleToString(g_DynamicTP_USD,2);
+            // Cancel any existing opposite-direction pending first
+            if(g_PendingMA200Ticket != 0) {
+               trade.OrderDelete(g_PendingMA200Ticket);
+               g_PendingMA200Ticket = 0; g_PendingMA200Dir = 0; g_PendingMA200Bar = 0;
+            }
+            bool _pOK = (tradeDir == 1)
+                        ? trade.BuyStop (lot, pendEntry, _Symbol, pendSL, pendTP, ORDER_TIME_GTC, 0, pendTag)
+                        : trade.SellStop(lot, pendEntry, _Symbol, pendSL, pendTP, ORDER_TIME_GTC, 0, pendTag);
+            if(_pOK) {
+               g_PendingMA200Ticket = (int)trade.ResultOrder();
+               g_PendingMA200Dir    = tradeDir;
+               g_PendingMA200Bar    = iTime(_Symbol, PERIOD_M15, 0);
+               g_PendingMA200Entry  = pendEntry;
+               g_LastBlockReason    = "";
+               Print("[MA200 PENDING] ", (tradeDir==1?"BuyStop":"SellStop"),
+                     " @", DoubleToString(pendEntry,5),
+                     " SL=", DoubleToString(pendSL,5), " TP=", DoubleToString(pendTP,5),
+                     " (MA200=", DoubleToString(g_MA200,5), " +buf=", DoubleToString(MA200PendingPips,1), "pip)"
+                     " | ", g_MAStatusLabel);
+            } else {
+               Print("[MA200 PENDING] Failed to place order: ", trade.ResultComment());
+            }
+            return;  // do not continue to market order placement
+         } else {
+            // Pending already exists in this direction, or PendingPips=0 (hard block mode)
             string _br = (tradeDir==1?"BUY":"SELL") + " blocked: MA200="
                          + DoubleToString(g_MA200,5) + " price "
                          + (g_AboveMA200 ? "above" : "below")
-                         + " MA200 macro block | " + g_MAStatusLabel;
+                         + " MA200 macro block"
+                         + (g_PendingMA200Ticket != 0 ? " (pending #" + IntegerToString(g_PendingMA200Ticket) + " active)" : "")
+                         + " | " + g_MAStatusLabel;
             if(_br != g_LastBlockReason) { Print(_br); g_LastBlockReason = _br; }
             return;
          }
-         Print("[MA200 CHoCH EXEMPT] trade proceeds despite MA200 block | ", g_MAStatusLabel);
       }
    }
 
@@ -7604,8 +7814,17 @@ void UpdateDashboard()
    if(UseMAFilter && g_MAStatusLabel != "") {
       bool allAbove = g_AboveMA200 && g_AboveMA50 && g_AboveMA20;
       bool allBelow = !g_AboveMA200 && !g_AboveMA50 && !g_AboveMA20;
-      color maClr = allAbove ? clrLime : allBelow ? clrTomato : clrYellow;
+      bool fakeJump = g_MA200FakeJumpUp || g_MA200FakeJumpDn;
+      color maClr = fakeJump ? clrOrange : allAbove ? clrLime : allBelow ? clrTomato : clrYellow;
       DashLine("14_ma", "MA15   : " + g_MAStatusLabel, cx, cy, row, lh, corner, maClr, 9); row++;
+      // v6.35: Pending MA200 order row
+      if(g_PendingMA200Ticket != 0) {
+         int barsOld = (int)iBarShift(_Symbol, PERIOD_M15, g_PendingMA200Bar, false);
+         string pendStr = (g_PendingMA200Dir==1?"BuyStop":"SellStop")
+                          + " @" + DoubleToString(g_PendingMA200Entry,5)
+                          + "  (" + IntegerToString(barsOld) + "/" + IntegerToString(MA200PendingMaxBars) + " bars)";
+         DashLine("14_mapend", "MA200 Pend: " + pendStr, cx, cy, row, lh, corner, clrAqua, 9); row++;
+      }
    }
    // v6.34: Daily extension cap row
    if(UseDailyExtCap) {

@@ -1,10 +1,10 @@
 //+------------------------------------------------------------------+
-//|  EURUSD Heiken Ashi Range Bot v6.29                              |
+//|  EURUSD Heiken Ashi Range Bot v6.30                              |
 //|  Volume gating + ATR SL/TP sizing + Real candle alignment        |
 //|  STANDARD / SENTINEL / MOMENTUM / ADAPTIVE / HARVESTER / CHRONO |
 //+------------------------------------------------------------------+
 #property copyright   "EURUSD HA Range Bot"
-#property version     "6.29"
+#property version     "6.30"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -161,7 +161,7 @@ input group "=== MACRO TREND RIDE ==="
 // Asian session is blocked: Asia often makes a small counter-BOS move before the
 // real continuation begins at London open. Wait for non-Asian confirmation.
 input bool   MacroTrendRideEnabled  = true;   // Enable MacroBOS intraday trend-ride entries
-input int    MacroTrendMinScore     = 5;      // Min ZoneContextScore (0-14) — higher = more selective
+input int    MacroTrendMinScore     = 5;      // Min ZoneContextScore (0-15) — higher = more selective
 input double MacroTrendSL_USD       = 2.75;   // SL per 0.01 lot (wider space for trend volatility)
 input double MacroTrendMinTP_USD    = 4.00;   // Floor TP per 0.01 lot (minimum target for a trend ride)
 input double MacroTrendMaxTP_USD    = 8.00;   // Ceiling TP per 0.01 lot (cap at realistic intraday range)
@@ -177,14 +177,14 @@ input bool   AllowMeanReversion = true; // Enable HA-confirmed mean reversion tr
 // Zone strictness controls how "wrong zone" trend trades are treated:
 //   0 = STRICT        — Hard block. Zone is an absolute barrier; no exceptions ever.
 //   1 = RELAXED       — Block unless Asian session + prev-day carry-over bias (original default).
-//   2 = CONTEXT_AWARE — Smart mode. Scores structural confluence (up to 14 points):
+//   2 = CONTEXT_AWARE — Smart mode. Scores structural confluence (up to 15 points):
 //                       If score >= ZoneContextMinScore AND price is approaching a Fib/Pivot level
 //                       → sets PENDING state; waits for that level to break + momentum before entry.
 //                       If score sufficient AND no Fib barrier ahead (or already past one)
 //                       → allows CAUTION entry, logged to journal for learning.
 //                       Ideal for trending markets where the zone filter alone is misleading.
 input int    ZoneStrictness        = 2;    // 0=STRICT | 1=RELAXED (Asian relax) | 2=CONTEXT_AWARE
-input int    ZoneContextMinScore   = 4;    // Min confluence score (0-14) for CONTEXT_AWARE zone override
+input int    ZoneContextMinScore   = 4;    // Min confluence score (0-15) for CONTEXT_AWARE zone override
 input bool   ZonePendingEnabled    = true; // CONTEXT mode: wait for Fib/Pivot breakout before entry
 input double ZonePendingPips       = 10.0; // Pip lookahead: detect approaching Fib/Pivot within this range
 input int    ZonePendingMaxBars    = 4;    // CONTEXT mode: auto-expire pending wait after N M15 bars (4=1hr)
@@ -251,6 +251,7 @@ double g_FibExt1618  = 0;     // Fib 161.8% extension (above range for buys)
 double g_FibExt1272L = 0;     // Fib 127.2% extension (below range for sells)
 double g_FibExt1618L = 0;     // Fib 161.8% extension (below range for sells)
 string g_ZoneHardness = "HARD";  // "SOFT" or "HARD" — zone boundary expected to hold?
+string g_BollRoomLabel = "";  // Bollinger headroom label: "ROOM" (below upper/above lower), "CAPPED" (at band), "" (no data)
 double g_CIHigh     = 0, g_CILow     = 0, g_ATR      = 0;
 int    g_InitTickCount = 0;  // count ticks since attach; D1[0] not trusted until threshold
 
@@ -394,10 +395,16 @@ bool   g_DivergenceCaution = false;          // true when TP was capped due to M
 bool   g_RealCandleAligned = false;          // v6.29: true when real candle direction matches HA on bars 1 & 2
 string g_LastBlockReason   = "";             // last TryEntry block message — only print when it changes
 
+// HA alignment quality — updated by EvaluateHAPattern each bar
+string g_HAQualityLabel = "—";  // PURE / MIXED / IMPURE / DOJI
+int    g_HAQualityScore = 0;    // count of bottomless (bull) or topless (bear) bars in last chain (0-4)
+int    g_HAQualityTotal = 0;    // total bars checked for quality (denominator)
+bool   g_ConfirmPure   = false; // true when the confirming bar (bar1) is bottomless/topless
+
 // Macro Trend Ride state
 bool   g_MacroTrendRide  = false;  // true when MacroBOS trend-ride conditions are met on this bar
 int    g_MacroTrendDir   = 0;      // 1=bullish ride (long), -1=bearish ride (short)
-int    g_MacroTrendScore = 0;      // ZoneContextScore captured at time of detection (0-14)
+int    g_MacroTrendScore = 0;      // ZoneContextScore captured at time of detection (0-15)
 int    g_BoldRejectConsec = 0;      // last consec count that printed a BOLD REJECTED (throttle)
 
 // Order Blocks (institutional entry zones on H1) — up to 3 per direction
@@ -2674,6 +2681,34 @@ string ClassifyZoneHardness(int tradeDir, double price)
       if(tradeDir == -1 && g_FibExt1272L > 0 && g_FibExt1272L < g_RangeLow) softScore += 1;
    }
 
+   // 9. Bollinger band headroom — room to move in trade direction
+   //    BUY:  price below upper band → room to rise (+1); prev-day bullish momentum aligned → extra (+1)
+   //    SELL: price above lower band → room to fall (+1); prev-day bearish momentum aligned → extra (+1)
+   //    Asian session with alignment → additional boost (+1, up to +3 total)
+   //    If price is at/past the band in trade direction → HARD (no bonus)
+   g_BollRoomLabel = "";
+   if(g_BollingerUpper1 > 0 && g_BollingerLower1 > 0) {
+      double bollTol = 2.0 * _Point * 10;  // 2-pip tolerance
+      bool bollRoom = false;
+      if(tradeDir == 1 && price < g_BollingerUpper1 - bollTol) {
+         bollRoom = true;
+      } else if(tradeDir == -1 && price > g_BollingerLower1 + bollTol) {
+         bollRoom = true;
+      }
+      if(bollRoom) {
+         softScore += 1;  // base: room to move within Bollinger envelope
+         g_BollRoomLabel = "ROOM";
+         // Prev-day momentum aligned → price was already trending this way at close
+         if(g_PrevDayLastHourDir == tradeDir) softScore += 1;
+         // Asian session + prev-day alignment → strongest carry-over signal
+         MqlDateTime _hdt; TimeToStruct(TimeCurrent(), _hdt);
+         bool _inAsianH = (_hdt.hour >= AsianStartHour && _hdt.hour < AsianEndHour);
+         if(_inAsianH && g_PrevDayLastHourDir == tradeDir) softScore += 1;
+      } else {
+         g_BollRoomLabel = "CAPPED";
+      }
+   }
+
    // Penalise (reduce) for clustered resistance ahead
    int resistCount = 0;
    double lookAhead = 15.0 * _Point * 10;  // 15 pips ahead
@@ -3143,6 +3178,33 @@ double CalcConfidence(int tradeDir, string zone, bool isMeanRev, bool isSideways
    }
    g_ConfBreakdown += " CdlAlign:" + DoubleToString(conf - prevConf, 0); prevConf = conf;
 
+   // --- FACTOR 19 — BOLLINGER BAND HEADROOM (0-8) ---
+   // If price is below the upper band (buy) or above the lower band (sell),
+   // there is room to move → boost confidence. Stronger during Asian session
+   // when prev-day momentum aligns (carry-over bias with Bollinger runway).
+   {
+      double bollBonus = 0;
+      if(g_BollingerUpper1 > 0 && g_BollingerLower1 > 0) {
+         double bTol = 2.0 * _Point * 10;
+         bool bRoom = (tradeDir == 1  && SymbolInfoDouble(_Symbol, SYMBOL_BID) < g_BollingerUpper1 - bTol) ||
+                      (tradeDir == -1 && SymbolInfoDouble(_Symbol, SYMBOL_BID) > g_BollingerLower1 + bTol);
+         if(bRoom) {
+            bollBonus += 4.0;  // base: Bollinger runway exists
+            // Aligned with prev-day close momentum → stronger carry-over
+            if(g_PrevDayLastHourDir == tradeDir) bollBonus += 2.0;
+            // Asian session with alignment → $2 move is realistic on 0.01 lot
+            MqlDateTime _bdt; TimeToStruct(TimeCurrent(), _bdt);
+            bool _inAsianB = (_bdt.hour >= AsianStartHour && _bdt.hour < AsianEndHour);
+            if(_inAsianB && g_PrevDayLastHourDir == tradeDir) bollBonus += 2.0;
+         } else {
+            // Price at or past Bollinger band in trade direction → limited room
+            bollBonus -= 3.0;
+         }
+      }
+      conf += bollBonus;
+   }
+   g_ConfBreakdown += " BollRm:" + DoubleToString(conf - prevConf, 0); prevConf = conf;
+
    // --- PENALTIES ---
    if(isSideways)  conf -= 8.0;
    if(isMeanRev)   conf -= 3.0;
@@ -3192,6 +3254,7 @@ double CalcConfidence(int tradeDir, string zone, bool isMeanRev, bool isSideways
          " H4SMC:", (UseH4SMC ? (h4smcBonus != 0 ? DoubleToString(h4smcBonus,1) : "0") : "off"),
          " H4FVG:", (g_NearBullH4FVG ? "BULL" : g_NearBearH4FVG ? "BEAR" : "none"),
          " H4OB:",  (g_NearH4BullOB  ? "BULL" : g_NearH4BearOB  ? "BEAR" : "none"),
+         " BollRm:", g_BollRoomLabel,
          " Bias:", g_TotalBias,
          " MRV:", isMeanRev, " Side:", isSideways);
 
@@ -3547,7 +3610,7 @@ void CheckMacroTrendRide()
       bool mtfDiv = !g_MTFAligned;
       bool volDiv = (UseVolumeAnalysis && g_VolDivergence);
       if(mtfDiv && volDiv) {
-         Print("[MACRO TREND RIDE] Blocked: MTF+Vol both diverged (score=", score, "/14)");
+         Print("[MACRO TREND RIDE] Blocked: MTF+Vol both diverged (score=", score, "/15)");
          return;
       }
    }
@@ -3557,7 +3620,7 @@ void CheckMacroTrendRide()
    g_MacroTrendScore = score;
    Print("[MACRO TREND RIDE] Armed: ", g_MacroStructLabel, " BOS",
          " HAConsec=", g_HAConsecCount,
-         " Score=", score, "/14",
+         " Score=", score, "/15",
          " Vol=", g_VolumeState,
          " MTF=", (g_MTFAligned ? "ALIGNED" : "diverged"),
          " dir=", (bosDir == 1 ? "BULL" : "BEAR"));
@@ -3620,7 +3683,7 @@ int CheckLevelBreakBars(int tradeDir)
 //+------------------------------------------------------------------+
 //| ZONE CONTEXT SCORE                                               |
 //| Evaluates structural confluence to decide whether a wrong-zone  |
-//| trend trade should be allowed (CONTEXT_AWARE mode). Returns 0-14|
+//| trend trade should be allowed (CONTEXT_AWARE mode). Returns 0-15|
 //| — higher = stronger evidence the trend should override the zone. |
 //+------------------------------------------------------------------+
 int ZoneContextScore(int tradeDir)
@@ -3674,7 +3737,15 @@ int ZoneContextScore(int tradeDir)
       }
    }
 
-   return score;   // max 14 (was 12, +2 for multi-day/Murray)
+   // 14: Bollinger band headroom — price has room to move in trade direction
+   if(g_BollingerUpper1 > 0 && g_BollingerLower1 > 0) {
+      double bt = 2.0 * _Point * 10;
+      if((tradeDir == 1  && p < g_BollingerUpper1 - bt) ||
+         (tradeDir == -1 && p > g_BollingerLower1 + bt))
+         score++;
+   }
+
+   return score;   // max 15 (was 14, +1 for Bollinger headroom)
 }
 
 //+------------------------------------------------------------------+
@@ -3835,6 +3906,32 @@ void EvaluateHAPattern()
 
    // Count consecutive same-color candles ending at bar 1
    g_HAConsecCount = CountConsecutive(1, dir1);
+
+   // === DOJI INVALIDATION ===
+   // A HA doji (haClose ≈ haOpen) signals indecision and invalidates any running setup.
+   // When the most recent closed bar is a doji, the consecutive count breaks and we reset.
+   if(dir1 == 0) {
+      if(g_HABullSetup || g_HABearSetup) {
+         Print("[DOJI] HA doji at bar1 — invalidating ",
+               (g_HABullSetup ? "BUY" : "SELL"),
+               " setup. Counter reset to WAITING.");
+      }
+      g_HABullSetup       = false;
+      g_HABearSetup       = false;
+      g_ConfirmCandleOpen = 0;
+      g_BoldTier          = "NORMAL";
+      g_ZonePending       = false;
+      g_ZoneContextUsed   = false;
+      g_Signal            = "WAITING";
+      g_PreflightBullOK   = false;
+      g_PreflightBearOK   = false;
+      g_PreflightBlocker  = "";
+      g_HAQualityLabel    = "DOJI";
+      g_HAQualityScore    = 0;
+      g_HAQualityTotal    = 0;
+      g_ConfirmPure       = false;
+      return;
+   }
 
    // === COLD-START RECOVERY ===
    // After restart all state is lost. If we have a consecutive chain of same-
@@ -4185,6 +4282,52 @@ void EvaluateHAPattern()
       g_Signal            = "WAITING";
       g_PreflightBullOK   = false;   // bull setup died
       g_PreflightBlocker  = "";
+   }
+
+   // === HA ALIGNMENT QUALITY — computed after state machine resolves ===
+   // Checks how many of the bars in the active consecutive chain are "pure":
+   //  Bull chain: bottomless (haOpen == haLow, no lower shadow) = strong signal
+   //  Bear chain: topless   (haOpen == haHigh, no upper shadow) = strong signal
+   // A candle with haOpen > haLow (bull) or haOpen < haHigh (bear) carries an
+   // opposite wick and is considered IMPURE — momentum may be weakening.
+   {
+      int chainDir = (g_Signal == "BUY INCOMING" || g_Signal == "PREPARING BUY")  ?  1 :
+                     (g_Signal == "SELL INCOMING" || g_Signal == "PREPARING SELL") ? -1 : 0;
+      if(chainDir == 0) {
+         g_HAQualityLabel = "—";
+         g_HAQualityScore = 0;
+         g_HAQualityTotal = 0;
+         g_ConfirmPure    = false;
+      } else {
+         int checkBars = MathMin(g_HAConsecCount, 4);
+         int pureCount = 0;
+         for(int qi = 1; qi <= checkBars; qi++) {
+            double qO, qH, qL, qC;
+            CalcHA(qi, qO, qH, qL, qC);
+            bool pure = (chainDir == 1)
+                        ? (MathAbs(qL - qO) <= _Point * 3)   // bull: no lower shadow
+                        : (MathAbs(qH - qO) <= _Point * 3);  // bear: no upper shadow
+            if(pure) pureCount++;
+         }
+         g_HAQualityScore = pureCount;
+         g_HAQualityTotal = checkBars;
+         // Confirming bar (bar1) purity — key quality indicator
+         {
+            double cO, cH, cL, cC;
+            CalcHA(1, cO, cH, cL, cC);
+            g_ConfirmPure = (chainDir == 1)
+                            ? (MathAbs(cL - cO) <= _Point * 3)
+                            : (MathAbs(cH - cO) <= _Point * 3);
+         }
+         if(checkBars == 0) {
+            g_HAQualityLabel = "—";
+         } else {
+            int pct = (pureCount * 100) / checkBars;
+            if(pct >= 75)      g_HAQualityLabel = "PURE";
+            else if(pct >= 50) g_HAQualityLabel = "MIXED";
+            else               g_HAQualityLabel = "IMPURE";
+         }
+      }
    }
 
    // === PREPARING EXPIRY — if Bollinger hasn't confirmed after PrepMaxBars, abandon setup ===
@@ -4915,6 +5058,43 @@ void TryEntry()
    else if(isMeanRev)      tradeDir = meanRevDir;
    else if(isMacroTrend)   tradeDir = g_MacroTrendDir;
 
+   // === M1/M5 TICK ALIGNMENT GATE ===
+   // The current forming M1 and M5 candle direction must align with the trade direction.
+   // If BOTH short-term candles oppose the trade direction, the HA signal is likely a
+   // smoothing artifact — real price action is moving the other way. Block the entry.
+   // MRV and MacroTrend rides are exempt (structural, not HA-chain based).
+   if(isTrendSignal && !isMeanRev && !isMacroTrend) {
+      double _bidNow = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+      double _m1O    = iOpen(_Symbol, PERIOD_M1, 0);
+      double _m5O    = iOpen(_Symbol, PERIOD_M5, 0);
+      // Use a 2-pip dead-band to avoid noise on flat ticks
+      int    _m1D    = (_m1O > 0) ? ((_bidNow > _m1O + _Point * 2) ? 1 : (_bidNow < _m1O - _Point * 2 ? -1 : 0)) : 0;
+      int    _m5D    = (_m5O > 0) ? ((_bidNow > _m5O + _Point * 2) ? 1 : (_bidNow < _m5O - _Point * 2 ? -1 : 0)) : 0;
+      bool   _m1OK   = (_m1D == 0 || _m1D == tradeDir);   // flat or aligned
+      bool   _m5OK   = (_m5D == 0 || _m5D == tradeDir);   // flat or aligned
+      if(!_m1OK && !_m5OK) {
+         // Both M1 and M5 actively oppose the trade direction
+         string _brM = ((tradeDir == 1) ? "BUY" : "SELL") +
+                       " BLOCKED: M1=" + IntegerToString(_m1D) +
+                       " M5=" + IntegerToString(_m5D) +
+                       " oppose trade dir — short-term tick misaligned (" +
+                       DoubleToString(_bidNow, 5) + ")";
+         if(_brM != g_LastBlockReason) { Print(_brM); g_LastBlockReason = _brM; }
+         return;
+      }
+      if(!_m1OK || !_m5OK) {
+         // One TF aligned, one not — log once per bar as CAUTION
+         string _cautM = ((tradeDir == 1) ? "BUY" : "SELL") +
+                         " CAUTION: M1=" + IntegerToString(_m1D) +
+                         " M5=" + IntegerToString(_m5D) +
+                         " partial alignment (" + DoubleToString(_bidNow, 5) + ")";
+         if(_cautM != g_LastBlockReason && _canPrintBlock) {
+            Print(_cautM); g_LastBlockReason = _cautM;
+         }
+         // Proceed but note: impure HA quality with mixed M1/M5 = extra caution logged
+      }
+   }
+
    // === ZONE HARDNESS (SOFT/HARD) ===
    // Evaluate whether the zone boundary is expected to hold or break.
    // Must be computed after tradeDir is known.
@@ -5013,7 +5193,7 @@ void TryEntry()
             if(ctxScore < ZoneContextMinScore) {
                // Not enough confluence to override the zone filter
                string _br = (tradeDir == 1 ? "BUY" : "SELL") + " skipped: " + zone +
-                            " zone [CONTEXT score=" + IntegerToString(ctxScore) + "/14, need " +
+                            " zone [CONTEXT score=" + IntegerToString(ctxScore) + "/15, need " +
                             IntegerToString(ZoneContextMinScore) + "+ for override]";
                if(_br != g_LastBlockReason) { Print(_br); g_LastBlockReason = _br; }
                g_ZonePending = false;
@@ -5060,7 +5240,7 @@ void TryEntry()
                                               : ("awaiting " + g_ZonePendingLevel + " breakout");
                   string _br = "ZONE PENDING: " + pndMsg + " (" + IntegerToString(barsSince) +
                                "/" + IntegerToString(ZonePendingMaxBars) +
-                               " bars, score=" + IntegerToString(ctxScore) + "/14)";
+                               " bars, score=" + IntegerToString(ctxScore) + "/15)";
                   if(_br != g_LastBlockReason) { Print(_br); g_LastBlockReason = _br; }
                   return;
                }
@@ -5071,7 +5251,7 @@ void TryEntry()
                g_ZonePendingLevel     = approachLvl;
                g_ZonePendingDir       = tradeDir;
                g_ZonePendingStartTime = TimeCurrent();
-               Print("ZONE PENDING SET: ", zone, " zone, score=", ctxScore, "/14",
+               Print("ZONE PENDING SET: ", zone, " zone, score=", ctxScore, "/15",
                      " — approaching ", approachLvl, " within ",
                      DoubleToString(ZonePendingPips, 1),
                      " pips; waiting for breakout + momentum before entry");
@@ -5079,7 +5259,7 @@ void TryEntry()
 
             } else {
                // ── No Fib barrier ahead, or price already at/past level — CAUTION entry ──
-               string ctx = "score=" + IntegerToString(ctxScore) + "/14"
+               string ctx = "score=" + IntegerToString(ctxScore) + "/15"
                            + (atLvl != "" ? " | at/past " + atLvl : " | no Fib barrier ahead");
                string _br = "ZONE CONTEXT OVERRIDE: " + zone + " — " + ctx + " — CAUTION entry";
                if(_br != g_LastBlockReason) { Print(_br); g_LastBlockReason = _br; }
@@ -5370,7 +5550,7 @@ void TryEntry()
       Print("[MACRO TREND RIDE] SL=$", DoubleToString(MacroTrendSL_USD,2),
             " TP=$", DoubleToString(baseTpUSD,2),
             htfTarget > 0 ? " HTFtarget=" + DoubleToString(htfTarget,5) : " (no HTF level, using cap)",
-            " Score=", g_MacroTrendScore, "/14");
+            " Score=", g_MacroTrendScore, "/15");
    }
 
    // === MTF / VOLUME DIVERGENCE BLOCK ===
@@ -6599,7 +6779,8 @@ void UpdateDashboard()
    color zoneClr = (g_ZoneLabel == "MID_ZONE") ? clrOrange :
                    (g_ZoneLabel == "UPPER_THIRD") ? clrTomato :
                    (g_ZoneLabel == "LOWER_THIRD") ? clrLime : clrGray;
-   DashLine("04b_zone",  "Zone    : " + g_ZoneLabel + " [" + g_ZoneHardness + "]",   cx, cy, row, lh, corner, zoneClr,       9); row++;
+   string bollRmTag = (g_BollRoomLabel != "") ? (" Boll:" + g_BollRoomLabel) : "";
+   DashLine("04b_zone",  "Zone    : " + g_ZoneLabel + " [" + g_ZoneHardness + "]" + bollRmTag,   cx, cy, row, lh, corner, zoneClr,       9); row++;
    bool sw = IsSideways();
    DashLine("04c_sw",    "Sideways: " + (sw ? "YES (tight lock)" : "No"),       cx, cy, row, lh, corner, sw?clrOrange:clrGray, 9); row++;
 
@@ -6689,7 +6870,7 @@ void UpdateDashboard()
          color  rideClr = g_MacroTrendRide ? clrGold : clrDimGray;
          string rideStr = g_MacroTrendRide
                           ? (g_MacroTrendDir==1 ? "BULL RIDE" : "BEAR RIDE") +
-                            " ARMED  Score=" + IntegerToString(g_MacroTrendScore) + "/14"
+                            " ARMED  Score=" + IntegerToString(g_MacroTrendScore) + "/15"
                           : "trend ride: no setup";
          DashLine("10bo_ride", "TrendRide: " + rideStr,
                   cx, cy, row, lh, corner, rideClr, 9); row++;
@@ -6821,6 +7002,22 @@ void UpdateDashboard()
                            (liveConsecDash >= 3)                ? clrYellow : clrWhite;
    DashLine("13_consec", "HA Consec: " + consecStr + liveExtra,
                                                                                  cx, cy, row, lh, corner, consecClr,    9); row++;
+
+   // HA Alignment Quality row
+   {
+      string qualDetail = (g_HAQualityTotal > 0)
+                          ? IntegerToString(g_HAQualityScore) + "/" + IntegerToString(g_HAQualityTotal) + " pure"
+                          : "—";
+      string confirmTag  = (g_HAQualityTotal > 0)
+                           ? (g_ConfirmPure ? "  confirm:CLEAN" : "  confirm:IMPURE")
+                           : "";
+      color qualClr = (g_HAQualityLabel == "PURE")   ? clrLime :
+                      (g_HAQualityLabel == "MIXED")  ? clrYellow :
+                      (g_HAQualityLabel == "IMPURE") ? clrTomato :
+                      (g_HAQualityLabel == "DOJI")   ? clrOrange : clrDimGray;
+      DashLine("13b_haqual", "HA Qual : " + g_HAQualityLabel + " (" + qualDetail + ")" + confirmTag,
+               cx, cy, row, lh, corner, qualClr, 9); row++;
+   }
 
    // --- Left panel sizing (finalize height) ---
    {

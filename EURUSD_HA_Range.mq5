@@ -39,7 +39,7 @@ input double TrailPct         = 0.30;   // Trail gap = 30% of TP — generous ro
 //   3 = ADAPTIVE  — full smart mode. Tracks peak/trough, dwindling detection, structure exits.
 //   4 = HARVESTER — profit-tier slasher. Closes at $1/$1.50/$2 (per 0.01 lot) based on context.
 //   5 = CHRONO   — session-aware hybrid. Slashes in quiet sessions, rides in active ones.
-input int    TradeMgmtMode    = 3;      // 0-5: STD|SENT|MOM|ADAPT|HARVEST|CHRONO
+input int    TradeMgmtMode    = 0;      // 0-5: STD|SENT|MOM|ADAPT|HARVEST|CHRONO
 // Pause new-trade scanning while bot has an open trade.
 // true = focus entirely on managing the open trade (default, recommended).
 // false = continue scanning/arming signals even while a trade is running.
@@ -242,11 +242,11 @@ input bool   RespectForeignTrades = true;   // Block new entries if a non-bot tr
 
 input group "=== OVERTRADING PROTECTION ==="
 input int    MaxDailyTrades     = 5;     // Max trades per day (0 = unlimited; more trades can offset losses — house always wins)
-input bool   OneTradePerSession  = true;  // Limit 1 trade per session: 1 Asian, 1 London, 1 NY
+input bool   OneTradePerSession  = false; // Allow multiple trades per session — a session can offer 2+ good setups
 input double MaxDailyLossUSD    = 5.0;   // Stop trading after cumulative daily loss exceeds this (0=disabled)
 input int    ConsecLossLimit    = 2;     // After N consecutive SL hits, pause trading
 input int    CooldownBars       = 8;     // Bars to pause after consecutive loss limit hit (8 = 2 hours)
-input int    PostTradeCoolBars  = 2;     // Cool-off bars after ANY trade closes before next entry (2 = 30 min)
+input int    PostTradeCoolBars  = 1;     // Cool-off bars after any trade closes before next entry (1 = 15 min)
 input int    StartupGraceMins   = 4;     // After real restart, wait N minutes before allowing entry (0=disabled; skipped on timeframe switch)
 input int    NoEntryAfterHour   = 21;    // No new entries after this server hour (0-23, 0=disabled)
 input int    PrepMaxBars        = 8;     // Max bars PREPARING can wait for Bollinger confirm before expiring (0=no limit)

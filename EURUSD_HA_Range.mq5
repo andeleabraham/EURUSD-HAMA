@@ -1,10 +1,10 @@
 //+------------------------------------------------------------------+
-//|  EURUSD Heiken Ashi Range Bot v6.38                              |
+//|  EURUSD Heiken Ashi Range Bot v6.39                              |
 //|  Volume gating + ATR SL/TP sizing + Real candle alignment        |
 //|  STANDARD / SENTINEL / MOMENTUM / ADAPTIVE / HARVESTER / CHRONO |
 //+------------------------------------------------------------------+
 #property copyright   "EURUSD HA Range Bot"
-#property version     "6.38"
+#property version     "6.39"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -236,6 +236,13 @@ input group "=== NEWS EVENTS ==="
 input string NewsNote         = "";
 input int    NewsImpactEUR    = 0;
 input int    NewsImpactUSD    = 0;
+
+input group "=== ECONOMIC CALENDAR ==="
+input bool   ShowCalendar        = true;   // Display live economic calendar on the Trade dashboard
+input int    CalendarLookAheadH  = 6;      // Hours ahead to scan for EUR/USD events (1-12)
+input int    CalendarMinImpact   = 2;      // Minimum importance: 1=all  2=moderate+  3=high only
+input int    CalendarMaxEvents   = 3;      // Events to show on dashboard (1-4)
+input int    CalendarNoTradeMins = 30;     // Block new entries within N min of HIGH impact event (0=off)
 
 input group "=== FOREIGN TRADE AWARENESS ==="
 input bool   RespectForeignTrades = true;   // Block new entries if a non-bot trade exists on this symbol
@@ -589,6 +596,16 @@ double   g_DailyPnL        = 0.0;    // cumulative P&L today
 
 datetime g_LastBarTime  = 0;
 datetime g_LastDayReset = 0;
+
+// Economic Calendar cache (populated by FetchCalendarEvents every 60 s)
+struct CalEvent { datetime time; string currency; string name; int importance; };
+CalEvent            g_CalEvents[4];          // up to 4 upcoming EUR/USD events
+int                 g_CalEventCount      = 0;
+datetime            g_CalLastFetch       = 0;
+bool                g_NewsNoTrade        = false;  // HIGH impact event within CalendarNoTradeMins
+bool                g_CalCountriesLoaded = false;
+MqlCalendarCountry  g_CalCountries[];           // filled once by CalendarCountries()
+int                 g_CalCountryCount    = 0;
 
 string DASH_PREFIX = "HABOT_DASH_";
 
@@ -1014,6 +1031,8 @@ int OnInit()
             ") — data in memory, no wait needed");
    }
 
+   FetchCalendarEvents();         // v6.39: initial calendar load
+   g_CalLastFetch = TimeCurrent();
    UpdateDashboard();
    // v6.36: Timer-driven dashboard (1 Hz instead of per-tick)
    EventSetTimer(1);
@@ -1027,6 +1046,11 @@ int OnInit()
 void OnTimer()
 {
    UpdateDashboard();
+   // Refresh economic calendar cache every 60 seconds
+   if(ShowCalendar && TimeCurrent() - g_CalLastFetch >= 60) {
+      FetchCalendarEvents();
+      g_CalLastFetch = TimeCurrent();
+   }
 }
 
 //+------------------------------------------------------------------+
@@ -5799,6 +5823,25 @@ void TryEntry()
       }
    }
 
+   // === NEWS NO-TRADE ZONE (v6.39) ===
+   // Block new entries when a HIGH-impact EUR or USD event is imminent.
+   if(ShowCalendar && CalendarNoTradeMins > 0 && g_NewsNoTrade) {
+      string _evInfo = "";
+      for(int _ni = 0; _ni < g_CalEventCount; _ni++) {
+         if(g_CalEvents[_ni].importance == 3) {
+            int _nSecs = (int)(g_CalEvents[_ni].time - TimeCurrent());
+            if(_nSecs >= 0 && _nSecs <= CalendarNoTradeMins * 60) {
+               _evInfo = g_CalEvents[_ni].currency + " " + g_CalEvents[_ni].name +
+                         " in " + IntegerToString(_nSecs / 60) + "min";
+               break;
+            }
+         }
+      }
+      string _newsMsg = "[NEWS BLOCK] Entry paused \u2014 HIGH impact imminent: " + _evInfo;
+      if(_newsMsg != g_LastBlockReason) { Print(_newsMsg); g_LastBlockReason = _newsMsg; }
+      return;
+   }
+
    // Check both trend signals AND mean reversion setup
    bool isTrendSignal = (g_Signal == "BUY INCOMING" || g_Signal == "SELL INCOMING");
    int  meanRevDir    = MeanReversionSetup();
@@ -7778,6 +7821,93 @@ void RecordTradeResult(double profit)
 }
 
 //+------------------------------------------------------------------+
+//| ECONOMIC CALENDAR — look up currency from country_id            |
+//+------------------------------------------------------------------+
+string CalGetCurrency(ulong country_id)
+{
+   for(int i = 0; i < g_CalCountryCount; i++)
+      if(g_CalCountries[i].id == country_id) return g_CalCountries[i].currency;
+   return "";
+}
+
+//+------------------------------------------------------------------+
+//| Fetch & cache upcoming EUR/USD economic events (called via timer)|
+//+------------------------------------------------------------------+
+void FetchCalendarEvents()
+{
+   if(!ShowCalendar) return;
+   g_CalEventCount = 0;
+   g_NewsNoTrade   = false;
+
+   // Lazy-load country metadata once
+   if(!g_CalCountriesLoaded) {
+      g_CalCountryCount    = CalendarCountries(g_CalCountries);
+      g_CalCountriesLoaded = (g_CalCountryCount > 0);
+   }
+   if(g_CalCountryCount <= 0) return;
+
+   datetime now = TimeCurrent();
+   datetime toT = now + (datetime)(CalendarLookAheadH * 3600);
+
+   MqlCalendarValue vals[];
+   int total = CalendarValueHistory(vals, now, toT);
+   if(total <= 0) return;
+
+   // Collect qualifying events into temp arrays (max 32 candidates)
+   datetime tmpTime[32]; string tmpCur[32], tmpName[32]; int tmpImp[32]; ulong tmpEid[32];
+   int found = 0;
+
+   for(int i = 0; i < total && found < 32; i++) {
+      if(vals[i].time < now) continue;
+      MqlCalendarEvent ev;
+      if(!CalendarEventById(vals[i].event_id, ev)) continue;
+      if(ev.importance == CALENDAR_IMPORTANCE_NONE) continue;
+      string cur = CalGetCurrency(ev.country_id);
+      if(cur != "EUR" && cur != "USD") continue;
+      int imp = (ev.importance == CALENDAR_IMPORTANCE_HIGH)     ? 3 :
+                (ev.importance == CALENDAR_IMPORTANCE_MODERATE) ? 2 : 1;
+      if(imp < CalendarMinImpact) continue;
+      // De-duplicate by event_id
+      bool dup = false;
+      for(int d = 0; d < found; d++) { if(tmpEid[d] == ev.id) { dup = true; break; } }
+      if(dup) continue;
+      tmpTime[found] = vals[i].time; tmpCur[found] = cur;
+      tmpName[found] = ev.name;      tmpImp[found] = imp; tmpEid[found] = ev.id;
+      found++;
+   }
+
+   // Insertion sort — soonest first
+   for(int i = 1; i < found; i++) {
+      datetime kt = tmpTime[i]; string kc = tmpCur[i], kn = tmpName[i];
+      int ki = tmpImp[i]; ulong ke = tmpEid[i]; int j = i - 1;
+      while(j >= 0 && tmpTime[j] > kt) {
+         tmpTime[j+1] = tmpTime[j]; tmpCur[j+1]  = tmpCur[j];
+         tmpName[j+1] = tmpName[j]; tmpImp[j+1]  = tmpImp[j]; tmpEid[j+1] = tmpEid[j]; j--;
+      }
+      tmpTime[j+1] = kt; tmpCur[j+1] = kc; tmpName[j+1] = kn; tmpImp[j+1] = ki; tmpEid[j+1] = ke;
+   }
+
+   int cap = MathMin(found, MathMin(CalendarMaxEvents, 4));
+   g_CalEventCount = cap;
+   for(int i = 0; i < cap; i++) {
+      g_CalEvents[i].time       = tmpTime[i];
+      g_CalEvents[i].currency   = tmpCur[i];
+      g_CalEvents[i].name       = tmpName[i];
+      g_CalEvents[i].importance = tmpImp[i];
+   }
+
+   // No-trade flag: any HIGH impact event within the guard window
+   if(CalendarNoTradeMins > 0) {
+      for(int i = 0; i < g_CalEventCount; i++) {
+         if(g_CalEvents[i].importance == 3) {
+            int sAway = (int)(g_CalEvents[i].time - now);
+            if(sAway >= 0 && sAway <= CalendarNoTradeMins * 60) { g_NewsNoTrade = true; break; }
+         }
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
 //| DASHBOARD — OBJ_LABEL objects, moveable via inputs              |
 //+------------------------------------------------------------------+
 void DashLine(string suffix, string text,
@@ -8524,6 +8654,65 @@ void UpdateDashboard()
       DashLine("R_grace", "", rx, cy, rowR, lh, corner, clrGray, 8);
    }
    rowR++;
+
+   // --- Economic Calendar (v6.39) ---
+   if(ShowCalendar) {
+      DashLine("R_calhdr", "--- NEXT EVENTS ---", rx, cy, rowR, lh, corner, clrSilver, 8); rowR++;
+
+      // Determine macro+micro structural alignment for context labelling
+      bool _calMacBull = (g_MacroStructLabel == "BULLISH");
+      bool _calMacBear = (g_MacroStructLabel == "BEARISH");
+      bool _calH1Bull  = (g_StructureLabel   == "BULLISH");
+      bool _calH1Bear  = (g_StructureLabel   == "BEARISH");
+      bool _calBothBull = (_calMacBull && _calH1Bull);
+      bool _calBothBear = (_calMacBear && _calH1Bear);
+
+      // Always render 3 fixed rows so panel height is stable
+      for(int _ri = 0; _ri < 3; _ri++) {
+         string _lsuf = "R_cal" + IntegerToString(_ri);
+         if(_ri < g_CalEventCount) {
+            CalEvent _ev  = g_CalEvents[_ri];
+            int _secsA    = (int)(_ev.time - TimeCurrent());
+            string _tStr;
+            if(_secsA <= 0)        _tStr = "NOW";
+            else if(_secsA < 3600) _tStr = IntegerToString(_secsA / 60) + "m  ";
+            else { MqlDateTime _edx; TimeToStruct(_ev.time, _edx);
+                   _tStr = StringFormat("%02d:%02d", _edx.hour, _edx.min); }
+            string _imp = (_ev.importance == 3) ? "!!!" : (_ev.importance == 2) ? "!! " : "!  ";
+            string _nm  = _ev.name;
+            if(StringLen(_nm) > 19) _nm = StringSubstr(_nm, 0, 18) + "~";
+            // Structural alignment tag: EUR+ = EURUSD UP, USD+ = EURUSD DOWN
+            string _tag = "";
+            if(_ev.importance >= 2) {
+               bool _eurUp = (_ev.currency == "EUR"); // EUR positive -> pair rises
+               if(_calBothBull)      _tag = _eurUp ? " [+]" : " [-]";
+               else if(_calBothBear) _tag = _eurUp ? " [-]" : " [+]";
+               else if(_calMacBull || _calH1Bull || _calMacBear || _calH1Bear) _tag = " [~]";
+            }
+            // Urgency colour: red=imminent HIGH, orange=upcoming HIGH, gold=later HIGH, yellow=MOD
+            color _ec = clrDimGray;
+            if(_ev.importance == 3) {
+               if(_secsA >= 0 && _secsA <= CalendarNoTradeMins * 60) _ec = clrRed;
+               else if(_secsA < 7200) _ec = clrOrange;
+               else _ec = clrGold;
+            } else if(_ev.importance == 2) { _ec = clrYellow; }
+            DashLine(_lsuf, _imp + " " + _ev.currency + " " + _tStr + " " + _nm + _tag,
+                     rx, cy, rowR, lh, corner, _ec, 8); rowR++;
+         } else {
+            DashLine(_lsuf, "", rx, cy, rowR, lh, corner, clrGray, 7); rowR++;
+         }
+      }
+      // No-trade warning banner
+      if(g_NewsNoTrade) {
+         DashLine("R_calwarn", " !! NO-TRADE - HIGH IMPACT IMMINENT !!",
+                  rx, cy, rowR, lh, corner, clrRed, 9); rowR++;
+      } else {
+         DashLine("R_calwarn", "", rx, cy, rowR, lh, corner, clrGray, 7); rowR++;
+      }
+      // Legend: [+]=aligns with bias  [-]=opposes  [~]=partial/mixed
+      DashLine("R_calleg", "  [+]align [-]oppose [~]mixed | !! = moderate  !!! = high",
+               rx, cy, rowR, lh, corner, clrDimGray, 7); rowR++;
+   }
 
    // Geo & News notes (always rendered)
    rowR++;

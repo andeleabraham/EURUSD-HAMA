@@ -240,7 +240,7 @@ input group "=== FOREIGN TRADE AWARENESS ==="
 input bool   RespectForeignTrades = true;   // Block new entries if a non-bot trade exists on this symbol
 
 input group "=== OVERTRADING PROTECTION ==="
-input int    MaxDailyTrades     = 3;     // Max trades per day (0 = unlimited; recommend 3 with OneTradePerSession)
+input int    MaxDailyTrades     = 5;     // Max trades per day (0 = unlimited; more trades can offset losses — house always wins)
 input bool   OneTradePerSession  = true;  // Limit 1 trade per session: 1 Asian, 1 London, 1 NY
 input double MaxDailyLossUSD    = 5.0;   // Stop trading after cumulative daily loss exceeds this (0=disabled)
 input int    ConsecLossLimit    = 2;     // After N consecutive SL hits, pause trading
@@ -6576,6 +6576,37 @@ void TryEntry()
    tag = tag + "_C" + confStr
              + "_SL" + DoubleToString(g_DynamicSL_USD, 2)
              + "_TP" + DoubleToString(g_DynamicTP_USD, 2);
+
+   // === CANDLE OPEN ALIGNMENT GATE ===
+   // For a SELL: the current execution price (bid) must be BELOW the open of the current
+   // M15 bar AND below the open of the previous M15 bar — entering a sell on a rising
+   // (green/bull) candle means price is above its own open, which is adverse momentum.
+   // For a BUY: the ask must be ABOVE both opens — selling into a green open or buying
+   // into a red open are both entry-quality failures.
+   // Exempt: MRV and MacroTrend rides use structural logic; this gate targets trend signals.
+   if(isTrendSignal && !isMeanRev && !isMacroTrend) {
+      double _openBar0 = iOpen(_Symbol, PERIOD_M15, 0);  // forming candle open
+      double _openBar1 = iOpen(_Symbol, PERIOD_M15, 1);  // last confirmed candle open
+      if(_openBar0 > 0 && _openBar1 > 0) {
+         bool _candleAligned = false;
+         if(tradeDir == 1) {
+            // BUY: ask must be above both opens (bullish momentum confirmed by price)
+            _candleAligned = (ask > _openBar0 && ask > _openBar1);
+         } else {
+            // SELL: bid must be below both opens (bearish momentum confirmed by price)
+            _candleAligned = (bid < _openBar0 && bid < _openBar1);
+         }
+         if(!_candleAligned) {
+            string _brCA = (tradeDir == 1 ? "BUY" : "SELL") + " blocked: candle-open misalignment"
+                           + " | price=" + DoubleToString(tradeDir == 1 ? ask : bid, 5)
+                           + " barOpen0=" + DoubleToString(_openBar0, 5)
+                           + " barOpen1=" + DoubleToString(_openBar1, 5)
+                           + " (entering against candle direction)";
+            if(_brCA != g_LastBlockReason) { Print(_brCA); g_LastBlockReason = _brCA; }
+            return;
+         }
+      }
+   }
 
    // === EXECUTE ===
    // v6.36: spread filter — block when spread is too wide (news, illiquid)

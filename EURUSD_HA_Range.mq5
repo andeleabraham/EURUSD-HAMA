@@ -1,10 +1,10 @@
 //+------------------------------------------------------------------+
-//|  EURUSD Heiken Ashi Range Bot v6.40                              |
+//|  EURUSD Heiken Ashi Range Bot v6.41                              |
 //|  Volume gating + ATR SL/TP sizing + Real candle alignment        |
 //|  STANDARD / SENTINEL / MOMENTUM / ADAPTIVE / HARVESTER / CHRONO |
 //+------------------------------------------------------------------+
 #property copyright   "EURUSD HA Range Bot"
-#property version     "6.40"
+#property version     "6.41"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -51,6 +51,17 @@ input int    LossStructExit   = 1;      // 0=OFF | 1=ADAPT/CHRONO/HARVEST | 2=AL
 // Mid-range time-exit: close if stalling in LOSS after MidRangeMaxBars
 input double MidRangeStallUSD = 0.00;   // Stall exit disabled — trust the SL/TP
 input int    MidRangeMaxBars  = 16;     // Bars before mid-range stall check (only if MidRangeStallUSD > 0)
+
+input group "=== HORIZONTAL PRICE LEVELS (HPL) ==="
+input bool   UseHPL             = true;   // Enable horizontal price level (consolidation) detection
+input int    HPLScanBars        = 100;    // M15 bars to scan for repeated price touches (~25 hours)
+input double HPLClusterPips     = 3.0;    // Max pip spread to cluster touches into one level
+input int    HPLMinTouches      = 3;      // Minimum bar-highs or bar-lows needed to form a level
+input int    HPLMaxZones        = 5;      // Max HPL zones to track per direction (resist + support)
+input double HPLBreakPips       = 5.0;    // Pips past zone needed for a convincing break (zone invalid)
+input double HPLBlockBufferPips = 1.5;    // Extra pip buffer: how close price must be to trigger block
+input bool   HPLBlockBuysAtResist = true; // Block BUY entries at unbroken resistance HPL
+input bool   HPLBlockSellsAtSupport = true; // Block SELL entries at unbroken support HPL
 
 input group "=== TIME FILTERS ==="
 input int    MaxHoldBars      = 48;     // Max 15M bars to hold = 12 hours — give trades room to develop
@@ -522,6 +533,22 @@ double g_BullOB_High = 0, g_BullOB_Low = 0;
 double g_BearOB_High = 0, g_BearOB_Low = 0;
 datetime g_BullOB_Time = 0;
 datetime g_BearOB_Time = 0;
+
+// Horizontal Price Levels (HPL) — multi-touch consolidation/rejection zones
+struct HPLZone {
+   double   high;        // upper edge of the cluster zone
+   double   low;         // lower edge of the cluster zone
+   int      dir;         // +1 = resistance (highs cluster), -1 = support (lows cluster)
+   int      touches;     // number of bar-highs or bar-lows in this cluster
+   datetime firstTime;   // time of earliest bar that contributed a touch
+   bool     broken;      // true once price closed convincingly past the zone
+};
+HPLZone g_HPLZones[];        // detected HPL zones (resist + support combined)
+int     g_HPLCount    = 0;   // number of active HPL zones
+bool    g_HPLResistBlock = false;  // true when an unbroken RESIST HPL is overhead (BUY blocked)
+bool    g_HPLSupportBlock = false; // true when an unbroken SUPPORT HPL is below (SELL blocked)
+double  g_HPLResistHigh = 0, g_HPLResistLow = 0;   // nearest blocking resistance band
+double  g_HPLSupportHigh = 0, g_HPLSupportLow = 0; // nearest blocking support band
 
 // Fair Value Gaps (FVG) — M15 imbalance zones
 struct FVGZone {
@@ -1383,6 +1410,7 @@ void OnTick()
       if(UseVolumeAnalysis)  AnalyzeVolume();
       if(UseLiquiditySweep)  DetectLiquiditySweep();
       if(UseFairValueGaps)   { DetectFairValueGaps(); DrawFVGZones(); }
+      if(UseHPL)             { DetectHPLZones(); DrawHPLZones(); }
       if(UseH4SMC) {
          datetime h4t = iTime(_Symbol, PERIOD_H4, 0);
          if(h4t != g_LastH4BarTime) {   // v6.36: only recompute on new H4 bar
@@ -2672,6 +2700,233 @@ void DrawFVGZones()
       ObjectSetInteger(0, name, OBJPROP_BACK,  true);
       ObjectSetInteger(0, name, OBJPROP_SELECTABLE, false);
       ObjectSetString (0, name, OBJPROP_TEXT, (g_FVGs[f].dir == 1 ? "Bull FVG" : "Bear FVG"));
+   }
+}
+
+//+------------------------------------------------------------------+
+//| HORIZONTAL PRICE LEVEL (HPL) DETECTION                           |
+//| Scans recent M15 bars for price levels where bar highs (resist)  |
+//| or bar lows (support) cluster within HPLClusterPips of each      |
+//| other at least HPLMinTouches times = emergent S/R zone.          |
+//+------------------------------------------------------------------+
+void DetectHPLZones()
+{
+   // Reset block flags
+   g_HPLResistBlock  = false;
+   g_HPLSupportBlock = false;
+   g_HPLResistHigh   = 0; g_HPLResistLow   = 0;
+   g_HPLSupportHigh  = 0; g_HPLSupportLow  = 0;
+
+   if(!UseHPL) { g_HPLCount = 0; return; }
+
+   int totalBars = iBars(_Symbol, PERIOD_M15);
+   int scanBars  = MathMin(HPLScanBars, totalBars - 2);
+   if(scanBars < HPLMinTouches) { g_HPLCount = 0; return; }
+
+   double clusterPips = HPLClusterPips * _Point * 10.0;  // pips → price
+
+   // Collect all bar highs and lows with their bar times
+   double  barHighs[]; datetime barHighTimes[];
+   double  barLows[];  datetime barLowTimes[];
+   ArrayResize(barHighs,     scanBars);
+   ArrayResize(barHighTimes, scanBars);
+   ArrayResize(barLows,      scanBars);
+   ArrayResize(barLowTimes,  scanBars);
+
+   for(int i = 1; i <= scanBars; i++) {   // skip forming bar 0
+      barHighs[i-1]     = iHigh(_Symbol, PERIOD_M15, i);
+      barHighTimes[i-1] = iTime(_Symbol, PERIOD_M15, i);
+      barLows[i-1]      = iLow (_Symbol, PERIOD_M15, i);
+      barLowTimes[i-1]  = iTime(_Symbol, PERIOD_M15, i);
+   }
+
+   // ─── cluster helper: given a sorted array find groups ────────────────────────
+   // We'll use a simple O(n²) pass — n ≤ 100, perfectly acceptable.
+   // For each candidate level (each bar H or L), count how many others lie within
+   // clusterPips. Record the best cluster per distinct region.
+
+   ArrayResize(g_HPLZones, (HPLMaxZones * 2) + 4);
+   g_HPLCount = 0;
+
+   // Process RESISTANCE levels (bar highs)
+   int resistFound = 0;
+   bool usedHigh[];
+   ArrayResize(usedHigh, scanBars);
+   ArrayInitialize(usedHigh, false);
+
+   for(int i = 0; i < scanBars && resistFound < HPLMaxZones; i++) {
+      if(usedHigh[i]) continue;
+      double anchor = barHighs[i];
+      double zHigh  = anchor;
+      double zLow   = anchor;
+      int    count  = 1;
+      datetime earliest = barHighTimes[i];
+
+      for(int j = i + 1; j < scanBars; j++) {
+         if(usedHigh[j]) continue;
+         if(MathAbs(barHighs[j] - anchor) <= clusterPips) {
+            if(barHighs[j] > zHigh) zHigh = barHighs[j];
+            if(barHighs[j] < zLow)  zLow  = barHighs[j];
+            if(barHighTimes[j] < earliest) earliest = barHighTimes[j];
+            usedHigh[j] = true;
+            count++;
+         }
+      }
+      usedHigh[i] = true;
+
+      if(count >= HPLMinTouches) {
+         // Check if this cluster is already covered by a previously added zone
+         bool duplicate = false;
+         for(int z = 0; z < g_HPLCount; z++) {
+            if(g_HPLZones[z].dir == 1 &&
+               MathAbs((g_HPLZones[z].high + g_HPLZones[z].low) / 2.0 - (zHigh + zLow) / 2.0) < clusterPips * 2)
+            { duplicate = true; break; }
+         }
+         if(!duplicate) {
+            double buf = 0.5 * _Point * 10.0;   // 0.5 pip visual buffer
+            g_HPLZones[g_HPLCount].high      = zHigh + buf;
+            g_HPLZones[g_HPLCount].low       = zLow  - buf;
+            g_HPLZones[g_HPLCount].dir       = 1;   // resistance
+            g_HPLZones[g_HPLCount].touches   = count;
+            g_HPLZones[g_HPLCount].firstTime = earliest;
+            g_HPLZones[g_HPLCount].broken    = false;
+            g_HPLCount++;
+            resistFound++;
+         }
+      }
+   }
+
+   // Process SUPPORT levels (bar lows)
+   int supportFound = 0;
+   bool usedLow[];
+   ArrayResize(usedLow, scanBars);
+   ArrayInitialize(usedLow, false);
+
+   for(int i = 0; i < scanBars && supportFound < HPLMaxZones; i++) {
+      if(usedLow[i]) continue;
+      double anchor = barLows[i];
+      double zHigh  = anchor;
+      double zLow   = anchor;
+      int    count  = 1;
+      datetime earliest = barLowTimes[i];
+
+      for(int j = i + 1; j < scanBars; j++) {
+         if(usedLow[j]) continue;
+         if(MathAbs(barLows[j] - anchor) <= clusterPips) {
+            if(barLows[j] > zHigh) zHigh = barLows[j];
+            if(barLows[j] < zLow)  zLow  = barLows[j];
+            if(barLowTimes[j] < earliest) earliest = barLowTimes[j];
+            usedLow[j] = true;
+            count++;
+         }
+      }
+      usedLow[i] = true;
+
+      if(count >= HPLMinTouches) {
+         bool duplicate = false;
+         for(int z = 0; z < g_HPLCount; z++) {
+            if(g_HPLZones[z].dir == -1 &&
+               MathAbs((g_HPLZones[z].high + g_HPLZones[z].low) / 2.0 - (zHigh + zLow) / 2.0) < clusterPips * 2)
+            { duplicate = true; break; }
+         }
+         if(!duplicate) {
+            double buf = 0.5 * _Point * 10.0;
+            g_HPLZones[g_HPLCount].high      = zHigh + buf;
+            g_HPLZones[g_HPLCount].low       = zLow  - buf;
+            g_HPLZones[g_HPLCount].dir       = -1;  // support
+            g_HPLZones[g_HPLCount].touches   = count;
+            g_HPLZones[g_HPLCount].firstTime = earliest;
+            g_HPLZones[g_HPLCount].broken    = false;
+            g_HPLCount++;
+            supportFound++;
+         }
+      }
+   }
+
+   // Mark zones as broken
+   double lastClose = iClose(_Symbol, PERIOD_M15, 1);
+   double breakPips = HPLBreakPips * _Point * 10.0;
+   for(int z = 0; z < g_HPLCount; z++) {
+      if(g_HPLZones[z].dir == 1  && lastClose > g_HPLZones[z].high + breakPips)
+         g_HPLZones[z].broken = true;   // resistance cleanly broken upward
+      if(g_HPLZones[z].dir == -1 && lastClose < g_HPLZones[z].low  - breakPips)
+         g_HPLZones[z].broken = true;   // support cleanly broken downward
+   }
+
+   // Determine block flags based on current bid price
+   double bid    = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double bufPx  = HPLBlockBufferPips * _Point * 10.0;
+
+   for(int z = 0; z < g_HPLCount; z++) {
+      if(g_HPLZones[z].broken) continue;
+      if(g_HPLZones[z].dir == 1) {
+         // Resistance — block BUY if price is inside zone or within buffer below it
+         if(bid >= g_HPLZones[z].low - bufPx && bid <= g_HPLZones[z].high + bufPx) {
+            if(!g_HPLResistBlock || g_HPLZones[z].low < g_HPLResistLow) {
+               g_HPLResistBlock = true;
+               g_HPLResistHigh  = g_HPLZones[z].high;
+               g_HPLResistLow   = g_HPLZones[z].low;
+            }
+         }
+      } else {
+         // Support — block SELL if price is inside zone or within buffer above it
+         if(bid >= g_HPLZones[z].low - bufPx && bid <= g_HPLZones[z].high + bufPx) {
+            if(!g_HPLSupportBlock || g_HPLZones[z].high > g_HPLSupportHigh) {
+               g_HPLSupportBlock = true;
+               g_HPLSupportHigh  = g_HPLZones[z].high;
+               g_HPLSupportLow   = g_HPLZones[z].low;
+            }
+         }
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| DRAW HPL ZONES ON CHART as semi-transparent rectangles            |
+//| Resistance = semi-transparent orange, Support = semi-transparent  |
+//| teal. Broken zones drawn in dim grey.                            |
+//+------------------------------------------------------------------+
+void DrawHPLZones()
+{
+   // Remove stale HPL rectangles
+   for(int i = ObjectsTotal(0, 0) - 1; i >= 0; i--) {
+      string nm = ObjectName(0, i, 0);
+      if(StringFind(nm, "HABOT_HPL_") == 0)
+         ObjectDelete(0, nm);
+   }
+
+   if(!UseHPL || g_HPLCount == 0) return;
+
+   datetime tEnd = TimeCurrent() + 3600 * 6;  // extend 6 h to the right
+
+   for(int z = 0; z < g_HPLCount; z++) {
+      string nm    = "HABOT_HPL_" + (g_HPLZones[z].dir == 1 ? "R_" : "S_") + IntegerToString(z);
+      bool   isResist = (g_HPLZones[z].dir == 1);
+      bool   broken   = g_HPLZones[z].broken;
+
+      color  zoneClr  = broken ? clrDimGray
+                                : (isResist ? clrOrangeRed : clrTeal);
+      string label    = (isResist ? "Resist HPL " : "Support HPL ") +
+                        IntegerToString(g_HPLZones[z].touches) + "t" +
+                        (broken ? " [BROKEN]" : "");
+
+      if(ObjectFind(0, nm) < 0)
+         ObjectCreate(0, nm, OBJ_RECTANGLE, 0,
+                      g_HPLZones[z].firstTime, g_HPLZones[z].high,
+                      tEnd,                    g_HPLZones[z].low);
+      else {
+         ObjectSetInteger(0, nm, OBJPROP_TIME,  0, g_HPLZones[z].firstTime);
+         ObjectSetDouble (0, nm, OBJPROP_PRICE, 0, g_HPLZones[z].high);
+         ObjectSetInteger(0, nm, OBJPROP_TIME,  1, tEnd);
+         ObjectSetDouble (0, nm, OBJPROP_PRICE, 1, g_HPLZones[z].low);
+      }
+      ObjectSetInteger(0, nm, OBJPROP_COLOR,      zoneClr);
+      ObjectSetInteger(0, nm, OBJPROP_STYLE,      STYLE_SOLID);
+      ObjectSetInteger(0, nm, OBJPROP_WIDTH,       1);
+      ObjectSetInteger(0, nm, OBJPROP_FILL,        true);
+      ObjectSetInteger(0, nm, OBJPROP_BACK,        true);
+      ObjectSetInteger(0, nm, OBJPROP_SELECTABLE,  false);
+      ObjectSetString (0, nm, OBJPROP_TEXT,        label);
    }
 }
 
@@ -6014,6 +6269,29 @@ void TryEntry()
    else if(isMeanRev)      tradeDir = meanRevDir;
    else if(isMacroTrend)   tradeDir = g_MacroTrendDir;
 
+   // === HPL HORIZONTAL PRICE LEVEL BLOCK ===
+   // Block trend entries when price is sitting AT or inside an unbroken horizontal
+   // rejection zone. Mean-reversion entries AT the HPL are intentional (the whole
+   // point of MRV is to fade the level), so isMeanRev is exempt.
+   if(UseHPL && tradeDir != 0 && !isMeanRev) {
+      if(tradeDir == 1 && HPLBlockBuysAtResist && g_HPLResistBlock) {
+         string _hplMsg = "[HPL BLOCK] BUY blocked — RESIST HPL @" +
+                          DoubleToString(g_HPLResistLow * 1.0, _Digits) + "-" +
+                          DoubleToString(g_HPLResistHigh * 1.0, _Digits) +
+                          " — wait for clean close above zone";
+         if(_hplMsg != g_LastBlockReason) { Print(_hplMsg); g_LastBlockReason = _hplMsg; }
+         return;
+      }
+      if(tradeDir == -1 && HPLBlockSellsAtSupport && g_HPLSupportBlock) {
+         string _hplMsg = "[HPL BLOCK] SELL blocked — SUPPORT HPL @" +
+                          DoubleToString(g_HPLSupportLow * 1.0, _Digits) + "-" +
+                          DoubleToString(g_HPLSupportHigh * 1.0, _Digits) +
+                          " — wait for clean close below zone";
+         if(_hplMsg != g_LastBlockReason) { Print(_hplMsg); g_LastBlockReason = _hplMsg; }
+         return;
+      }
+   }
+
    // === M1/M5 TICK ALIGNMENT GATE ===
    // The current forming M1 and M5 candle direction must align with the trade direction.
    // If BOTH short-term candles oppose the trade direction, the HA signal is likely a
@@ -8202,6 +8480,41 @@ void UpdateDashboard()
    DashLine("04b_zone",  "Zone    : " + g_ZoneLabel + " [" + g_ZoneHardness + "]" + bollRmTag,   cx, cy, row, lh, corner, zoneClr,       9); row++;
    bool sw = IsSideways();
    DashLine("04c_sw",    "Sideways: " + (sw ? "YES (tight lock)" : "No"),       cx, cy, row, lh, corner, sw?clrOrange:clrGray, 9); row++;
+
+   // HPL horizontal price level block status
+   if(UseHPL && g_HPLCount > 0) {
+      bool   hplAnyBlock  = g_HPLResistBlock || g_HPLSupportBlock;
+      string hplText      = "HPL     : ";
+      color  hplClr       = clrGray;
+      if(g_HPLResistBlock && g_HPLSupportBlock) {
+         hplText += "TRAPPED (" +
+                    DoubleToString(g_HPLSupportHigh, _Digits) + " - " +
+                    DoubleToString(g_HPLResistLow,   _Digits) + ")";
+         hplClr   = clrOrangeRed;
+      } else if(g_HPLResistBlock) {
+         hplText += "RESIST @" +
+                    DoubleToString(g_HPLResistLow,  _Digits) + "-" +
+                    DoubleToString(g_HPLResistHigh, _Digits) + " [BUY BLOCKED]";
+         hplClr   = clrOrangeRed;
+      } else if(g_HPLSupportBlock) {
+         hplText += "SUPPORT @" +
+                    DoubleToString(g_HPLSupportLow,  _Digits) + "-" +
+                    DoubleToString(g_HPLSupportHigh, _Digits) + " [SELL BLOCKED]";
+         hplClr   = clrTomato;
+      } else {
+         // Show brief zone count
+         int rCnt = 0, sCnt = 0;
+         for(int _hz = 0; _hz < g_HPLCount; _hz++) {
+            if(!g_HPLZones[_hz].broken) {
+               if(g_HPLZones[_hz].dir ==  1) rCnt++;
+               else                           sCnt++;
+            }
+         }
+         hplText += IntegerToString(rCnt) + "R/" + IntegerToString(sCnt) + "S zones (clear)";
+         hplClr   = clrSilver;
+      }
+      DashLine("04d_hpl", hplText, cx, cy, row, lh, corner, hplClr, 9); row++;
+   }
 
    // Asian session prev-day momentum status
    if(AsianPrevDayMomEnabled) {

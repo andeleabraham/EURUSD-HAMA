@@ -4810,8 +4810,14 @@ void EvaluateHAPattern()
                      " bar1=", DoubleToString(_rcB1-_roB1,5), " bar2=", DoubleToString(_rcB2-_roB2,5),
                      " — waiting for real alignment.");
             } else if(!_realBull1 || !_realBull2) {
+               // One real candle conflicts — HA chain invalidated; reset count and stay PREPARING
+               realCandleOK = false;
+               g_HAConsecCount   = 0;
+               g_HABullSetup     = false;
+               g_ConfirmCandleOpen = 0;
                Print("BUY: Real candle MIXED — bar1=", (_realBull1?"BULL":"BEAR"),
-                     " bar2=", (_realBull2?"BULL":"BEAR"), " — proceeding with caution");
+                     " bar2=", (_realBull2?"BULL":"BEAR"),
+                     " — HA chain invalidated, resetting consecutive count.");
             }
          }
          if(bollOK && realCandleOK) {
@@ -4967,8 +4973,14 @@ void EvaluateHAPattern()
                      " bar1=", DoubleToString(_rcS1-_roS1,5), " bar2=", DoubleToString(_rcS2-_roS2,5),
                      " — waiting for real alignment.");
             } else if(!_realBear1 || !_realBear2) {
+               // One real candle conflicts — HA chain invalidated; reset count and stay PREPARING
+               realCandleOKS = false;
+               g_HAConsecCount   = 0;
+               g_HABearSetup     = false;
+               g_ConfirmCandleOpen = 0;
                Print("SELL: Real candle MIXED — bar1=", (_realBear1?"BEAR":"BULL"),
-                     " bar2=", (_realBear2?"BEAR":"BULL"), " — proceeding with caution");
+                     " bar2=", (_realBear2?"BEAR":"BULL"),
+                     " — HA chain invalidated, resetting consecutive count.");
             }
          }
          if(bollOK && realCandleOKS) {

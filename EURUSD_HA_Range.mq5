@@ -5837,7 +5837,7 @@ void TryEntry()
             }
          }
       }
-      string _newsMsg = "[NEWS BLOCK] Entry paused \u2014 HIGH impact imminent: " + _evInfo;
+      string _newsMsg = "[NEWS BLOCK] Entry paused -- HIGH impact imminent: " + _evInfo;
       if(_newsMsg != g_LastBlockReason) { Print(_newsMsg); g_LastBlockReason = _newsMsg; }
       return;
    }

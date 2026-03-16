@@ -25,8 +25,8 @@ input group "=== RISK & PROFIT (per 0.01 lot baseline) ==="
 input double MaxLossUSD       = 2.50;   // Hard max loss before forced close (per 0.01 lot)
 // Dynamic SL/TP: the bot finds structural SL (nearest invalidation) and calculates TP from R:R.
 // The SL is clamped within MinSL/MaxSL range. TP = SL × RRRatio.
-input double MinSL_USD        = 1.25;   // Minimum SL per 0.01 lot (~12.5 pips) — HA-based entries are precise
-input double MaxSL_USD        = 1.50;   // Maximum SL per 0.01 lot (~15 pips) — keep losses small; a bad entry is costly
+input double MinSL_USD        = 0.50;   // Minimum SL per 0.01 lot — floor avoids broker reject; HA-based SL can be as low as 0.8
+input double MaxSL_USD        = 1.25;   // Hard SL cap per 0.01 lot (~12.5 pips) — a bad entry is costly; don't give more away
 input double RRRatio          = 1.8;    // Reward:Risk ratio (1.8 = for every $1 risk, target $1.80)
 input double MaxTP_USD        = 2.50;   // Hard TP ceiling per 0.01 lot — 2.0-2.5 USD is statistically achievable; beyond this risks missing the exit
 // Lock/trail are now proportional to the dynamic SL, not fixed per tier
@@ -3935,20 +3935,54 @@ double CalcStructuralSL(int tradeDir)
    double minSLdist = MinSL_USD / 10.0;  // convert USD/0.01lot to price distance
    double maxSLdist = MaxSL_USD / 10.0;
 
-   for(int i = 0; i < cnt; i++) {
-      double dist = MathAbs(entry - levels[i]);
-      if(dist < minSLdist * 0.5) continue;  // too close, skip (would give SL < min)
-      if(dist < bestDist) bestDist = dist;
+   // === PRIMARY SL: outermost edge of the last 1-2 clean HA candles ===
+   // A clean candle is one that is directional (matches trade) and is not a doji.
+   // For buys  : SL = lowest HA Low  among clean bars 1 & 2 (the further from entry wins)
+   // For sells : SL = highest HA High among clean bars 1 & 2
+   // This gives the tightest structurally-valid SL — the smoothed HA already prices in
+   // noise, so its outermost edge IS the real invalidation point.
+   double _haO1p, _haH1p, _haL1p, _haC1p;
+   double _haO2p, _haH2p, _haL2p, _haC2p;
+   CalcHA(1, _haO1p, _haH1p, _haL1p, _haC1p);
+   CalcHA(2, _haO2p, _haH2p, _haL2p, _haC2p);
+   bool _bar1Clean = (!IsHADoji(1) && HADir(1) == tradeDir);
+   bool _bar2Clean = (!IsHADoji(2) && HADir(2) == tradeDir);
+   double _haPrimaryDist = 0;
+   if(tradeDir == 1 && _bar1Clean) {
+      double _haEdge = _haL1p;
+      if(_bar2Clean && _haL2p < _haEdge) _haEdge = _haL2p;  // furthest low wins
+      _haPrimaryDist = MathAbs(entry - _haEdge) + 1.0 * pipValue;  // +1 pip buffer
+   } else if(tradeDir == -1 && _bar1Clean) {
+      double _haEdge = _haH1p;
+      if(_bar2Clean && _haH2p > _haEdge) _haEdge = _haH2p;  // furthest high wins
+      _haPrimaryDist = MathAbs(entry - _haEdge) + 1.0 * pipValue;  // +1 pip buffer
+   }
+   if(_haPrimaryDist > 0)
+      bestDist = _haPrimaryDist;   // HA edge is the primary SL
+
+   // === FALLBACK: structural levels (only if HA gave no valid primary) ===
+   if(bestDist >= 99000) {
+      for(int i = 0; i < cnt; i++) {
+         double dist = MathAbs(entry - levels[i]);
+         if(dist < minSLdist * 0.5) continue;  // too close, skip
+         if(dist < bestDist) bestDist = dist;
+      }
    }
 
-   // If no structural level found, use ATR-based fallback
+   // === STRUCTURAL LEVEL AS TIGHTER CHECK ===
+   // Even when HA gave a primary SL, if a structural level sits closer to entry
+   // (providing tighter protection), prefer it — smaller SL = better R:R.
+   for(int i = 0; i < cnt; i++) {
+      double dist = MathAbs(entry - levels[i]) + 1.0 * pipValue;
+      if(dist < minSLdist * 0.5) continue;
+      if(dist < bestDist) bestDist = dist;  // structural level improves SL
+   }
+
+   // If no level found at all, use ATR-based fallback
    if(bestDist >= 99000) {
       double atrDist = (g_ATR > 0) ? g_ATR * 1.5 : 20 * pipValue;
       bestDist = atrDist;
    }
-
-   // Add a small buffer beyond the structural level (2 pips)
-   bestDist += 2.0 * pipValue;
 
    // Convert price distance to USD per 0.01 lot
    // For EURUSD: 1 pip = $0.10 per 0.01 lot
@@ -3958,38 +3992,28 @@ double CalcStructuralSL(int tradeDir)
    // Clamp to user limits
    slUSD = MathMax(MinSL_USD, MathMin(MaxSL_USD, slUSD));
 
-   // === VOLUME / ATR / MOMENTUM SL/TP ADJUSTMENT (v6.29) ===
-   // Dynamic multipliers give the SL room to breathe in volatile/low-volume markets
-   // and let TP run when institutional volume is present.
-   double slMult = 1.0;
+   // === TP ADJUSTMENT (volume/momentum context — applied to TP only, not SL) ===
+   // SL is fixed by HA structure; do NOT inflate it with multipliers (defeats tight entry).
+   // TP is allowed to scale: when institutional volume is high or momentum is strong,
+   // let the winner run a little further while keeping SL anchored to HA edge.
    double tpMult = 1.0;
+   if(g_VolumeState == "LOW")            tpMult *= 0.85;  // choppy: conservative TP
+   else if(g_VolumeState == "HIGH")      tpMult *= 1.10;  // strong flow: let it run
+   else if(g_VolumeState == "ABOVE_AVG") tpMult *= 1.05;
 
-   // Volume-driven: LOW = wider SL (needs room in choppy market), tighter TP (conservative)
-   //                HIGH = wider TP (let institutional move run)
-   if(g_VolumeState == "LOW")            { slMult *= 1.25; tpMult *= 0.80; }
-   else if(g_VolumeState == "HIGH")      { tpMult *= 1.15; }
-   else if(g_VolumeState == "ABOVE_AVG") { tpMult *= 1.05; }
-
-   // ATR-driven: elevated volatility requires wider SL to avoid premature stop-outs
    double _atrPips = (g_ATR > 0) ? (g_ATR / _Point / 10.0) : 10.0;
-   if(_atrPips >= 20.0)      slMult *= 1.20;   // high volatility — give SL 20% more room
-   else if(_atrPips >= 14.0) slMult *= 1.10;   // moderate-high
-
-   // Bar momentum: average range of last 3 confirmed bars vs ATR
-   // Strong bars = price is moving decisively → widen both SL (room) and TP (capture)
    double _avgBarRng = 0;
    for(int m = 1; m <= 3; m++)
       _avgBarRng += iHigh(_Symbol, PERIOD_M15, m) - iLow(_Symbol, PERIOD_M15, m);
    _avgBarRng /= 3.0;
    double _momRatio = (g_ATR > 0) ? _avgBarRng / g_ATR : 1.0;
-   if(_momRatio >= 1.5) { slMult *= 1.10; tpMult *= 1.10; }   // strong momentum
+   if(_momRatio >= 1.5 && g_VolumeState != "LOW") tpMult *= 1.05;  // strong momentum bonus
 
-   // Apply multipliers
-   double adjSL = slUSD * slMult;
-   double adjTP = slUSD * RRRatio * tpMult;
+   double adjSL = slUSD;                       // SL = HA-structural edge, no multiplier
+   double adjTP = slUSD * RRRatio * tpMult;   // TP scales with SL × R:R × context
 
-   // Re-clamp: allow SL up to 30% above MaxSL_USD for dynamic adjustments, TP at least 1:1
-   adjSL = MathMax(MinSL_USD, MathMin(MaxSL_USD * 1.3, adjSL));
+   // Re-clamp SL to [MinSL, MaxSL] — HA edge might land below floor or above hard cap
+   adjSL = MathMax(MinSL_USD, MathMin(MaxSL_USD, adjSL));
    adjTP = MathMax(adjSL * 1.0, adjTP);   // TP floor = 1:1 R:R
    adjTP = MathMin(adjTP, MaxTP_USD);      // hard cap — statistically achievable targets
 
@@ -4001,8 +4025,8 @@ double CalcStructuralSL(int tradeDir)
          " (", DoubleToString(adjSL / 0.10, 1), " pips)",
          " TP: $", DoubleToString(adjTP, 2),
          " R:R=1:", DoubleToString(adjTP / adjSL, 1),
-         " [base=$", DoubleToString(slUSD, 2),
-         " slMult=", DoubleToString(slMult, 2),
+         " [haPrimary=", DoubleToString(_haPrimaryDist / pipValue, 1), "pip",
+         " base=$", DoubleToString(slUSD, 2),
          " tpMult=", DoubleToString(tpMult, 2),
          " Vol=", g_VolumeState,
          " ATR=", DoubleToString(_atrPips, 1), "pip",
@@ -5289,7 +5313,10 @@ void EvaluateHAPattern()
                              : (!g_AboveMA50 || g_MA50Touch || g_MA50CrossDn));
       bool hpExtCapOK = !UseDailyExtCap || DailyExtCapPct <= 0 ||
                         (isBuy ? (g_DailyExtUpPct   <= DailyExtCapPct)
-                               : (g_DailyExtDownPct <= DailyExtCapPct));
+                               : (g_DailyExtDownPct <= DailyExtCapPct)) ||
+                        // Key-level override: cap ignored when a level was broken with room ahead
+                        (CheckLevelBreakBars(isBuy ? 1 : -1) <= MaxConsecCandles * 2 &&
+                         FindNextTargetLevel(SymbolInfoDouble(_Symbol, SYMBOL_BID), isBuy ? 1 : -1) > 0);
       nextGates += "\n  " + (hpVolOK     ? "✓" : "✗") + " Vol=" + g_VolumeState + "(x" + DoubleToString(g_VolRatio,2) + ")";
       nextGates += " | RealCdlAlign=" + (g_RealCandleAligned ? "ALIGNED" : "mixed/miss");
       nextGates += " | " + (hpSessObsOK  ? "✓" : "✗") + " SessObs=" + (hpSessObsOK ? "OK" : hpSessObsBlocker);
@@ -6449,16 +6476,39 @@ void TryEntry()
    }
 
    // === DAILY EXTENSION CAP (v6.34) ===
+   // Standard rule: block when price has moved > DailyExtCapPct of D1 ATR from today's open.
+   // Key-level override: if price recently BROKE a key S/R or Fib level in the trade direction
+   // AND a further key level exists ahead (room to run), the cap is lifted with a caution note.
+   // Rationale: price breaking R1 with room to R2 is continuation, not chasing.
    if(UseDailyExtCap && DailyExtCapPct > 0) {
       bool extBlockSell = (tradeDir == -1 && g_DailyExtDownPct > DailyExtCapPct);
       bool extBlockBuy  = (tradeDir ==  1 && g_DailyExtUpPct   > DailyExtCapPct);
       if(extBlockSell || extBlockBuy) {
          double _extPct = extBlockSell ? g_DailyExtDownPct : g_DailyExtUpPct;
-         string _br = (tradeDir==1?"BUY":"SELL") + " blocked: DailyExt "
-                      + DoubleToString(_extPct,1) + "% of D1ATR (cap="
-                      + DoubleToString(DailyExtCapPct,1) + "%) — await retracement";
-         if(_br != g_LastBlockReason) { Print(_br); g_LastBlockReason = _br; }
-         return;
+         // Check if a key level was broken recently in the trade direction
+         int    _brkBars   = CheckLevelBreakBars(tradeDir);
+         bool   _lvlBroken = (_brkBars <= MaxConsecCandles * 2 && g_LevelBreakLabel != "");
+         // Check whether a further key level exists ahead (room between current price and next level)
+         double _nextLvl   = FindNextTargetLevel(price, tradeDir);
+         double _roomPips  = (_nextLvl > 0) ? MathAbs(_nextLvl - price) / _Point / 10.0 : 0;
+         bool   _roomAhead = (_roomPips >= 10.0);  // at least 10 pips to next level
+         if(_lvlBroken && _roomAhead) {
+            string _brOver = (tradeDir==1?"BUY":"SELL") + " DailyExt "
+                             + DoubleToString(_extPct,1) + "% > cap="
+                             + DoubleToString(DailyExtCapPct,1) + "% — OVERRIDDEN: level "
+                             + g_LevelBreakLabel + " broken " + IntegerToString(_brkBars) + "b ago"
+                             + ", room to " + DoubleToString(_nextLvl,5)
+                             + " (" + DoubleToString(_roomPips,1) + " pips) — proceeding cautiously";
+            if(_brOver != g_LastBlockReason) { Print(_brOver); g_LastBlockReason = _brOver; }
+            // fall through — trade is allowed
+         } else {
+            string _br = (tradeDir==1?"BUY":"SELL") + " blocked: DailyExt "
+                         + DoubleToString(_extPct,1) + "% of D1ATR (cap="
+                         + DoubleToString(DailyExtCapPct,1) + "%) "
+                         + (!_lvlBroken ? "— no key level broken in trade dir" : "— no room to next level (" + DoubleToString(_roomPips,1) + "pip)");
+            if(_br != g_LastBlockReason) { Print(_br); g_LastBlockReason = _br; }
+            return;
+         }
       }
    }
 

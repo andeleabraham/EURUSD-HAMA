@@ -25,9 +25,10 @@ input group "=== RISK & PROFIT (per 0.01 lot baseline) ==="
 input double MaxLossUSD       = 2.50;   // Hard max loss before forced close (per 0.01 lot)
 // Dynamic SL/TP: the bot finds structural SL (nearest invalidation) and calculates TP from R:R.
 // The SL is clamped within MinSL/MaxSL range. TP = SL × RRRatio.
-input double MinSL_USD        = 1.50;   // Minimum SL per 0.01 lot (15 pips) — won't go tighter
-input double MaxSL_USD        = 2.50;   // Maximum SL per 0.01 lot (25 pips) — won't go wider
+input double MinSL_USD        = 1.25;   // Minimum SL per 0.01 lot (~12.5 pips) — HA-based entries are precise
+input double MaxSL_USD        = 1.50;   // Maximum SL per 0.01 lot (~15 pips) — keep losses small; a bad entry is costly
 input double RRRatio          = 1.8;    // Reward:Risk ratio (1.8 = for every $1 risk, target $1.80)
+input double MaxTP_USD        = 2.50;   // Hard TP ceiling per 0.01 lot — 2.0-2.5 USD is statistically achievable; beyond this risks missing the exit
 // Lock/trail are now proportional to the dynamic SL, not fixed per tier
 input double LockPct          = 0.75;   // Lock profit at 75% of TP — only secure near-target profits
 input double TrailPct         = 0.30;   // Trail gap = 30% of TP — generous room to fluctuate
@@ -188,9 +189,9 @@ input group "=== MACRO TREND RIDE ==="
 // real continuation begins at London open. Wait for non-Asian confirmation.
 input bool   MacroTrendRideEnabled  = true;   // Enable MacroBOS intraday trend-ride entries
 input int    MacroTrendMinScore     = 5;      // Min ZoneContextScore (0-15) — higher = more selective
-input double MacroTrendSL_USD       = 2.75;   // SL per 0.01 lot (wider space for trend volatility)
-input double MacroTrendMinTP_USD    = 4.00;   // Floor TP per 0.01 lot (minimum target for a trend ride)
-input double MacroTrendMaxTP_USD    = 8.00;   // Ceiling TP per 0.01 lot (cap at realistic intraday range)
+input double MacroTrendSL_USD       = 1.75;   // SL per 0.01 lot (slightly wider for trend volatility)
+input double MacroTrendMinTP_USD    = 1.80;   // Floor TP per 0.01 lot (minimum target for a trend ride)
+input double MacroTrendMaxTP_USD    = 2.50;   // Ceiling TP per 0.01 lot — capped at achievable target (mirrors MaxTP_USD)
 input bool   MacroTrendAsianBlock   = true;   // Block during Asian session (wait for London/NY momentum)
 
 input group "=== RANGE ZONE FILTERS ==="
@@ -354,6 +355,8 @@ bool   g_HABullSetup  = false;
 bool   g_HABearSetup  = false;
 string g_Signal       = "WAITING";
 int    g_HAConsecCount= 0;
+int    g_HAConsecSinceKeyLevel = 0;   // consecutive clean HA bars since last key S/R/Fib level was crossed
+string g_KeyLevelCrossLabel    = "";  // label of the most recently crossed key level
 // Early entry: track when the 2nd (confirming) candle opened so we
 // know whether we are within EarlyEntryMins of its start
 datetime g_ConfirmCandleOpen = 0;   // time the confirming candle opened
@@ -3128,6 +3131,18 @@ bool IsToplessWithBottomSpike(int idx)
    return (lowerWick > bodySize * 0.4);
 }
 
+// HA Doji: body < 25% of total candle range = indecision even if technically directional.
+// This catches spinning tops that HADir() still classifies as bull or bear.
+// After a doji, the consecutive clean-candle counter is broken and must restart fresh.
+bool IsHADoji(int idx)
+{
+   double haO, haH, haL, haC;
+   CalcHA(idx, haO, haH, haL, haC);
+   double range = haH - haL;
+   if(range < _Point * 2) return true;   // essentially flat = hard doji
+   return (MathAbs(haC - haO) < range * 0.25);
+}
+
 //+------------------------------------------------------------------+
 //| MURRAY MATH CHANNEL LEVELS                                       |
 //| Computes 9 octave levels (0/8 through 8/8) from the H4 swing.   |
@@ -3884,6 +3899,14 @@ double CalcStructuralSL(int tradeDir)
          if(g_FVGs[f].dir == 1 && g_FVGs[f].low < entry && g_FVGs[f].low > 0)
             levels[cnt++] = g_FVGs[f].low;
       }
+      // HA-based invalidation: lowest Low of the last 2 closed HA candles
+      // A bullish entry is invalidated when price closes below either HA low
+      double _haO1b, _haH1b, _haL1b, _haC1b;
+      double _haO2b, _haH2b, _haL2b, _haC2b;
+      CalcHA(1, _haO1b, _haH1b, _haL1b, _haC1b);
+      CalcHA(2, _haO2b, _haH2b, _haL2b, _haC2b);
+      if(_haL1b > 0 && _haL1b < entry) levels[cnt++] = _haL1b;
+      if(_haL2b > 0 && _haL2b < entry) levels[cnt++] = _haL2b;
    } else {
       // SELL invalidation: resistance ABOVE entry
       if(g_SwingHigh1 > 0 && g_SwingHigh1 > entry) levels[cnt++] = g_SwingHigh1;
@@ -3896,6 +3919,14 @@ double CalcStructuralSL(int tradeDir)
          if(g_FVGs[f].dir == -1 && g_FVGs[f].high > entry && g_FVGs[f].high > 0)
             levels[cnt++] = g_FVGs[f].high;
       }
+      // HA-based invalidation: highest High of the last 2 closed HA candles
+      // A bearish entry is invalidated when price closes above either HA high
+      double _haO1s, _haH1s, _haL1s, _haC1s;
+      double _haO2s, _haH2s, _haL2s, _haC2s;
+      CalcHA(1, _haO1s, _haH1s, _haL1s, _haC1s);
+      CalcHA(2, _haO2s, _haH2s, _haL2s, _haC2s);
+      if(_haH1s > entry) levels[cnt++] = _haH1s;
+      if(_haH2s > entry) levels[cnt++] = _haH2s;
    }
 
    // Find the NEAREST invalidation level (smallest distance from entry)
@@ -3960,6 +3991,7 @@ double CalcStructuralSL(int tradeDir)
    // Re-clamp: allow SL up to 30% above MaxSL_USD for dynamic adjustments, TP at least 1:1
    adjSL = MathMax(MinSL_USD, MathMin(MaxSL_USD * 1.3, adjSL));
    adjTP = MathMax(adjSL * 1.0, adjTP);   // TP floor = 1:1 R:R
+   adjTP = MathMin(adjTP, MaxTP_USD);      // hard cap — statistically achievable targets
 
    // Store globally
    g_DynamicSL_USD = adjSL;
@@ -4115,6 +4147,7 @@ int CountConsecutive(int startIdx, int dir)
 {
    int count = 0;
    for(int i = startIdx; i <= startIdx + 20; i++) {
+      if(IsHADoji(i)) break;          // doji interrupts the chain regardless of direction
       if(HADir(i) == dir) count++;
       else break;
    }
@@ -4484,6 +4517,84 @@ bool BollingerOverrideCheck(int tradeDir, string &reason)
    return (score >= BollOverrideMinScore);
 }
 
+//+------------------------------------------------------------------+
+//| HA KEY-LEVEL CROSSING TRACKER                                    |
+//| Counts consecutive clean (non-doji) HA bars since price last     |
+//| crossed a key S/R or Fibonacci level.  Levels within 20 pips     |
+//| of each other are deduplicated so the counter is not triggered   |
+//| by cluster-noise.  Updated every bar from EvaluateHAPattern().  |
+//+------------------------------------------------------------------+
+void UpdateHALevelConsec(int dir1)
+{
+   const double MIN_GAP = 20.0 * _Point * 10.0;   // 20 pips = 2 USD / 0.01 lot
+
+   // ---- Collect candidate key levels ----
+   double candidates[50];
+   string candLbls[50];
+   int    nCand = 0;
+
+   if(g_PivotPP      > 0) { candidates[nCand]=g_PivotPP;      candLbls[nCand++]="PP";  }
+   if(g_PivotR1      > 0) { candidates[nCand]=g_PivotR1;      candLbls[nCand++]="R1";  }
+   if(g_PivotR2      > 0) { candidates[nCand]=g_PivotR2;      candLbls[nCand++]="R2";  }
+   if(g_PivotS1      > 0) { candidates[nCand]=g_PivotS1;      candLbls[nCand++]="S1";  }
+   if(g_PivotS2      > 0) { candidates[nCand]=g_PivotS2;      candLbls[nCand++]="S2";  }
+   if(g_Fib236       > 0) { candidates[nCand]=g_Fib236;       candLbls[nCand++]="F23"; }
+   if(g_Fib382       > 0) { candidates[nCand]=g_Fib382;       candLbls[nCand++]="F38"; }
+   if(g_Fib500       > 0) { candidates[nCand]=g_Fib500;       candLbls[nCand++]="F50"; }
+   if(g_Fib618       > 0) { candidates[nCand]=g_Fib618;       candLbls[nCand++]="F61"; }
+   if(g_Fib764       > 0) { candidates[nCand]=g_Fib764;       candLbls[nCand++]="F76"; }
+   if(g_SwingHigh1   > 0) { candidates[nCand]=g_SwingHigh1;   candLbls[nCand++]="SH1"; }
+   if(g_SwingLow1    > 0) { candidates[nCand]=g_SwingLow1;    candLbls[nCand++]="SL1"; }
+   if(g_CIHigh       > 0) { candidates[nCand]=g_CIHigh;       candLbls[nCand++]="CI-H";}
+   if(g_CILow        > 0) { candidates[nCand]=g_CILow;        candLbls[nCand++]="CI-L";}
+   if(g_PrevWeekHigh > 0) { candidates[nCand]=g_PrevWeekHigh; candLbls[nCand++]="WkH"; }
+   if(g_PrevWeekLow  > 0) { candidates[nCand]=g_PrevWeekLow;  candLbls[nCand++]="WkL"; }
+   if(g_ThreeDayHigh > 0) { candidates[nCand]=g_ThreeDayHigh; candLbls[nCand++]="3dH"; }
+   if(g_ThreeDayLow  > 0) { candidates[nCand]=g_ThreeDayLow;  candLbls[nCand++]="3dL"; }
+   for(int mi = 0; mi <= 8; mi++) {
+      if(g_Murray[mi] > 0) { candidates[nCand]=g_Murray[mi]; candLbls[nCand++]="M"+IntegerToString(mi); }
+   }
+
+   // ---- Deduplicate: keep only levels >= MIN_GAP apart ----
+   double lvls[50];
+   string lbls[50];
+   int    nLvl = 0;
+   for(int ci = 0; ci < nCand && nLvl < 50; ci++) {
+      bool far = true;
+      for(int k = 0; k < nLvl; k++) {
+         if(MathAbs(lvls[k] - candidates[ci]) < MIN_GAP) { far = false; break; }
+      }
+      if(far) { lvls[nLvl] = candidates[ci]; lbls[nLvl] = candLbls[ci]; nLvl++; }
+   }
+
+   // ---- Check whether bar1's HA close crossed any level (bar2 close on opposite side) ----
+   double haO1, haH1, haL1, haC1;
+   double haO2, haH2, haL2, haC2;
+   CalcHA(1, haO1, haH1, haL1, haC1);
+   CalcHA(2, haO2, haH2, haL2, haC2);
+   const double tol = 1.5 * _Point * 10.0;  // 1.5-pip crossing tolerance
+
+   bool   crossed = false;
+   for(int li = 0; li < nLvl && !crossed; li++) {
+      double lp = lvls[li];
+      if((haC2 < lp - tol && haC1 > lp + tol) ||
+         (haC2 > lp + tol && haC1 < lp - tol)) {
+         crossed              = true;
+         g_KeyLevelCrossLabel = lbls[li] + "@" + DoubleToString(lp, 5);
+      }
+   }
+
+   // ---- Update the counter ----
+   if(crossed) {
+      // Level just crossed: start a fresh count if bar1 is a clean directional candle
+      g_HAConsecSinceKeyLevel = (!IsHADoji(1) && dir1 != 0) ? 1 : 0;
+   } else if(dir1 != 0 && !IsHADoji(1)) {
+      g_HAConsecSinceKeyLevel++;   // clean same-direction bar: extend the run
+   } else {
+      g_HAConsecSinceKeyLevel = 0; // doji or direction change: reset
+   }
+}
+
 void EvaluateHAPattern()
 {
    // bar 1 = most recently closed bar
@@ -4498,12 +4609,16 @@ void EvaluateHAPattern()
    bool tl2 = IsTopless(2);
 
    // Count consecutive same-color candles ending at bar 1
+   // (CountConsecutive now stops at a doji even if it's technically directional)
    g_HAConsecCount = CountConsecutive(1, dir1);
 
+   // Update key-level crossing tracker (separate from chain consec; uses 20-pip level spacing)
+   UpdateHALevelConsec(dir1);
+
    // === DOJI INVALIDATION ===
-   // A HA doji (haClose ≈ haOpen) signals indecision and invalidates any running setup.
-   // When the most recent closed bar is a doji, the consecutive count breaks and we reset.
-   if(dir1 == 0) {
+   // A HA doji (haClose ≈ haOpen) OR a near-doji (body < 25% of range) signals
+   // indecision and invalidates any running setup.
+   if(dir1 == 0 || IsHADoji(1)) {
       if(g_HABullSetup || g_HABearSetup) {
          Print("[DOJI] HA doji at bar1 — invalidating ",
                (g_HABullSetup ? "BUY" : "SELL"),
@@ -4523,6 +4638,7 @@ void EvaluateHAPattern()
       g_HAQualityScore    = 0;
       g_HAQualityTotal    = 0;
       g_ConfirmPure       = false;
+      g_HAConsecSinceKeyLevel = 0;  // doji breaks the key-level chain too
       return;
    }
 
@@ -6428,7 +6544,7 @@ void TryEntry()
       double targetPips = targetDist / _Point / 10.0;
       double targetUSD  = targetPips * 0.10;
       // If the structural target gives more than R:R TP, use it (capped at $6/0.01)
-      if(targetUSD > baseTpUSD && targetUSD <= 6.0) {
+      if(targetUSD > baseTpUSD && targetUSD <= MaxTP_USD) {
          Print("TP EXTENDED to structural level: $", DoubleToString(targetUSD, 2),
                " (at ", DoubleToString(targetLvl, 5), ", ", DoubleToString(targetPips, 1), " pips)");
          baseTpUSD = targetUSD;
@@ -6472,7 +6588,7 @@ void TryEntry()
          double pct     = (g_BoldTier == "HUGE_BOLD") ? 1.0 : SmallBoldTPPct;
          double boldTP  = ciUSD * pct;
          boldTP = MathMax(boldTP, baseTpUSD);   // never less than structural TP
-         boldTP = MathMin(boldTP, 8.0);          // safety cap $8/0.01 lot
+         boldTP = MathMin(boldTP, MaxTP_USD);     // cap at MaxTP_USD — achievable target
          if(boldTP != baseTpUSD) {
             Print("[", g_BoldTier, "] TP: $", DoubleToString(baseTpUSD,2),
                   " -> $", DoubleToString(boldTP,2),

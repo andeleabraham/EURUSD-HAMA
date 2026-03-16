@@ -1,10 +1,10 @@
 //+------------------------------------------------------------------+
-//|  EURUSD Heiken Ashi Range Bot v6.39                              |
+//|  EURUSD Heiken Ashi Range Bot v6.40                              |
 //|  Volume gating + ATR SL/TP sizing + Real candle alignment        |
 //|  STANDARD / SENTINEL / MOMENTUM / ADAPTIVE / HARVESTER / CHRONO |
 //+------------------------------------------------------------------+
 #property copyright   "EURUSD HA Range Bot"
-#property version     "6.39"
+#property version     "6.40"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -319,6 +319,7 @@ int    g_StructShiftCount = 0;       // times H1 structure changed direction dur
 string g_LastMgmtAction   = "";      // last management action label (for dashboard/log)
 string g_TradeMgmtModeName = "STANDARD"; // resolved mode name
 string g_ComebackLabel     = "";       // comeback potential label for dashboard (HIGH/MODERATE/LOW)
+string g_SignalPendingReason = "";     // short reason why signal survives HA reset (dashboard sub-line)
 
 // HA chain cache — proper recursive calculation built once per new bar.
 // The old CalcHA used a 2-bar lookback which under-smoothed HA Open, causing
@@ -4810,26 +4811,50 @@ void EvaluateHAPattern()
                      " bar1=", DoubleToString(_rcB1-_roB1,5), " bar2=", DoubleToString(_rcB2-_roB2,5),
                      " — waiting for real alignment.");
             } else if(!_realBull1 || !_realBull2) {
-               // One real candle conflicts — HA chain invalidated; reset count and stay PREPARING
-               realCandleOK = false;
-               g_HAConsecCount   = 0;
-               g_HABullSetup     = false;
+               // One real candle conflicts — HA chain invalidated; reset count
+               g_HAConsecCount     = 0;
+               g_HABullSetup       = false;
                g_ConfirmCandleOpen = 0;
-               Print("BUY: Real candle MIXED — bar1=", (_realBull1?"BULL":"BEAR"),
-                     " bar2=", (_realBull2?"BULL":"BEAR"),
-                     " — HA chain invalidated, resetting consecutive count.");
+               realCandleOK        = false;
+               // Re-evaluate: do structural factors still support BUY?
+               int _reSS = 0; string _reR = "";
+               if(g_MacroStructLabel == "BULLISH")                      { _reSS++; _reR += "H4Bull "; }
+               if(g_StructureLabel   == "BULLISH")                      { _reSS++; _reR += "H1Bull "; }
+               if(g_MTFAligned && g_MacroStructLabel == "BULLISH")      { _reSS++; _reR += "MTF+ "; }
+               if(g_NearBullFVG)                                        { _reSS++; _reR += "FVG "; }
+               if(g_NearH4BullOB || g_BullOB_High > 0)                 { _reSS++; _reR += "OB "; }
+               if(g_LiquiditySweep && g_SweepDir == 1)                 { _reSS++; _reR += "Sweep "; }
+               if(g_MacroBOSActive && g_MacroStructLabel == "BULLISH")  { _reSS++; _reR += "MacroBOS "; }
+               if(g_TotalBias >= 1)                                     { _reSS++; _reR += "Bias+" + IntegerToString(g_TotalBias) + " "; }
+               StringTrimRight(_reR);
+               if(_reSS >= 2) {
+                  g_Signal             = "PREPARING BUY";
+                  g_SignalPendingReason = _reR + " (" + IntegerToString(_reSS) + " factors, conf "
+                                         + DoubleToString(g_Confidence,0) + "%) — HA reset, awaiting chain";
+                  Print("BUY: Real candle MIXED — bar1=", (_realBull1?"BULL":"BEAR"),
+                        " bar2=", (_realBull2?"BULL":"BEAR"),
+                        " — HA reset. Struct supports BUY [", _reR, "] PREPARING.");
+               } else {
+                  g_Signal             = "WAITING";
+                  g_SignalPendingReason = "";
+                  Print("BUY: Real candle MIXED — bar1=", (_realBull1?"BULL":"BEAR"),
+                        " bar2=", (_realBull2?"BULL":"BEAR"),
+                        " — HA reset. Insufficient factors (", _reSS, "), signal cleared to WAITING.");
+               }
             }
          }
          if(bollOK && realCandleOK) {
             if(g_ConfirmCandleOpen == 0)
                g_ConfirmCandleOpen = iTime(_Symbol, PERIOD_M15, 1);
-            g_Signal = "BUY INCOMING";
+            g_Signal             = "BUY INCOMING";
+            g_SignalPendingReason = "";  // clean confirm — clear any stale reason
             if(bollOverrideApplied)
                Print("BUY INCOMING [BOLL OVERRIDE]: entering despite Boll midline — ", g_BollOverrideReason);
          } else {
             g_Signal            = "PREPARING BUY";
             g_ConfirmCandleOpen = 0;
-            if(!bollOK)
+            if(!bollOK) {
+               g_SignalPendingReason = "";  // Bollinger block — clear MIXED reason
                Print("PREPARING BUY: Bollinger gate BLOCKING",
                      (isNarrow ? " [NARROW band=" + DoubleToString(bandWidthPips,1) + "pip]" : ""),
                      " HA_H1=", DoubleToString(haH1b, 5),
@@ -4838,6 +4863,7 @@ void EvaluateHAPattern()
                      " BollUpper=", DoubleToString(g_BollingerUpper1, 5),
                      isNarrow ? " (need HA high >= BollMid)" : " (need body <= BollMid)",
                      " | Override-check: ", g_BollOverrideReason);
+            }
             // Note: realCandleOK=false already printed its own diagnostic above
          }
       } else {
@@ -4973,26 +4999,50 @@ void EvaluateHAPattern()
                      " bar1=", DoubleToString(_rcS1-_roS1,5), " bar2=", DoubleToString(_rcS2-_roS2,5),
                      " — waiting for real alignment.");
             } else if(!_realBear1 || !_realBear2) {
-               // One real candle conflicts — HA chain invalidated; reset count and stay PREPARING
-               realCandleOKS = false;
-               g_HAConsecCount   = 0;
-               g_HABearSetup     = false;
+               // One real candle conflicts — HA chain invalidated; reset count
+               g_HAConsecCount     = 0;
+               g_HABearSetup       = false;
                g_ConfirmCandleOpen = 0;
-               Print("SELL: Real candle MIXED — bar1=", (_realBear1?"BEAR":"BULL"),
-                     " bar2=", (_realBear2?"BEAR":"BULL"),
-                     " — HA chain invalidated, resetting consecutive count.");
+               realCandleOKS       = false;
+               // Re-evaluate: do structural factors still support SELL?
+               int _reSSS = 0; string _reRS = "";
+               if(g_MacroStructLabel == "BEARISH")                      { _reSSS++; _reRS += "H4Bear "; }
+               if(g_StructureLabel   == "BEARISH")                      { _reSSS++; _reRS += "H1Bear "; }
+               if(g_MTFAligned && g_MacroStructLabel == "BEARISH")      { _reSSS++; _reRS += "MTF- "; }
+               if(g_NearBearFVG)                                        { _reSSS++; _reRS += "FVG "; }
+               if(g_NearH4BearOB || g_BearOB_High > 0)                 { _reSSS++; _reRS += "OB "; }
+               if(g_LiquiditySweep && g_SweepDir == -1)                { _reSSS++; _reRS += "Sweep "; }
+               if(g_MacroBOSActive && g_MacroStructLabel == "BEARISH")  { _reSSS++; _reRS += "MacroBOS "; }
+               if(g_TotalBias <= -1)                                    { _reSSS++; _reRS += "Bias" + IntegerToString(g_TotalBias) + " "; }
+               StringTrimRight(_reRS);
+               if(_reSSS >= 2) {
+                  g_Signal             = "PREPARING SELL";
+                  g_SignalPendingReason = _reRS + " (" + IntegerToString(_reSSS) + " factors, conf "
+                                         + DoubleToString(g_Confidence,0) + "%) — HA reset, awaiting chain";
+                  Print("SELL: Real candle MIXED — bar1=", (_realBear1?"BEAR":"BULL"),
+                        " bar2=", (_realBear2?"BEAR":"BULL"),
+                        " — HA reset. Struct supports SELL [", _reRS, "] PREPARING.");
+               } else {
+                  g_Signal             = "WAITING";
+                  g_SignalPendingReason = "";
+                  Print("SELL: Real candle MIXED — bar1=", (_realBear1?"BEAR":"BULL"),
+                        " bar2=", (_realBear2?"BEAR":"BULL"),
+                        " — HA reset. Insufficient factors (", _reSSS, "), signal cleared to WAITING.");
+               }
             }
          }
          if(bollOK && realCandleOKS) {
             if(g_ConfirmCandleOpen == 0)
                g_ConfirmCandleOpen = iTime(_Symbol, PERIOD_M15, 1);
-            g_Signal = "SELL INCOMING";
+            g_Signal             = "SELL INCOMING";
+            g_SignalPendingReason = "";  // clean confirm — clear any stale reason
             if(bollOverrideAppliedS)
                Print("SELL INCOMING [BOLL OVERRIDE]: entering despite Boll midline — ", g_BollOverrideReason);
          } else {
             g_Signal            = "PREPARING SELL";
             g_ConfirmCandleOpen = 0;
-            if(!bollOK)
+            if(!bollOK) {
+               g_SignalPendingReason = "";  // Bollinger block — clear MIXED reason
                Print("PREPARING SELL: Bollinger gate BLOCKING",
                      (isNarrow ? " [NARROW band=" + DoubleToString(bandWidthPips,1) + "pip]" : ""),
                      " HA_L1=", DoubleToString(haL1s, 5),
@@ -5001,6 +5051,8 @@ void EvaluateHAPattern()
                      " BollLower=", DoubleToString(g_BollingerLower1, 5),
                      isNarrow ? " (need HA low <= BollMid)" : " (need body >= BollMid)",
                      " | Override-check: ", g_BollOverrideReason);
+            }
+            // Note: realCandleOKS=false already printed its own diagnostic above
          }
       } else {
          // === TREND BOLD TIER EVALUATION (consec > MaxConsecCandles) ===
@@ -8027,6 +8079,32 @@ void UpdateDashboard()
 
    DashLine("02_sig",    "Signal  : " + g_Signal,                               cx, cy, row, lh, corner, sigColor,     10); row++;
 
+   // Confidence inline with signal (compact: conf% only; full SL/TP/RR stays near OB/FVG section)
+   {
+      bool _sigActive = (g_Signal != "WAITING");
+      if(_sigActive) {
+         color  _cClr = (g_Confidence >= 80) ? clrGold :
+                        (g_Confidence >= MinConfidence) ? clrLime :
+                        (g_Confidence > 0) ? clrOrange : clrSilver;
+         DashLine("02_conf_inline", "          Conf: " + DoubleToString(g_Confidence,0) + "%",
+                  cx, cy, row, lh, corner, _cClr, 8); row++;
+      } else {
+         DashLine("02_conf_inline", "", cx, cy, row, lh, corner, clrGray, 7); row++;
+      }
+   }
+
+   // Signal reason sub-line (shown when HA reset but structure still supports trade)
+   {
+      bool _showReason = (g_SignalPendingReason != "" &&
+                          (g_Signal == "PREPARING BUY" || g_Signal == "PREPARING SELL"));
+      if(_showReason) {
+         DashLine("02_sigreason", "          Why: " + g_SignalPendingReason,
+                  cx, cy, row, lh, corner, clrOrange, 7); row++;
+      } else {
+         DashLine("02_sigreason", "", cx, cy, row, lh, corner, clrGray, 7); row++;
+      }
+   }
+
    // Scan-paused indicator when bot has an open trade
    if(PauseScanInTrade && g_TradeOpen) {
       DashLine("02_pause", "          [SCAN PAUSED — managing trade]",          cx, cy, row, lh, corner, clrOrange,     8); row++;
@@ -8280,7 +8358,7 @@ void UpdateDashboard()
                cx, cy, row, lh, corner, h4fvgClr, g_NearBullH4FVG||g_NearBearH4FVG ? 9 : 7); row++;
    }
 
-   // --- Confidence Score (live, recalculated from current signals) ---
+   // --- Confidence Score (SL/TP/RR detail block -- conf% also shown inline near signal above) ---
    {
       string confStr2 = DoubleToString(g_Confidence, 1) + "%";
       color  confClr2 = (g_Confidence >= 80) ? clrGold :

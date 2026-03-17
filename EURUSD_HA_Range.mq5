@@ -288,6 +288,21 @@ double g_PeakEquity         = 0;    // v6.36: peak equity watermark for drawdown
 double g_ForeignLotsSymbol  = 0.0;  // total lots of foreign trades on this symbol
 string g_ForeignSummary     = "";   // human-readable summary for dashboard
 
+// Per-trade detail for manual trades panel
+struct ManualTradeInfo {
+   ulong    ticket;
+   int      dir;        // 1=BUY, -1=SELL
+   double   lots;
+   double   openPrice;
+   double   sl;         // 0 if not set
+   double   tp;         // 0 if not set
+   double   pnl;        // profit + swap + commission (net)
+   bool     isManual;   // true = magic == 0
+   long     magic;
+};
+ManualTradeInfo g_ManualTrades[4];   // up to 4 same-symbol foreign trades
+int             g_ManualTradeCount = 0;
+
 double g_AsianHigh  = 0, g_AsianLow  = 0, g_AsianOpen  = 0;
 double g_LondonHigh = 0, g_LondonLow = 0, g_LondonOpen = 0;
 double g_NYHigh     = 0, g_NYLow     = 0, g_NYOpen     = 0;
@@ -723,6 +738,66 @@ void RestoreExistingTrade()
 }
 
 //+------------------------------------------------------------------+
+//| MANUAL TRADE STRUCTURAL CONFIDENCE                               |
+//| Scores how well current market structure supports a manual trade  |
+//| direction. Returns 0-100. Independent of HA/Bollinger chain.     |
+//+------------------------------------------------------------------+
+int ManualTradeConf(int tradeDir)
+{
+   // Each factor worth ~12-15 pts; cap at 100.
+   int score = 0;
+
+   // H4 macro structure
+   int macroDir = (g_MacroStructLabel == "BULLISH") ? 1 : (g_MacroStructLabel == "BEARISH") ? -1 : 0;
+   if(macroDir == tradeDir)        score += 15;
+   else if(macroDir == -tradeDir)  score -= 10;
+
+   // H1 structure
+   int h1Dir = (g_StructureLabel == "BULLISH") ? 1 : (g_StructureLabel == "BEARISH") ? -1 : 0;
+   if(h1Dir == tradeDir)           score += 12;
+   else if(h1Dir == -tradeDir)     score -= 8;
+
+   // Bias
+   if(tradeDir == 1  && g_TotalBias >= 2)   score += 10;
+   else if(tradeDir == 1  && g_TotalBias >= 1) score += 5;
+   else if(tradeDir == -1 && g_TotalBias <= -2) score += 10;
+   else if(tradeDir == -1 && g_TotalBias <= -1) score += 5;
+   else if(tradeDir == 1  && g_TotalBias <= -2) score -= 8;
+   else if(tradeDir == -1 && g_TotalBias >= 2)  score -= 8;
+
+   // FVG support
+   if(tradeDir == 1  && g_NearBullFVG) score += 8;
+   if(tradeDir == -1 && g_NearBearFVG) score += 8;
+   if(tradeDir == 1  && g_NearBearFVG) score -= 5;  // FVG overhead opposing buy
+   if(tradeDir == -1 && g_NearBullFVG) score -= 5;
+
+   // Order block support
+   if(tradeDir == 1  && g_BullOB_High > 0) score += 8;
+   if(tradeDir == -1 && g_BearOB_High > 0) score += 8;
+
+   // H4 OB support
+   if(tradeDir == 1  && g_NearH4BullOB) score += 8;
+   if(tradeDir == -1 && g_NearH4BearOB) score += 8;
+
+   // HPL: unbroken zone opposing the trade = structural headwind
+   if(tradeDir == 1  && g_HPLResistBlock)  score -= 15;
+   if(tradeDir == -1 && g_HPLSupportBlock) score -= 15;
+
+   // Sideways market
+   if(IsSideways()) score -= 8;
+
+   // Liquidity sweep in trade direction = smart money entry
+   if(g_LiquiditySweep) score += 6;
+
+   // Map to 0-100 (raw range is roughly -50 to +75)
+   // Shift so that 0 raw = 40% (neutral-ish baseline)
+   int pct = 40 + score;
+   if(pct < 0)   pct = 0;
+   if(pct > 100) pct = 100;
+   return pct;
+}
+
+//+------------------------------------------------------------------+
 //| SCAN FOREIGN TRADES                                              |
 //| Counts open positions NOT placed by this bot (magic != 202502).  |
 //| Separates same-symbol vs total-account foreign trades.           |
@@ -733,6 +808,7 @@ void ScanForeignTrades()
    int    countAll   = 0;
    double lotsSym    = 0.0;
    string details    = "";
+   g_ManualTradeCount = 0;
 
    for(int i = PositionsTotal() - 1; i >= 0; i--)
    {
@@ -760,6 +836,22 @@ void ScanForeignTrades()
          else
             details += " (manual)";
          details += " P&L:$" + DoubleToString(pnl, 2);
+
+         // Save detailed info for the manual trades panel (up to 4)
+         if(g_ManualTradeCount < 4) {
+            ManualTradeInfo mt;
+            mt.ticket    = posInfo.Ticket();
+            mt.dir       = (posInfo.PositionType() == POSITION_TYPE_BUY) ? 1 : -1;
+            mt.lots      = lot;
+            mt.openPrice = posInfo.PriceOpen();
+            mt.sl        = posInfo.StopLoss();
+            mt.tp        = posInfo.TakeProfit();
+            mt.pnl       = pnl;
+            mt.isManual  = (magic == 0);
+            mt.magic     = magic;
+            g_ManualTrades[g_ManualTradeCount] = mt;
+            g_ManualTradeCount++;
+         }
       }
    }
 
@@ -8836,10 +8928,33 @@ void UpdateDashboard()
 
    // --- Trade Status (ALL rows ALWAYS rendered — prevents label overlap) ---
    {
-      color  tColor  = g_TradeOpen ? clrLime : clrGray;
-      DashLine("R_trade", "Trade   : " + (g_TradeOpen ? "OPEN" : "NONE"),
-               rx, cy, rowR, lh, corner, tColor, 9); rowR++;
+      // Fetch live entry price + net P&L from the position for display
+      double _botEntry = 0, _botNetPnL = 0;
+      if(g_TradeOpen) {
+         for(int _pi = PositionsTotal() - 1; _pi >= 0; _pi--) {
+            if(!posInfo.SelectByIndex(_pi)) continue;
+            if(posInfo.Symbol() != _Symbol || posInfo.Magic() != 202502) continue;
+            _botEntry  = posInfo.PriceOpen();
+            _botNetPnL = posInfo.Profit() + posInfo.Swap() + posInfo.Commission();
+            break;
+         }
+      }
 
+      // Row 1: Direction + lots + entry + floating P&L (most important info on first line)
+      if(g_TradeOpen) {
+         string _bDir    = (g_TradeDir == 1) ? "[BUY] " : "[SELL]";
+         color  _bDirClr = (g_TradeDir == 1) ? clrLime  : clrTomato;
+         string _bPnL    = (_botNetPnL >= 0 ? "+$" : "-$") + DoubleToString(MathAbs(_botNetPnL), 2);
+         string _bEntry  = (_botEntry > 0) ? "  @" + DoubleToString(_botEntry, _Digits) : "";
+         DashLine("R_trade",
+                  _bDir + " " + DoubleToString(g_CurrentLot, 2) + "L" + _bEntry + "  Net:" + _bPnL,
+                  rx, cy, rowR, lh, corner, _bDirClr, 9);
+      } else {
+         DashLine("R_trade", "Trade   : NONE", rx, cy, rowR, lh, corner, clrGray, 9);
+      }
+      rowR++;
+
+      // Row 2: Mode + management strategy
       if(g_TradeOpen) {
          string modeStr = g_IsMeanRev ? "MEAN REV" : (g_IsNearMid ? "MID-validated" : "TREND");
          color  modeClr = g_IsMeanRev ? clrGold : (g_IsNearMid ? clrOrange : clrLime);
@@ -8849,27 +8964,32 @@ void UpdateDashboard()
       }
       rowR++;
 
+      // Row 3: Confidence + SL/TP USD risk + RR ratio
       if(g_TradeOpen) {
+         double _rr = (g_ScaledSLUSD > 0) ? g_ScaledTPUSD / g_ScaledSLUSD : 0;
          string confLbl = "Conf " + DoubleToString(g_Confidence, 0) + "%";
          color  cClr = (g_Confidence >= 80) ? clrGold : (g_Confidence >= 65) ? clrCyan : clrSilver;
          DashLine("R_sltp", confLbl +
                   "  SL:$" + DoubleToString(g_ScaledSLUSD, 2) +
-                  "  TP:$" + DoubleToString(g_ScaledTPUSD, 2),
+                  "  TP:$" + DoubleToString(g_ScaledTPUSD, 2) +
+                  "  RR:" + DoubleToString(_rr, 1),
                   rx, cy, rowR, lh, corner, cClr, 8);
       } else {
-         DashLine("R_sltp", "SL / TP : ---", rx, cy, rowR, lh, corner, clrDimGray, 8);
+         DashLine("R_sltp", "Conf/SL/TP: ---", rx, cy, rowR, lh, corner, clrDimGray, 8);
       }
       rowR++;
 
+      // Row 4: Lock thresholds
       if(g_TradeOpen) {
-         DashLine("R_lktr", "Lock:$" + DoubleToString(g_ScaledLockUSD, 2) +
-                  "  Trail:$" + DoubleToString(g_ScaledTrailUSD, 2),
+         DashLine("R_lktr", "LkTrig:$" + DoubleToString(g_ScaledLockUSD, 2) +
+                  "  TrailTrig:$" + DoubleToString(g_ScaledTrailUSD, 2),
                   rx, cy, rowR, lh, corner, clrAqua, 8);
       } else {
          DashLine("R_lktr", "Lock/Tr : ---", rx, cy, rowR, lh, corner, clrDimGray, 8);
       }
       rowR++;
 
+      // Row 5: Confluence level
       if(g_TradeOpen && g_NearLevel != "") {
          DashLine("R_cnfl", "Cnfl    : " + g_NearLevel, rx, cy, rowR, lh, corner, clrGold, 9);
       } else {
@@ -8877,15 +8997,22 @@ void UpdateDashboard()
       }
       rowR++;
 
+      // Row 6: Hold bars + peak/trough/shifts (merged from separate hold+track rows)
       if(g_TradeOpen) {
-         DashLine("R_hold", "Hold    : " + IntegerToString(g_OpenBarCount) + "/" +
-                  IntegerToString(MaxHoldBars) + " bars  SincePk:" + IntegerToString(g_BarsSincePeak),
-                  rx, cy, rowR, lh, corner, clrWhite, 9);
+         color  _holdClr = (g_BarsSincePeak > 10) ? clrOrange :
+                           (g_PeakProfit > g_ScaledLockUSD) ? clrLime : clrWhite;
+         DashLine("R_hold",
+                  "Hold:" + IntegerToString(g_OpenBarCount) + "/" + IntegerToString(MaxHoldBars) +
+                  "  SincePk:" + IntegerToString(g_BarsSincePeak) +
+                  "  Pk:$" + DoubleToString(g_PeakProfit, 2) +
+                  "  Lo:$" + DoubleToString(g_TroughProfit, 2),
+                  rx, cy, rowR, lh, corner, _holdClr, 8);
       } else {
-         DashLine("R_hold", "Hold    : ---", rx, cy, rowR, lh, corner, clrDimGray, 9);
+         DashLine("R_hold", "Hold    : ---", rx, cy, rowR, lh, corner, clrDimGray, 8);
       }
       rowR++;
 
+      // Row 7: Hard loss cap
       if(g_TradeOpen) {
          double hardLoss = MaxLossUSD * g_CurrentLot / 0.01;
          DashLine("R_cap", "MaxLoss : -$" + DoubleToString(hardLoss, 2) + " cap",
@@ -8895,28 +9022,44 @@ void UpdateDashboard()
       }
       rowR++;
 
+      // Row 8: Lock status + struct shifts
       if(g_TradeOpen) {
          string lockStr = g_ProfitLocked
                           ? "LOCKED  peak:$" + DoubleToString(g_PeakProfit, 2)
-                          : (g_EarlyLockEngaged ? "EARLY_LK" : "Watch") +
+                          : (g_EarlyLockEngaged ? "EARLY_LK" : "Watching") +
                             "  lock@$" + DoubleToString(g_ScaledLockUSD, 2);
-         color  lColor  = g_ProfitLocked ? clrLime : g_EarlyLockEngaged ? clrYellow : clrOrange;
+         lockStr += "  Sh:" + IntegerToString(g_StructShiftCount);
+         color  lColor = g_ProfitLocked ? clrLime : g_EarlyLockEngaged ? clrYellow : clrOrange;
          DashLine("R_lock", "Lock    : " + lockStr, rx, cy, rowR, lh, corner, lColor, 9);
       } else {
          DashLine("R_lock", "Lock    : ---", rx, cy, rowR, lh, corner, clrDimGray, 9);
       }
       rowR++;
 
-      // --- In-trade tracking (peak/trough/struct shift) ---
-      if(g_TradeOpen) {
-         string trackStr = "Pk:$" + DoubleToString(g_PeakProfit, 2) +
-                           "  Lo:$" + DoubleToString(g_TroughProfit, 2) +
-                           "  Shifts:" + IntegerToString(g_StructShiftCount);
-         color  trackClr = (g_BarsSincePeak > 10) ? clrOrange :
-                           (g_PeakProfit > g_ScaledLockUSD) ? clrLime : clrSilver;
-         DashLine("R_track", "Track   : " + trackStr, rx, cy, rowR, lh, corner, trackClr, 8);
+      // Row 9: HPL stagnation alert for bot trade (repurposed track row)
+      if(g_TradeOpen && g_TradeDir != 0 && UseHPL && g_HPLCount > 0) {
+         string _hplWarnStr = "";  color _hplWarnClr = clrDimGray;
+         double _bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+         for(int _hz = 0; _hz < g_HPLCount; _hz++) {
+            if(g_HPLZones[_hz].broken) continue;
+            double _hzMid = (g_HPLZones[_hz].high + g_HPLZones[_hz].low) / 2.0;
+            bool _opposing = (g_TradeDir == 1 && g_HPLZones[_hz].dir == 1) ||
+                             (g_TradeDir == -1 && g_HPLZones[_hz].dir == -1);
+            if(!_opposing) continue;
+            // Zone directly ahead (within 8 pips of current price in trade direction)
+            bool _near = (g_TradeDir == 1 && _hzMid > _bid && (_hzMid - _bid) < 80 * _Point * 10.0) ||
+                         (g_TradeDir == -1 && _hzMid < _bid && (_bid - _hzMid) < 80 * _Point * 10.0);
+            if(_near || (g_TradeDir == 1 && g_HPLResistBlock) || (g_TradeDir == -1 && g_HPLSupportBlock)) {
+               _hplWarnStr = ">> HPL " + (g_HPLZones[_hz].dir == 1 ? "RESIST" : "SUPPORT") +
+                             " @" + DoubleToString(g_HPLZones[_hz].low, _Digits) +
+                             " (" + IntegerToString(g_HPLZones[_hz].touches) + "t) — hold cautiously";
+               _hplWarnClr = (_near && (g_HPLResistBlock || g_HPLSupportBlock)) ? clrOrangeRed : clrOrange;
+               break;
+            }
+         }
+         DashLine("R_track", _hplWarnStr, rx, cy, rowR, lh, corner, _hplWarnClr, 8);
       } else {
-         DashLine("R_track", "Track   : ---", rx, cy, rowR, lh, corner, clrDimGray, 8);
+         DashLine("R_track", "", rx, cy, rowR, lh, corner, clrDimGray, 8);
       }
       rowR++;
 
@@ -8979,27 +9122,164 @@ void UpdateDashboard()
    }
    rowR++;
 
-   // --- Foreign Trades ---
-   DashLine("R_fhdr", "--- FOREIGN ---", rx, cy, rowR, lh, corner, clrSilver, 8); rowR++;
-   if(g_ForeignCountSymbol > 0) {
-      string fStr = IntegerToString(g_ForeignCountSymbol) + " on " + _Symbol
-                    + " (" + DoubleToString(g_ForeignLotsSymbol, 2) + " lots)";
-      DashLine("R_fgn",  "Foreign : " + fStr, rx, cy, rowR, lh, corner, clrOrangeRed, 8);
-   } else if(g_ForeignCountTotal > 0) {
-      DashLine("R_fgn",  "Foreign : " + IntegerToString(g_ForeignCountTotal) + " other pairs",
-               rx, cy, rowR, lh, corner, clrGray, 8);
-   } else {
-      DashLine("R_fgn",  "Foreign : none", rx, cy, rowR, lh, corner, clrGray, 8);
+   // --- Manual Trades Panel ---
+   // Header shows count and total lots on one line; individual trades below
+   {
+      string mtHdrStr;
+      color  mtHdrClr;
+      if(g_ManualTradeCount > 0) {
+         mtHdrStr = "--- MANUAL (" + IntegerToString(g_ManualTradeCount) + " | " +
+                    DoubleToString(g_ForeignLotsSymbol, 2) + "L) ---";
+         mtHdrClr = clrOrangeRed;
+      } else if(g_ForeignCountTotal > 0) {
+         mtHdrStr = "--- MANUAL (other pairs: " + IntegerToString(g_ForeignCountTotal) + ") ---";
+         mtHdrClr = clrSilver;
+      } else {
+         mtHdrStr = "--- MANUAL TRADES ---";
+         mtHdrClr = clrSilver;
+      }
+      DashLine("R_mthdr", mtHdrStr, rx, cy, rowR, lh, corner, mtHdrClr, 8); rowR++;
    }
-   rowR++;
 
-   if(g_ForeignCountSymbol > 0) {
-      DashLine("R_fgnd", "  " + g_ForeignSummary, rx, cy, rowR, lh, corner, clrOrange, 7);
-   } else {
-      DashLine("R_fgnd", "", rx, cy, rowR, lh, corner, clrGray, 7);
+   // Up to 2 trades shown in full; 3rd+ summarised
+   int mtShow = MathMin(g_ManualTradeCount, 2);
+   for(int _mi = 0; _mi < 2; _mi++) {   // always render 2 trade blocks to hold slot positions
+      string pfx = "R_mt" + IntegerToString(_mi);
+      if(_mi < mtShow) {
+         ManualTradeInfo mt = g_ManualTrades[_mi];
+         double bid    = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+         double pipSz  = _Point * 10.0;
+         double slPips = (mt.sl > 0) ? MathAbs(mt.openPrice - mt.sl)   / pipSz : 0;
+         double tpPips = (mt.tp > 0) ? MathAbs(mt.tp        - mt.openPrice) / pipSz : 0;
+         double rr     = (slPips > 0.1 && tpPips > 0.1) ? tpPips / slPips : 0;
+         int    conf   = ManualTradeConf(mt.dir);
+         string dirLbl = (mt.dir == 1) ? "[BUY] " : "[SELL]";
+         color  dirClr = (mt.dir == 1) ? clrLime  : clrTomato;
+         string srcLbl = mt.isManual ? "" : " EA:" + IntegerToString((int)mt.magic);
+         string pnlLbl = (mt.pnl >= 0 ? "+$" : "-$") + DoubleToString(MathAbs(mt.pnl), 2);
+         color  pnlClr = (mt.pnl >= 0) ? clrLime : clrTomato;
+
+         // --- Row 1: Direction | Lots | Entry | Net P&L ---
+         string r1 = dirLbl + " " + DoubleToString(mt.lots, 2) + "L" + srcLbl +
+                     "  @" + DoubleToString(mt.openPrice, _Digits) +
+                     "  Net:" + pnlLbl;
+         DashLine(pfx + "_h", r1, rx, cy, rowR, lh, corner, dirClr, 9); rowR++;
+
+         // --- Row 2: SL/TP details or NO SL warning ---
+         string r2;  color r2Clr;
+         if(mt.sl == 0 && mt.tp == 0) {
+            r2    = "!! NO SL & NO TP — risk fully unmanaged";
+            r2Clr = clrRed;
+         } else if(mt.sl == 0) {
+            double tpP = tpPips;
+            r2    = "!! NO SL  TP:" + DoubleToString(mt.tp, _Digits) +
+                    "(" + DoubleToString(tpP, 1) + "p)  Suggest SL:" +
+                    DoubleToString(mt.dir == 1
+                                   ? mt.openPrice - 1.5 * g_ATR
+                                   : mt.openPrice + 1.5 * g_ATR, _Digits);
+            r2Clr = clrOrangeRed;
+         } else if(mt.tp == 0) {
+            r2    = "SL:" + DoubleToString(mt.sl, _Digits) +
+                    "(" + DoubleToString(slPips, 1) + "p)  !! NO TP — add target";
+            r2Clr = clrOrange;
+         } else {
+            string rrStr = DoubleToString(rr, 2) + ":1";
+            color  rrClr = (rr >= 1.5) ? clrLime : (rr >= 1.0) ? clrGold : clrTomato;
+            r2    = "SL:" + DoubleToString(mt.sl, _Digits) + "(" + DoubleToString(slPips,1) + "p)" +
+                    "  TP:" + DoubleToString(mt.tp, _Digits) + "(" + DoubleToString(tpPips,1) + "p)" +
+                    "  RR:" + rrStr;
+            r2Clr = (rr < 1.0) ? clrOrangeRed : rrClr;
+         }
+         DashLine(pfx + "_sl", r2, rx, cy, rowR, lh, corner, r2Clr, 8); rowR++;
+
+         // --- Row 3: Structural confidence + factor tags ---
+         string h4Tag  = (g_MacroStructLabel == "BULLISH") ? "[H4+]" : (g_MacroStructLabel == "BEARISH") ? "[H4-]" : "[H4~]";
+         string h1Tag  = (g_StructureLabel   == "BULLISH") ? "[H1+]" : (g_StructureLabel   == "BEARISH") ? "[H1-]" : "[H1~]";
+         string fvgTag = (mt.dir == 1 && g_NearBullFVG) ? "[FVG]" : (mt.dir == -1 && g_NearBearFVG) ? "[FVG]" : "     ";
+         string obTag  = (mt.dir == 1 && g_BullOB_High > 0) ? "[OB]" : (mt.dir == -1 && g_BearOB_High > 0) ? "[OB]" : "    ";
+         // Flip tags to opposing colour if they work against the trade direction
+         color confClr = (conf >= 65) ? clrCyan : (conf >= 45) ? clrSilver : clrTomato;
+         DashLine(pfx + "_st",
+                  h4Tag + h1Tag + fvgTag + obTag + " Conf:" + IntegerToString(conf) + "% at TP",
+                  rx, cy, rowR, lh, corner, confClr, 8); rowR++;
+
+         // --- Row 4: Contextual warnings (HPL, poor RR, bad conf) ---
+         string warnStr = "";  color warnClr = clrGray;
+         // HPL stagnation zone between price and TP
+         if(mt.dir == 1 && mt.tp > 0) {
+            for(int _hz = 0; _hz < g_HPLCount; _hz++) {
+               if(g_HPLZones[_hz].broken) continue;
+               if(g_HPLZones[_hz].dir == 1) {       // resistance
+                  double zMid = (g_HPLZones[_hz].high + g_HPLZones[_hz].low) / 2.0;
+                  if(zMid > bid && zMid < mt.tp) {   // between now and TP
+                     warnStr = ">> RESIST HPL @" + DoubleToString(g_HPLZones[_hz].low, _Digits) +
+                               "-" + DoubleToString(g_HPLZones[_hz].high, _Digits) +
+                               " (" + IntegerToString(g_HPLZones[_hz].touches) + "t) before TP — early exit";
+                     warnClr = clrOrange;
+                     break;
+                  }
+                  if(g_HPLResistBlock) {             // currently inside resist zone
+                     warnStr = ">> Price in RESIST HPL — stagnation risk, consider close";
+                     warnClr = clrOrangeRed;
+                     break;
+                  }
+               }
+            }
+         } else if(mt.dir == -1 && mt.tp > 0) {
+            for(int _hz = 0; _hz < g_HPLCount; _hz++) {
+               if(g_HPLZones[_hz].broken) continue;
+               if(g_HPLZones[_hz].dir == -1) {      // support
+                  double zMid = (g_HPLZones[_hz].high + g_HPLZones[_hz].low) / 2.0;
+                  if(zMid < bid && zMid > mt.tp) {   // between now and TP (for sell, TP < bid)
+                     warnStr = ">> SUPPORT HPL @" + DoubleToString(g_HPLZones[_hz].low, _Digits) +
+                               "-" + DoubleToString(g_HPLZones[_hz].high, _Digits) +
+                               " (" + IntegerToString(g_HPLZones[_hz].touches) + "t) before TP — early exit";
+                     warnClr = clrOrange;
+                     break;
+                  }
+                  if(g_HPLSupportBlock) {
+                     warnStr = ">> Price in SUPPORT HPL — stagnation risk, consider close";
+                     warnClr = clrOrangeRed;
+                     break;
+                  }
+               }
+            }
+         }
+         // Poor RR warning (supersedes HPL warn if rr even worse)
+         if(warnStr == "" && mt.sl > 0 && mt.tp > 0 && rr < 1.0) {
+            warnStr = ">> POOR RR (" + DoubleToString(rr, 2) + ":1) — SL > reward, reposition";
+            warnClr = clrOrangeRed;
+         }
+         // Structural opposition warning
+         if(warnStr == "" && conf < 35) {
+            warnStr = ">> Structure OPPOSING this trade (" + IntegerToString(conf) + "%)";
+            warnClr = clrTomato;
+         }
+         DashLine(pfx + "_w", warnStr, rx, cy, rowR, lh, corner, warnClr, 8); rowR++;
+      } else {
+         // Empty slot — always render to hold row positions (avoids stale label overlap)
+         DashLine(pfx + "_h",  "", rx, cy, rowR, lh, corner, clrDimGray, 9); rowR++;
+         DashLine(pfx + "_sl", "", rx, cy, rowR, lh, corner, clrDimGray, 8); rowR++;
+         DashLine(pfx + "_st", "", rx, cy, rowR, lh, corner, clrDimGray, 8); rowR++;
+         DashLine(pfx + "_w",  "", rx, cy, rowR, lh, corner, clrDimGray, 8); rowR++;
+      }
    }
-   rowR++;
+   // If there are > 2 trades, show a compact summary for the rest
+   if(g_ManualTradeCount > 2) {
+      string xtraStr = "  +" + IntegerToString(g_ManualTradeCount - 2) + " more: ";
+      for(int _mx = 2; _mx < g_ManualTradeCount; _mx++) {
+         xtraStr += (g_ManualTrades[_mx].dir == 1 ? "BUY " : "SELL ") +
+                    DoubleToString(g_ManualTrades[_mx].lots, 2) + "L  ";
+      }
+      DashLine("R_mtxtra", xtraStr, rx, cy, rowR, lh, corner, clrGray, 7); rowR++;
+   } else {
+      DashLine("R_mtxtra", "", rx, cy, rowR, lh, corner, clrDimGray, 7); rowR++;
+   }
+   // No same-symbol trades — write "none" into the first slot high-water row and keep a blank placeholder
+   DashLine("R_mtnone", (g_ManualTradeCount == 0) ? " none (no manual trades on " + _Symbol + ")" : "",
+            rx, cy, rowR, lh, corner, clrGray, 8); rowR++;
 
+   // Bot paused warning at bottom of section
    if(g_ForeignCountSymbol > 0 && RespectForeignTrades) {
       DashLine("R_fgnw", "  >> Bot PAUSED (one-trade rule)", rx, cy, rowR, lh, corner, clrRed, 8);
    } else {

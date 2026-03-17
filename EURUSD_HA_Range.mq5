@@ -635,7 +635,12 @@ bool     g_PreflightBearOK  = false; // all downstream TryEntry gates are green 
 string   g_PreflightBlocker = "";    // first failing gate during pre-flight (for diagnostic)
 int      g_DailyWins       = 0;      // wins today (for dashboard)
 int      g_DailyLosses     = 0;      // losses today (for dashboard)
-double   g_DailyPnL        = 0.0;    // cumulative P&L today
+double   g_DailyPnL        = 0.0;    // cumulative P&L today (bot trades only)
+// Manual / foreign trade daily stats (recalculated from HistorySelect each bar)
+int      g_DailyManualCount  = 0;
+int      g_DailyManualWins   = 0;
+int      g_DailyManualLosses = 0;
+double   g_DailyManualPnL    = 0.0;
 
 datetime g_LastBarTime  = 0;
 datetime g_LastDayReset = 0;
@@ -802,6 +807,45 @@ int ManualTradeConf(int tradeDir)
 //| Counts open positions NOT placed by this bot (magic != 202502).  |
 //| Separates same-symbol vs total-account foreign trades.           |
 //+------------------------------------------------------------------+
+
+//+------------------------------------------------------------------+
+//| Recalculate manual-trade daily stats from closed deal history.   |
+//| Bot trades (magic 202502) are tracked event-driven; this covers  |
+//| all manually-placed / third-party-EA deals for today.            |
+//+------------------------------------------------------------------+
+void CalcDailyStatsBySource()
+{
+   g_DailyManualCount  = 0;
+   g_DailyManualWins   = 0;
+   g_DailyManualLosses = 0;
+   g_DailyManualPnL    = 0.0;
+
+   MqlDateTime dayDt;
+   TimeToStruct(TimeCurrent(), dayDt);
+   dayDt.hour = 0; dayDt.min = 0; dayDt.sec = 0;
+   datetime dayStart = StructToTime(dayDt);
+
+   if(!HistorySelect(dayStart, TimeCurrent())) return;
+
+   int total = HistoryDealsTotal();
+   for(int i = 0; i < total; i++)
+   {
+      ulong ticket = HistoryDealGetTicket(i);
+      if(ticket == 0) continue;
+      if(HistoryDealGetString(ticket, DEAL_SYMBOL) != _Symbol) continue;
+      if((ENUM_DEAL_ENTRY)HistoryDealGetInteger(ticket, DEAL_ENTRY) != DEAL_ENTRY_OUT) continue;
+      long magic = HistoryDealGetInteger(ticket, DEAL_MAGIC);
+      if(magic == 202502) continue;   // bot trades tracked separately via event
+      double pnl = HistoryDealGetDouble(ticket, DEAL_PROFIT)
+                 + HistoryDealGetDouble(ticket, DEAL_COMMISSION)
+                 + HistoryDealGetDouble(ticket, DEAL_SWAP);
+      g_DailyManualCount++;
+      g_DailyManualPnL += pnl;
+      if(pnl >= 0.0) g_DailyManualWins++;
+      else            g_DailyManualLosses++;
+   }
+}
+
 void ScanForeignTrades()
 {
    int    countSym   = 0;
@@ -1210,6 +1254,7 @@ void OnTick()
 
    // Scan for foreign (non-bot) trades every tick
    ScanForeignTrades();
+   CalcDailyStatsBySource();
 
    // === FRIDAY WEEKEND CLOSE ===
    if(FridayCloseHour > 0 && g_TradeOpen) {
@@ -1774,6 +1819,10 @@ void ResetDailyRanges()
    g_DailyWins         = 0;
    g_DailyLosses       = 0;
    g_DailyPnL          = 0.0;
+   g_DailyManualCount  = 0;
+   g_DailyManualWins   = 0;
+   g_DailyManualLosses = 0;
+   g_DailyManualPnL    = 0.0;
    // Don't reset g_ConsecLosses or g_CooldownUntil — they persist across days
    Print("Day reset. Prev range: H=", g_RangeHigh, " L=", g_RangeLow);
 }
@@ -9291,13 +9340,37 @@ void UpdateDashboard()
    // --- Daily Stats ---
    DashLine("R_shdr", "--- DAILY STATS ---", rx, cy, rowR, lh, corner, clrWhite, 9); rowR++;
    {
-      string dayStatsStr = "W:" + IntegerToString(g_DailyWins) +
-                           " L:" + IntegerToString(g_DailyLosses) +
-                           " P&L:$" + DoubleToString(g_DailyPnL, 2) +
-                           " (" + IntegerToString(g_DailyTradeCount) + "/" +
-                           (MaxDailyTrades > 0 ? IntegerToString(MaxDailyTrades) : "inf") + ")";
-      color dayClr = g_DailyPnL > 0 ? clrLime : g_DailyPnL < 0 ? clrRed : clrGray;
-      DashLine("R_dstat", "Today   : " + dayStatsStr, rx, cy, rowR, lh, corner, dayClr, 8); rowR++;
+      // Combined totals across bot + manual
+      double _totalPnL = g_DailyPnL + g_DailyManualPnL;
+      int    _totalW   = g_DailyWins + g_DailyManualWins;
+      int    _totalL   = g_DailyLosses + g_DailyManualLosses;
+      int    _totalN   = g_DailyTradeCount + g_DailyManualCount;
+      color  _totClr   = _totalPnL > 0 ? clrLime : _totalPnL < 0 ? clrRed : clrGray;
+      DashLine("R_dstat_tot",
+               "All   : W:" + IntegerToString(_totalW) +
+               " L:" + IntegerToString(_totalL) +
+               " P&L:$" + DoubleToString(_totalPnL, 2) +
+               " (" + IntegerToString(_totalN) + " trades)",
+               rx, cy, rowR, lh, corner, _totClr, 9); rowR++;
+
+      // Bot sub-row
+      color _botClr = g_DailyPnL > 0 ? clrLime : g_DailyPnL < 0 ? clrTomato : clrGray;
+      DashLine("R_dstat_bot",
+               "  Bot : W:" + IntegerToString(g_DailyWins) +
+               " L:" + IntegerToString(g_DailyLosses) +
+               " $" + DoubleToString(g_DailyPnL, 2) +
+               " (" + IntegerToString(g_DailyTradeCount) + "/" +
+               (MaxDailyTrades > 0 ? IntegerToString(MaxDailyTrades) : "inf") + ")",
+               rx, cy, rowR, lh, corner, _botClr, 8); rowR++;
+
+      // Manual sub-row
+      color _manClr = g_DailyManualPnL > 0 ? clrLime : g_DailyManualPnL < 0 ? clrTomato : clrSilver;
+      DashLine("R_dstat_man",
+               "  Man : W:" + IntegerToString(g_DailyManualWins) +
+               " L:" + IntegerToString(g_DailyManualLosses) +
+               " $" + DoubleToString(g_DailyManualPnL, 2) +
+               " (" + IntegerToString(g_DailyManualCount) + " closed)",
+               rx, cy, rowR, lh, corner, _manClr, 8); rowR++;
    }
 
    // Cooldowns (all slots always rendered — blank when inactive)

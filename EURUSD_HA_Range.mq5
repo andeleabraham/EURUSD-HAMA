@@ -1,10 +1,10 @@
 //+------------------------------------------------------------------+
-//|  EURUSD Heiken Ashi Range Bot v6.41                              |
+//|  EURUSD Heiken Ashi Range Bot v6.42                              |
 //|  Volume gating + ATR SL/TP sizing + Real candle alignment        |
 //|  STANDARD / SENTINEL / MOMENTUM / ADAPTIVE / HARVESTER / CHRONO |
 //+------------------------------------------------------------------+
 #property copyright   "EURUSD HA Range Bot"
-#property version     "6.41"
+#property version     "6.42"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -254,6 +254,7 @@ input int    CalendarLookAheadH  = 6;      // Hours ahead to scan for EUR/USD ev
 input int    CalendarMinImpact   = 2;      // Minimum importance: 1=all  2=moderate+  3=high only
 input int    CalendarMaxEvents   = 3;      // Events to show on dashboard (1-4)
 input int    CalendarNoTradeMins = 30;     // Block new entries within N min of HIGH impact event (0=off)
+input int    CalendarLookBackH   = 4;      // Hours back to scan for released EUR/USD events shown as Recent News (0=off)
 
 input group "=== FOREIGN TRADE AWARENESS ==="
 input bool   RespectForeignTrades = true;   // Block new entries if a non-bot trade exists on this symbol
@@ -654,6 +655,16 @@ bool                g_NewsNoTrade        = false;  // HIGH impact event within C
 bool                g_CalCountriesLoaded = false;
 MqlCalendarCountry  g_CalCountries[];           // filled once by CalendarCountries()
 int                 g_CalCountryCount    = 0;
+// Recent released events (actual results already published)
+struct CalPastEvent {
+   datetime time; string currency; string name; int importance;
+   int    impact;    // +1 = EUR/USD bullish, -1 = bearish, 0 = neutral/na
+   double actual;   // released actual value (DBL_MAX = not provided)
+   double forecast; // consensus forecast   (DBL_MAX = not provided)
+};
+CalPastEvent g_CalPastEvents[4];   // up to 4 most-recent released events
+int          g_CalPastCount  = 0;
+int          g_CalNewsScore  = 0;  // net EUR/USD sentiment from recent data (-10..+10)
 
 string DASH_PREFIX = "HABOT_DASH_";
 
@@ -793,6 +804,19 @@ int ManualTradeConf(int tradeDir)
 
    // Liquidity sweep in trade direction = smart money entry
    if(g_LiquiditySweep) score += 6;
+
+   // Recent news releases: g_CalNewsScore > 0 = EUR/USD bullish data, < 0 = bearish
+   // Only counted when ShowCalendar is active and CalendarLookBackH > 0
+   if(ShowCalendar && CalendarLookBackH > 0) {
+      int _nsFactor = 0;
+      if(g_CalNewsScore >= 4)       _nsFactor = 10;
+      else if(g_CalNewsScore >= 2)  _nsFactor = 6;
+      else if(g_CalNewsScore >= 1)  _nsFactor = 3;
+      else if(g_CalNewsScore <= -4) _nsFactor = -10;
+      else if(g_CalNewsScore <= -2) _nsFactor = -6;
+      else if(g_CalNewsScore <= -1) _nsFactor = -3;
+      score += (tradeDir == 1 ? _nsFactor : -_nsFactor);
+   }
 
    // Map to 0-100 (raw range is roughly -50 to +75)
    // Shift so that 0 raw = 40% (neutral-ish baseline)
@@ -8388,6 +8412,77 @@ void FetchCalendarEvents()
          }
       }
    }
+
+   // --- Recent released events (look-back window) ---
+   g_CalPastCount = 0;
+   g_CalNewsScore = 0;
+   if(CalendarLookBackH > 0) {
+      datetime fromT = now - (datetime)(CalendarLookBackH * 3600);
+      MqlCalendarValue pvals[];
+      int ptotal = CalendarValueHistory(pvals, fromT, now);
+
+      datetime pTm[32]; string pCr[32], pNm[32];
+      int pIp[32], pIa[32]; double pAc[32], pFc[32]; ulong pEd[32];
+      int pfound = 0;
+
+      for(int i = 0; i < ptotal && pfound < 32; i++) {
+         if(pvals[i].actual_value == LONG_MIN) continue; // not yet released
+         MqlCalendarEvent pev;
+         if(!CalendarEventById(pvals[i].event_id, pev)) continue;
+         if(pev.importance == CALENDAR_IMPORTANCE_NONE)   continue;
+         string pcur = CalGetCurrency(pev.country_id);
+         if(pcur != "EUR" && pcur != "USD") continue;
+         int pimp = (pev.importance == CALENDAR_IMPORTANCE_HIGH)     ? 3 :
+                    (pev.importance == CALENDAR_IMPORTANCE_MODERATE) ? 2 : 1;
+         if(pimp < CalendarMinImpact) continue;
+         // De-duplicate by event_id
+         bool pdup = false;
+         for(int d = 0; d < pfound; d++) { if(pEd[d] == pev.id) { pdup = true; break; } }
+         if(pdup) continue;
+         // Determine EUR/USD directional impact from release
+         int eImpact = 0;
+         if(pcur == "EUR") {
+            if(pvals[i].impact_type == CALENDAR_IMPACT_POSITIVE)     eImpact = +1;
+            else if(pvals[i].impact_type == CALENDAR_IMPACT_NEGATIVE) eImpact = -1;
+         } else { // USD: USD strength inverts EURUSD direction
+            if(pvals[i].impact_type == CALENDAR_IMPACT_POSITIVE)     eImpact = -1;
+            else if(pvals[i].impact_type == CALENDAR_IMPACT_NEGATIVE) eImpact = +1;
+         }
+         double pAcV = (pvals[i].actual_value   == LONG_MIN) ? DBL_MAX : (double)pvals[i].actual_value   / 1000000.0;
+         double pFcV = (pvals[i].forecast_value == LONG_MIN) ? DBL_MAX : (double)pvals[i].forecast_value / 1000000.0;
+         pTm[pfound] = pvals[i].time; pCr[pfound] = pcur; pNm[pfound] = pev.name;
+         pIp[pfound] = pimp; pIa[pfound] = eImpact;
+         pAc[pfound] = pAcV; pFc[pfound] = pFcV; pEd[pfound] = pev.id;
+         pfound++;
+      }
+      // Sort descending by time (most recent first)
+      for(int i = 1; i < pfound; i++) {
+         datetime kt = pTm[i]; string kc = pCr[i], kn = pNm[i];
+         int ki = pIp[i], kia = pIa[i]; double ka = pAc[i], kf = pFc[i]; ulong ke = pEd[i]; int j = i-1;
+         while(j >= 0 && pTm[j] < kt) {
+            pTm[j+1]=pTm[j]; pCr[j+1]=pCr[j]; pNm[j+1]=pNm[j];
+            pIp[j+1]=pIp[j]; pIa[j+1]=pIa[j]; pAc[j+1]=pAc[j]; pFc[j+1]=pFc[j]; pEd[j+1]=pEd[j]; j--;
+         }
+         pTm[j+1]=kt; pCr[j+1]=kc; pNm[j+1]=kn;
+         pIp[j+1]=ki; pIa[j+1]=kia; pAc[j+1]=ka; pFc[j+1]=kf; pEd[j+1]=ke;
+      }
+      int pcap = MathMin(pfound, 4);
+      g_CalPastCount = pcap;
+      for(int i = 0; i < pcap; i++) {
+         g_CalPastEvents[i].time       = pTm[i];
+         g_CalPastEvents[i].currency   = pCr[i];
+         g_CalPastEvents[i].name       = pNm[i];
+         g_CalPastEvents[i].importance = pIp[i];
+         g_CalPastEvents[i].impact     = pIa[i];
+         g_CalPastEvents[i].actual     = pAc[i];
+         g_CalPastEvents[i].forecast   = pFc[i];
+         // Contribute to net score weighted by importance
+         int w = (pIp[i] == 3) ? 2 : (pIp[i] == 2) ? 1 : 0;
+         g_CalNewsScore += pIa[i] * w;
+      }
+      if(g_CalNewsScore >  10) g_CalNewsScore =  10;
+      if(g_CalNewsScore < -10) g_CalNewsScore = -10;
+   }
 }
 
 //+------------------------------------------------------------------+
@@ -9413,6 +9508,52 @@ void UpdateDashboard()
 
    // --- Economic Calendar (v6.39) ---
    if(ShowCalendar) {
+      // === RECENT NEWS (released events with actual data) ===
+      if(CalendarLookBackH > 0) {
+         string _nsHdr = "--- RECENT NEWS ---";
+         if(g_CalNewsScore > 0)       _nsHdr = _nsHdr + " [+" + IntegerToString(g_CalNewsScore) + " BULL]";
+         else if(g_CalNewsScore < 0)  _nsHdr = _nsHdr + " [" + IntegerToString(g_CalNewsScore) + " BEAR]";
+         else                         _nsHdr = _nsHdr + " [neutral]";
+         DashLine("R_pnhdr", _nsHdr, rx, cy, rowR, lh, corner, clrSilver, 8); rowR++;
+
+         for(int _pi = 0; _pi < 3; _pi++) {
+            string _psuf = "R_pnev" + IntegerToString(_pi);
+            if(_pi < g_CalPastCount) {
+               CalPastEvent _pev = g_CalPastEvents[_pi];
+               // Time ago
+               int _ago = (int)(TimeCurrent() - _pev.time);
+               string _tAgo;
+               if(_ago < 3600) _tAgo = IntegerToString(_ago / 60) + "m";
+               else            _tAgo = IntegerToString(_ago / 3600) + "h";
+               while(StringLen(_tAgo) < 4) _tAgo = _tAgo + " "; // pad
+               // Importance stars
+               string _pimp = (_pev.importance == 3) ? "!!!" : (_pev.importance == 2) ? "!! " : "!  ";
+               // EUR/USD direction tag
+               string _itag;
+               color  _iclr;
+               if(_pev.impact == +1)      { _itag = "[+]"; _iclr = clrLime;   }
+               else if(_pev.impact == -1) { _itag = "[-]"; _iclr = clrTomato; }
+               else                       { _itag = "[~]"; _iclr = clrGray;   }
+               // Actual & forecast
+               string _acts = "";
+               if(_pev.actual != DBL_MAX) {
+                  _acts = " A:" + DoubleToString(_pev.actual, 2);
+                  if(_pev.forecast != DBL_MAX)
+                     _acts = _acts + " F:" + DoubleToString(_pev.forecast, 2);
+               }
+               // Name (truncated)
+               string _nm = _pev.name;
+               if(StringLen(_nm) > 16) _nm = StringSubstr(_nm, 0, 15) + "~";
+               DashLine(_psuf,
+                        _pimp + " " + _pev.currency + " " + _tAgo + " " + _nm + _acts + " " + _itag,
+                        rx, cy, rowR, lh, corner, _iclr, 8); rowR++;
+            } else {
+               DashLine(_psuf, "", rx, cy, rowR, lh, corner, clrGray, 7); rowR++;
+            }
+         }
+         rowR++; // spacer
+      }
+
       DashLine("R_calhdr", "--- NEXT EVENTS ---", rx, cy, rowR, lh, corner, clrSilver, 8); rowR++;
 
       // Determine macro+micro structural alignment for context labelling

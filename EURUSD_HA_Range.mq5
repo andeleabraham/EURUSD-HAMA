@@ -5590,7 +5590,7 @@ void EvaluateHAPattern()
       g_ConfidenceStatic   = CalcConfidence(1, g_ZoneLabel, false, IsSideways(), g_NearLevel);
       g_ConfidenceArmedBar = iTime(_Symbol, PERIOD_M15, 0);
       if(g_HADirFlip)
-         Print("FLIP FAST-ENTRY BUY: bear\u2192bull momentum flip. First bottomless candle = BUY INCOMING.",
+         Print("FLIP FAST-ENTRY BUY: bear->bull momentum flip. First bottomless candle = BUY INCOMING.",
                " Consec=", g_HAConsecCount, " Conf=", DoubleToString(g_ConfidenceStatic, 1), "%",
                " NB gate applies in TryEntry.");
       else
@@ -5796,7 +5796,7 @@ void EvaluateHAPattern()
       g_ConfidenceStatic   = CalcConfidence(-1, g_ZoneLabel, false, IsSideways(), g_NearLevel);
       g_ConfidenceArmedBar = iTime(_Symbol, PERIOD_M15, 0);
       if(g_HADirFlip)
-         Print("FLIP FAST-ENTRY SELL: bull\u2192bear momentum flip. First topless candle = SELL INCOMING.",
+         Print("FLIP FAST-ENTRY SELL: bull->bear momentum flip. First topless candle = SELL INCOMING.",
                " Consec=", g_HAConsecCount, " Conf=", DoubleToString(g_ConfidenceStatic, 1), "%",
                " NB gate applies in TryEntry.");
       else

@@ -122,3 +122,12 @@ It is recommended to run on a VPS or dedicated machine to ensure the bot is alwa
 | v6.32 | Session observation window extended to 4 bars across all sessions; fake-out detection added |
 | v6.33 | Inter-session momentum context; fake-outs classified as HIGH/MEDIUM/CONTINUATION/SESSION REVERSAL |
 | v6.34 | M15 MA 200/50/20 filter suite; daily extension cap |
+| v6.35 | MA convergence detection; fake-jump guard at MA200 crossings; MA200 boundary stop-limit pending orders |
+| v6.36 | MRV (Mean Reversion) trade mode with scaled SL/TP; persistent ATR & Bollinger handles; H4 frequency gating; M1/M5 double-oppose block; peak equity drawdown watermark |
+| v6.37 | Per-session trade counters (Asian / London / New York); individual session daily caps |
+| v6.38 | Confidence pre-cached at signal arm bar — score is stable from PREPARING through to entry |
+| v6.39 | Economic calendar integration; news no-trade zone blocks entries before and after high-impact events |
+| v6.40 | Order Block (OB) detection on H1; Fair Value Gap (FVG) detection on M15 and H1; SMC confluence added to confidence scoring |
+| v6.41 | HPL (Horizontal Price Level) detection — multi-touch consolidation zones block entries at untested S/R; liquidity sweep detection with confidence bonus |
+| v6.42 | HARVESTER (profit-tier slasher) and CHRONO trade management modes; six-mode management suite complete |
+| v6.43 | Naive Bayes probabilistic gate (9 features, Laplace-smoothed, retrained every 4 bars); momentum flip fast-entry — one clean HA candle after a direction reversal goes directly to INCOMING; NB direction-flip feature (F8) so the model learns separate win rates for flip vs standard entries |

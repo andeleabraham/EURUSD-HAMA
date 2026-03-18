@@ -86,8 +86,8 @@ input bool   AsianPrevDayMomEnabled = true;   // Enable prev-day last-hour momen
 input double AsianMomentumBonusPts  = 6.0;    // Confidence bonus when aligned (add-only, never penalises)
 input bool   AsianZoneStrictMode    = false;  // false=RELAX zone filter when momentum aligned; true=always enforce zones
 input int    AsianObserveBars      = 4;      // v6.32: first N M15 bars of Asian open = observe-only (4 = 1 hour)
-input int    LondonObserveBars     = 4;      // v6.32: first N M15 bars of London open = observe-only (4 = 1 hour)
-input int    NYObserveBars         = 4;      // v6.32: first N M15 bars of NY open (13:00) = observe-only (4 = 1 hour)
+input int    LondonObserveBars     = 2;      // v6.32: first N M15 bars of London open = observe-only (2 = 30 min; fakeout detection covers the rest)
+input int    NYObserveBars         = 2;      // v6.32: first N M15 bars of NY open (13:00) = observe-only (2 = 30 min; fakeout detection covers the rest)
 // RELAX mode: when prev-day momentum aligns with signal AND multiple factors agree,
 // the standard zone block (UPPER_THIRD for buy / LOWER_THIRD for sell) is lifted in Asian hours.
 // The trade is entered with standard (not narrowed) SL and a logged CAUTION note.
@@ -280,18 +280,18 @@ input int    DashboardCorner  = 0;
 input int    DashboardX       = 10;
 input int    DashboardY       = 20;
 
-input group "=== NB BRAIN (Probabilistic Gate) ==="
-// Self-training Naive Bayes engine: learns from the last NB_LookbackBars to estimate
-// P(WIN | current market features). Acts as a SECOND gate alongside additive confidence.
-// A trade fires only when BOTH additive confidence >= MinConfidence AND NB posterior >= NBMinPosterior.
-// WIN label: price moved >= ATR * NB_WinMultiplier in trade direction within NB_Lookahead bars.
-// Disable gate by setting NBMinPosterior = 0.0 for A/B comparison.
-input bool   UseNBBrain        = true;   // Enable NB posterior gate (second quality filter)
-input double NBMinPosterior    = 40.0;   // Min P(WIN|features)% to allow trade (0=gate off)
-input int    NB_LookbackBars   = 200;    // Historical M15 bars used for training (lower = faster init)
-input int    NB_Lookahead      = 3;      // Bars ahead to label WIN (3 = 45m)
-input double NB_WinMultiplier  = 0.9;   // WIN if |price move| >= ATR * this in trade direction
-input int    NB_RetrainBars    = 4;      // Retrain every N new M15 bars (4 = hourly)
+input group "=== NB BRAIN (Signal Co-Driver) ==="
+// Self-training Naive Bayes: re-runs every new bar, predicts P(UP)% and P(DOWN)% from 9 live features.
+// NB is a signal CO-DRIVER: high NB confidence drives BUY/SELL INCOMING directly (skips PREPARING).
+// Strong NB disagreement suppresses HA arming. Classes: UP(0)/DOWN(1)/NEUTRAL(2) — absolute direction.
+// Disable by setting UseNBBrain=false; set NBMinPosterior=0 to disable soft suppression gate.
+input bool   UseNBBrain        = true;   // Enable NB signal co-driver (runs every bar)
+input double NBHighThreshold   = 55.0;   // P(direction)% at which NB drives direct INCOMING
+input double NBMinPosterior    = 35.0;   // P(direction)% minimum to arm PREPARING; below = suppress
+input int    NB_LookbackBars   = 100;    // M15 bars of training history (100 = ~25h fast init)
+input int    NB_Lookahead      = 2;      // Bars ahead for label (2 = 30 min)
+input double NB_WinMultiplier  = 0.9;   // UP/DOWN label if |move| >= ATR * this within lookahead
+input int    NB_RetrainBars    = 1;      // Retrain every N new bars (1 = every bar, freshest model)
 
 //=== GLOBALS ===
 
@@ -625,16 +625,21 @@ datetime g_ConfidenceArmedBar = 0;         // v6.38: bar time when confidence wa
 // --- NB Brain globals ---
 #define HA_NB_FEATURES   9
 #define HA_NB_MAX_BINS   4
-#define HA_NB_CLASSES    3   // 0=WIN, 1=LOSS, 2=HOLD
+#define HA_NB_CLASSES    3   // 0=UP, 1=DOWN, 2=NEUTRAL (absolute direction classes)
 int    g_HaNB_FeatureBins[HA_NB_FEATURES];
 double g_HaNB_Prior[HA_NB_CLASSES];
 double g_HaNB_Likelihood[HA_NB_CLASSES][HA_NB_FEATURES][HA_NB_MAX_BINS];
 int    g_HaNB_SampleCount = 0;
-double g_NBPosteriorWin   = 0.0;   // last P(WIN|features) 0-100 (for display)
-double g_NBPosteriorLoss  = 0.0;   // last P(LOSS|features) 0-100 (for display)
-double g_NBPosteriorHold  = 0.0;   // last P(HOLD|features) 0-100 (for display)
+double g_NBPosteriorWin   = 0.0;   // P(UP|features) % — live, updated every bar
+double g_NBPosteriorLoss  = 0.0;   // P(DOWN|features) % — live, updated every bar
+double g_NBPosteriorHold  = 0.0;   // P(NEUTRAL|features) % — live, updated every bar
+double g_NBBuyProb        = 0.0;   // alias for g_NBPosteriorWin  (P(UP) for buy signal use)
+double g_NBSellProb       = 0.0;   // alias for g_NBPosteriorLoss (P(DOWN) for sell signal use)
+int    g_NBPredDir        = 0;     // NB top prediction direction: 1=UP, -1=DOWN, 0=neutral
 int    g_HaNB_BarCounter  = 0;     // bars elapsed since last retrain
 bool   g_HaNB_Trained     = false; // true once model has been trained at least once
+int    g_hNB_MA10         = INVALID_HANDLE;  // persistent SMA10 for NB training
+int    g_hNB_MA30         = INVALID_HANDLE;  // persistent SMA30 for NB training
 double g_DynamicSL_USD    = 2.0;           // structural SL for current setup (per 0.01 lot)
 double g_DynamicTP_USD    = 3.6;           // calculated TP = SL × RRRatio (per 0.01 lot)
 
@@ -1250,10 +1255,11 @@ int OnInit()
    FetchCalendarEvents();         // v6.39: initial calendar load
    g_CalLastFetch = TimeCurrent();
 
-   // NB Brain: initialise + warm-up train on historical data
+   // NB Brain: initialise + warm-up train + immediately compute live posteriors
    if(UseNBBrain) {
-      InitNBBrain();
-      BuildAndTrainNBBrain(1);  // train once on init (buy direction; inference is symmetric)
+      InitNBBrain();          // bins, uniform priors, create persistent MA handles
+      BuildAndTrainNBBrain(); // initial train on NB_LookbackBars of history
+      CalcNBLiveProbs();      // immediately sets g_NBBuyProb/SellProb for dashboard
    }
 
    UpdateDashboard();
@@ -1289,6 +1295,9 @@ void OnDeinit(const int reason)
    // v6.36: Release persistent ATR and Bollinger handles
    if(g_hATR   != INVALID_HANDLE) { IndicatorRelease(g_hATR);   g_hATR   = INVALID_HANDLE; }
    if(g_hBands != INVALID_HANDLE) { IndicatorRelease(g_hBands); g_hBands = INVALID_HANDLE; }
+   // v6.43: Release NB Brain persistent MA handles
+   if(g_hNB_MA10 != INVALID_HANDLE) { IndicatorRelease(g_hNB_MA10); g_hNB_MA10 = INVALID_HANDLE; }
+   if(g_hNB_MA30 != INVALID_HANDLE) { IndicatorRelease(g_hNB_MA30); g_hNB_MA30 = INVALID_HANDLE; }
    // v6.35: Cancel any live MA200 pending order on EA removal/deinit
    if(g_PendingMA200Ticket != 0) {
       if(OrderSelect(g_PendingMA200Ticket))
@@ -1417,8 +1426,8 @@ void OnTick()
       ComputeMurrayLevels();  // Murray Math octave channels from H4
       ComputeMultiDaySR();    // weekly + 3-day S/R levels
 
-      // NB Brain: retrain every NB_RetrainBars bars
-      RetrainNBIfDue();
+      // NB Brain: retrain when due + compute live posteriors every bar (drives EvaluateHAPattern)
+      RunNBEveryBar();
 
       // Prev-day last-hour direction — recalc once per day during Asian session
       if(AsianPrevDayMomEnabled) {
@@ -1629,6 +1638,11 @@ void OnTick()
          CheckMacroTrendRide();   // must run after EvaluateHAPattern (uses g_HAConsecCount, g_MacroBOS, etc.)
       }
    }
+
+   // Re-run NB inference every tick — cheap (9 feature lookups, no training),
+   // keeps dashboard and fast-track promotion in sync with live price.
+   if(UseNBBrain && g_HaNB_Trained)
+      CalcNBLiveProbs();
 
    // Fire TryEntry when trend signal active, mean reversion qualifies, OR macro trend ride armed.
    // When PauseScanInTrade is on and bot has a trade, the signal scanning above was already
@@ -3930,23 +3944,30 @@ string NearFibPivotLevel(double price)
 
 void InitNBBrain()
 {
-   g_HaNB_FeatureBins[0] = 3;
-   g_HaNB_FeatureBins[1] = 4;
-   g_HaNB_FeatureBins[2] = 4;
-   g_HaNB_FeatureBins[3] = 3;
-   g_HaNB_FeatureBins[4] = 3;
-   g_HaNB_FeatureBins[5] = 3;
-   g_HaNB_FeatureBins[6] = 3;
-   g_HaNB_FeatureBins[7] = 3;
-   g_HaNB_FeatureBins[8] = 2;   // direction flip: 0=no / 1=yes
-   // Flat uniform priors — will be overwritten on first train
+   g_HaNB_FeatureBins[0] = 3;  // F0: zone 0=LOWER/1=MID/2=UPPER
+   g_HaNB_FeatureBins[1] = 4;  // F1: session 0=Asian/1=London/2=NY/3=Off
+   g_HaNB_FeatureBins[2] = 4;  // F2: 0=strongBear/1=mildBear/2=mildBull/3=strongBull (absolute)
+   g_HaNB_FeatureBins[3] = 3;  // F3: volume 0=Low/1=Normal/2=High
+   g_HaNB_FeatureBins[4] = 3;  // F4: structure 0=BEARISH/1=NEUTRAL/2=BULLISH
+   g_HaNB_FeatureBins[5] = 3;  // F5: FVG 0=none/1=BullFVG/2=BearFVG (absolute)
+   g_HaNB_FeatureBins[6] = 3;  // F6: OB  0=none/1=nearBullOB/2=nearBearOB (absolute)
+   g_HaNB_FeatureBins[7] = 3;  // F7: Sweep 0=none/1=bullSweep->UP/2=bearSweep->DOWN (absolute)
+   g_HaNB_FeatureBins[8] = 2;  // F8: dir flip 0=no/1=yes
+   // Flat uniform priors — overwritten on first train
    for(int c = 0; c < HA_NB_CLASSES; c++) g_HaNB_Prior[c] = 1.0 / HA_NB_CLASSES;
    for(int c = 0; c < HA_NB_CLASSES; c++)
       for(int f = 0; f < HA_NB_FEATURES; f++)
          for(int v = 0; v < HA_NB_MAX_BINS; v++)
-            g_HaNB_Likelihood[c][f][v] = 1.0 / g_HaNB_FeatureBins[f]; // uniform
+            g_HaNB_Likelihood[c][f][v] = 1.0 / g_HaNB_FeatureBins[f];
    g_HaNB_Trained    = false;
    g_HaNB_BarCounter = 0;
+   g_NBBuyProb = g_NBSellProb = 0.0;
+   g_NBPredDir = 0;
+   // Persistent MA handles for training loop — avoids per-bar iMA() overhead
+   if(g_hNB_MA10 == INVALID_HANDLE)
+      g_hNB_MA10 = iMA(_Symbol, PERIOD_M15, 10, 0, MODE_SMA, PRICE_CLOSE);
+   if(g_hNB_MA30 == INVALID_HANDLE)
+      g_hNB_MA30 = iMA(_Symbol, PERIOD_M15, 30, 0, MODE_SMA, PRICE_CLOSE);
 }
 
 // Get zone bin from price relative to range (mirrors ClassifyZone logic, direction-aware)
@@ -4021,13 +4042,13 @@ int GetNBHAConsecBin(int barIdx, int directionForBuy)
    return 3;
 }
 
-// Build live feature vector (8 features) for current bar, direction-aware
-void GetNBLiveFeatures(int tradeDir, int &out[])
+// Build live feature vector — all features ABSOLUTE (direction-independent).
+// Classes trained as UP(0)/DOWN(1)/NEUTRAL(2), so no tradeDir dependency in features.
+void GetNBLiveFeatures(int &out[])
 {
    ArrayResize(out, HA_NB_FEATURES);
 
-   // F0: zone (direction-normalized: for buy, LOW=good; for sell, HIGH=good → both map to easier WIN)
-   // We store absolute zone: 0=LOWER / 1=MID / 2=UPPER. Label interpretation in training.
+   // F0: range zone (absolute: 0=LOWER / 1=MID / 2=UPPER)
    double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
    out[0] = GetNBZoneBin(bid, g_RangeHigh, g_RangeLow);
 
@@ -4035,62 +4056,76 @@ void GetNBLiveFeatures(int tradeDir, int &out[])
    MqlDateTime dt; TimeToStruct(TimeCurrent(), dt);
    out[1] = GetNBSessionBin(dt.hour);
 
-   // F2: HA streak tier
-   if(g_HAConsecCount <= 1) out[2] = 0;
-   else if(g_HAConsecCount == 2) out[2] = 1;
-   else if(g_HAConsecCount <= 4) out[2] = 2;
-   else out[2] = 3;
+   // F2: absolute HA direction + streak — uses both bar1 (confirmed) and bar0 (forming) for
+   // tick-by-tick sensitivity: consensus makes it strong, divergence makes it mild.
+   {
+      double bid  = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+      double b0o  = iOpen(_Symbol, PERIOD_M15, 0);
+      double c1   = iClose(_Symbol, PERIOD_M15, 1);
+      double o1   = iOpen (_Symbol, PERIOD_M15, 1);
+      int    dir0 = (bid > b0o + _Point*3)  ? 1 : (bid < b0o - _Point*3)  ? -1 : 0;  // forming bar
+      int    dir1 = (c1  > o1  + _Point)    ? 1 : (c1  < o1  - _Point)    ? -1 : 0;  // last closed
+      int    net  = dir0 + dir1;  // -2..+2
+      if(net >= 2)       out[2] = (g_HAConsecCount >= 3) ? 3 : 2;  // both bull
+      else if(net <= -2) out[2] = (g_HAConsecCount >= 3) ? 0 : 1;  // both bear
+      else if(net == 1)  out[2] = 2;   // mild bull
+      else if(net == -1) out[2] = 1;   // mild bear
+      else               out[2] = 1;   // flat/mixed
+   }
 
-   // F3: volume state
+   // F3: volume state (direction-agnostic: 0=Low/1=Normal/2=High)
    out[3] = (g_VolumeState == "LOW" || g_VolumeState == "DEAD") ? 0
           : (g_VolumeState == "HIGH" || g_VolumeState == "ABOVE_AVG") ? 2 : 1;
 
-   // F4: structure (0=BEARISH/1=NEUTRAL/2=BULLISH)
+   // F4: market structure (absolute: 0=BEARISH/1=NEUTRAL/2=BULLISH)
    out[4] = (g_StructureLabel == "BULLISH") ? 2 : (g_StructureLabel == "BEARISH") ? 0 : 1;
 
-   // F5: FVG alignment (0=none / 1=aligned / 2=opposing)
-   if(tradeDir == 1) {
-      if(g_NearBullFVG)       out[5] = 1;
-      else if(g_NearBearFVG)  out[5] = 2;
-      else                    out[5] = 0;
-   } else {
-      if(g_NearBearFVG)       out[5] = 1;
-      else if(g_NearBullFVG)  out[5] = 2;
-      else                    out[5] = 0;
+   // F5: 3-bar OHLC Fair Value Gap (live bars 0/1/2) — consistent with training detection.
+   // Bullish FVG: bar0.low > bar2.high (gap below current price — bullish imbalance)
+   // Bearish FVG: bar0.high < bar2.low (gap above current price — bearish imbalance)
+   {
+      double l0 = iLow (_Symbol, PERIOD_M15, 0);
+      double h0 = iHigh(_Symbol, PERIOD_M15, 0);
+      double h2 = iHigh(_Symbol, PERIOD_M15, 2);
+      double l2 = iLow (_Symbol, PERIOD_M15, 2);
+      // Use live bid as bar0 low bound (forming bar)
+      l0 = MathMin(l0, SymbolInfoDouble(_Symbol, SYMBOL_BID));
+      h0 = MathMax(h0, SymbolInfoDouble(_Symbol, SYMBOL_ASK));
+      if(l0 > h2 + _Point * 2)        out[5] = 1;  // bullish FVG
+      else if(h0 < l2 - _Point * 2)   out[5] = 2;  // bearish FVG
+      else                             out[5] = 0;
    }
 
-   // F6: OB alignment (0=none / 1=aligned / 2=opposing)
-   bool nearBullOB = (g_BullOB_High > 0 && bid >= g_BullOB_Low - 3.0*_Point*10 && bid <= g_BullOB_High + 3.0*_Point*10);
-   bool nearBearOB = (g_BearOB_High > 0 && bid >= g_BearOB_Low - 3.0*_Point*10 && bid <= g_BearOB_High + 3.0*_Point*10);
-   if(tradeDir == 1) {
-      if(nearBullOB)       out[6] = 1;
-      else if(nearBearOB)  out[6] = 2;
-      else                 out[6] = 0;
-   } else {
-      if(nearBearOB)       out[6] = 1;
-      else if(nearBullOB)  out[6] = 2;
-      else                 out[6] = 0;
-   }
+   // F6: always 0 — OB replay not available historically; consistent with training
+   out[6] = 0;
 
-   // F7: liquidity sweep (0=none / 1=aligned / 2=opposing)
-   if(g_LiquiditySweep) {
-      out[7] = (g_SweepDir == tradeDir) ? 1 : 2;
-   } else {
-      out[7] = 0;
-   }
+   // F7: always 0 — Sweep replay not available historically; consistent with training
+   out[7] = 0;
 
-   // F8: direction flip — did bar1 just reverse bar2's direction? (momentum flip signal)
-   out[8] = g_HADirFlip ? 1 : 0;
+   // F8: direction flip — bar1 vs bar2 (confirmed) OR live bar vs bar1 (forming)
+   {
+      double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+      double b0o = iOpen (_Symbol, PERIOD_M15, 0);
+      double c1  = iClose(_Symbol, PERIOD_M15, 1);
+      double o1  = iOpen (_Symbol, PERIOD_M15, 1);
+      double c2  = iClose(_Symbol, PERIOD_M15, 2);
+      double o2  = iOpen (_Symbol, PERIOD_M15, 2);
+      int dir0 = (bid > b0o + _Point*3)  ? 1 : (bid < b0o - _Point*3)  ? -1 : 0;
+      int dir1 = (c1  > o1  + _Point)    ? 1 : (c1  < o1  - _Point)    ? -1 : 0;
+      int dir2 = (c2  > o2  + _Point)    ? 1 : (c2  < o2  - _Point)    ? -1 : 0;
+      bool flip_1v2 = (dir1 != 0 && dir2 != 0 && dir1 != dir2);  // confirmed bar1 vs bar2
+      bool flip_0v1 = (dir0 != 0 && dir1 != 0 && dir0 != dir1);  // forming bar vs bar1
+      out[8] = (flip_1v2 || flip_0v1) ? 1 : 0;
+   }
 }
 
 // Build historical feature vector for training at barIdx.
-// ICT live features (FVG/OB/Sweep) are set to neutral (0=none) — too expensive to replay.
-// Zone, session, HA streak, volume, and structure are computable from history.
-void GetNBHistoricalFeatures(int barIdx, int tradeDir, int &out[])
+// All features ABSOLUTE (no tradeDir). Uses persistent g_hNB_MA10/MA30 — no handle creation in loop.
+void GetNBHistoricalFeatures(int barIdx, int &out[])
 {
    ArrayResize(out, HA_NB_FEATURES);
 
-   // F0: zone (use D1 bar at barIdx to approximate daily range)
+   // F0: zone approximated from D1 bar
    int d1Idx = barIdx / 96 + 1;
    double dH = iHigh(_Symbol, PERIOD_D1, d1Idx);
    double dL = iLow (_Symbol, PERIOD_D1, d1Idx);
@@ -4102,8 +4137,19 @@ void GetNBHistoricalFeatures(int barIdx, int tradeDir, int &out[])
    MqlDateTime bdt; TimeToStruct(barTime, bdt);
    out[1] = GetNBSessionBin(bdt.hour);
 
-   // F2: HA streak tier
-   out[2] = GetNBHAConsecBin(barIdx, tradeDir);
+   // F2: absolute direction + streak (0=strongBear/1=mildBear/2=mildBull/3=strongBull)
+   // Net bull-bear in last 3+current bar; maps to 4 absolute bins
+   {
+      int bulls = 0, bears = 0;
+      for(int k = barIdx; k <= barIdx + 3; k++) {
+         double ko = iOpen (_Symbol, PERIOD_M15, k);
+         double kc = iClose(_Symbol, PERIOD_M15, k);
+         if(kc > ko + _Point) bulls++;
+         else if(kc < ko - _Point) bears++;
+      }
+      int net = bulls - bears;
+      out[2] = (net >= 2) ? 3 : (net >= 1) ? 2 : (net <= -2) ? 0 : 1;
+   }
 
    // F3: volume state
    long volBuf[21];
@@ -4115,28 +4161,37 @@ void GetNBHistoricalFeatures(int barIdx, int tradeDir, int &out[])
       out[3] = (vr < 0.6) ? 0 : (vr > 1.5) ? 2 : 1;
    } else out[3] = 1;
 
-   // F4: structure proxy (SMA10 vs SMA30 direction at barIdx)
-   double sma10Buf[2], sma30Buf[2];
-   int h10 = iMA(_Symbol, PERIOD_M15, 10, 0, MODE_SMA, PRICE_CLOSE);
-   int h30 = iMA(_Symbol, PERIOD_M15, 30, 0, MODE_SMA, PRICE_CLOSE);
-   if(h10 != INVALID_HANDLE && h30 != INVALID_HANDLE &&
-      CopyBuffer(h10, 0, barIdx, 2, sma10Buf) == 2 &&
-      CopyBuffer(h30, 0, barIdx, 2, sma30Buf) == 2) {
-      double gap = sma10Buf[0] - sma30Buf[0];
-      double thresh = 2.0 * _Point * 10;
-      out[4] = (gap >  thresh) ? 2 : (gap < -thresh) ? 0 : 1;
-      IndicatorRelease(h10);
-      IndicatorRelease(h30);
-   } else {
-      out[4] = 1;
+   // F4: structure proxy from persistent SMA handles (no per-bar handle creation)
+   {
+      double sma10Buf[1], sma30Buf[1];
+      bool hasMA = (g_hNB_MA10 != INVALID_HANDLE && g_hNB_MA30 != INVALID_HANDLE &&
+                    CopyBuffer(g_hNB_MA10, 0, barIdx, 1, sma10Buf) == 1 &&
+                    CopyBuffer(g_hNB_MA30, 0, barIdx, 1, sma30Buf) == 1);
+      if(hasMA) {
+         double gap = sma10Buf[0] - sma30Buf[0];
+         out[4] = (gap > 2.0*_Point*10) ? 2 : (gap < -2.0*_Point*10) ? 0 : 1;
+      } else out[4] = 1;
    }
 
-   // F5,F6,F7: ICT (FVG/OB/Sweep) — neutral in historical training
-   out[5] = 0;
+   // F5: 3-bar OHLC Fair Value Gap at barIdx — same definition as live inference.
+   // Bullish: low[barIdx] > high[barIdx+2]; Bearish: inverse.
+   {
+      int avail = Bars(_Symbol, PERIOD_M15);
+      if(barIdx + 2 < avail) {
+         double l0h = iLow (_Symbol, PERIOD_M15, barIdx);
+         double h0h = iHigh(_Symbol, PERIOD_M15, barIdx);
+         double h2h = iHigh(_Symbol, PERIOD_M15, barIdx + 2);
+         double l2h = iLow (_Symbol, PERIOD_M15, barIdx + 2);
+         if(l0h > h2h + _Point * 2)       out[5] = 1;  // bullish FVG
+         else if(h0h < l2h - _Point * 2)  out[5] = 2;  // bearish FVG
+         else                              out[5] = 0;
+      } else out[5] = 0;
+   }
+   // F6,F7: OB/Sweep replay not feasible historically — keep 0 (consistent with prior training)
    out[6] = 0;
    out[7] = 0;
 
-   // F8: direction flip — compare this bar's direction vs the bar before it
+   // F8: direction flip from bar direction change
    {
       double curO = iOpen (_Symbol, PERIOD_M15, barIdx);
       double curC = iClose(_Symbol, PERIOD_M15, barIdx);
@@ -4149,9 +4204,9 @@ void GetNBHistoricalFeatures(int barIdx, int tradeDir, int &out[])
 }
 
 // Train NB model from last NB_LookbackBars of M15 history.
-// tradeDir is used to compute direction for F2/F5/F6/F7 and WIN label.
-// The same model is used for both buy and sell by feeding live direction at inference.
-void BuildAndTrainNBBrain(int tradeDir)
+// Classes are absolute: 0=UP (rose >= ATR*mult) / 1=DOWN (fell >= ATR*mult) / 2=NEUTRAL.
+// No tradeDir — one model serves both BUY and SELL signal decisions.
+void BuildAndTrainNBBrain()
 {
    int avail = Bars(_Symbol, PERIOD_M15);
    int total = NB_LookbackBars + NB_Lookahead + 10;
@@ -4163,45 +4218,35 @@ void BuildAndTrainNBBrain(int tradeDir)
    int nSamples = NB_LookbackBars - NB_Lookahead;
    if(nSamples <= 0) return;
 
-   // --- Count per class for Laplace smoothing ---
    int classCounts[HA_NB_CLASSES];
    ArrayInitialize(classCounts, 0);
    int fCounts[HA_NB_CLASSES][HA_NB_FEATURES][HA_NB_MAX_BINS];
    ArrayInitialize(fCounts, 0);
-
    int validCount = 0;
 
    for(int i = 0; i < nSamples; i++) {
-      int barIdx = NB_Lookahead + i;   // training bar index (older end first)
+      int barIdx = NB_Lookahead + i;
 
-      // Compute ATR at that point (rough: average of 14 bars)
+      // Local ATR (range average over 14 bars)
       double atrSum = 0;
       for(int a = barIdx; a < barIdx + 14 && a < avail; a++)
          atrSum += (iHigh(_Symbol, PERIOD_M15, a) - iLow(_Symbol, PERIOD_M15, a));
       double atrLocal = atrSum / 14.0;
       if(atrLocal <= 0) continue;
 
-      // Forward price move over NB_Lookahead bars (using HA close direction proxy)
+      // Absolute label: UP(0) / DOWN(1) / NEUTRAL(2)
       double futureClose = iClose(_Symbol, PERIOD_M15, barIdx - NB_Lookahead);
       double baseClose   = iClose(_Symbol, PERIOD_M15, barIdx);
       double delta       = futureClose - baseClose;
-
-      double winThresh = atrLocal * NB_WinMultiplier;
+      double thresh      = atrLocal * NB_WinMultiplier;
 
       int label;
-      // Label WIN/LOSS from the perspective of tradeDir
-      if(tradeDir == 1) {
-         if(delta >= winThresh)       label = 0; // WIN (bull)
-         else if(delta <= -winThresh) label = 1; // LOSS
-         else                         label = 2; // HOLD
-      } else {
-         if(delta <= -winThresh)      label = 0; // WIN (bear)
-         else if(delta >= winThresh)  label = 1; // LOSS
-         else                         label = 2; // HOLD
-      }
+      if(delta >= thresh)       label = 0; // UP
+      else if(delta <= -thresh) label = 1; // DOWN
+      else                      label = 2; // NEUTRAL
 
       int feats[];
-      GetNBHistoricalFeatures(barIdx, tradeDir, feats);
+      GetNBHistoricalFeatures(barIdx, feats);
 
       classCounts[label]++;
       for(int f = 0; f < HA_NB_FEATURES; f++) {
@@ -4217,11 +4262,9 @@ void BuildAndTrainNBBrain(int tradeDir)
       return;
    }
 
-   // --- Priors ---
    for(int c = 0; c < HA_NB_CLASSES; c++)
-      g_HaNB_Prior[c] = (validCount > 0) ? (double)classCounts[c] / (double)validCount : 1.0/HA_NB_CLASSES;
+      g_HaNB_Prior[c] = (double)classCounts[c] / (double)validCount;
 
-   // --- Likelihoods with Laplace smoothing ---
    for(int c = 0; c < HA_NB_CLASSES; c++) {
       for(int f = 0; f < HA_NB_FEATURES; f++) {
          int nBins = g_HaNB_FeatureBins[f];
@@ -4237,25 +4280,22 @@ void BuildAndTrainNBBrain(int tradeDir)
 
    g_HaNB_SampleCount = validCount;
    g_HaNB_Trained     = true;
-
-   Print("[NB Brain] Trained on ", validCount, " samples (dir=", tradeDir, ")",
-         " | P(WIN)=", DoubleToString(g_HaNB_Prior[0]*100,1),
-         "% P(LOSS)=", DoubleToString(g_HaNB_Prior[1]*100,1),
-         "% P(HOLD)=", DoubleToString(g_HaNB_Prior[2]*100,1), "%");
+   Print("[NB Brain] Trained ", validCount, " samples | P(UP)=", DoubleToString(g_HaNB_Prior[0]*100,1),
+         "% P(DOWN)=", DoubleToString(g_HaNB_Prior[1]*100,1),
+         "% P(NEUTRAL)=", DoubleToString(g_HaNB_Prior[2]*100,1), "%");
 }
 
-// Infer P(WIN | live features) for the given tradeDir. Returns 0-100%.
-// Side-effects: sets g_NBPosteriorWin / Loss / Hold for display.
-double CalcNBPosterior(int tradeDir)
+// Compute live P(UP)/P(DOWN)/P(NEUTRAL) from current NB model and live market features.
+// Updates g_NBBuyProb, g_NBSellProb, g_NBPosteriorWin/Loss/Hold, g_NBPredDir every call.
+void CalcNBLiveProbs()
 {
-   if(!g_HaNB_Trained) return 50.0;  // untrained → neutral (allow)
+   if(!g_HaNB_Trained) return;
 
    int liveFeats[];
-   GetNBLiveFeatures(tradeDir, liveFeats);
+   GetNBLiveFeatures(liveFeats);
 
    double probs[HA_NB_CLASSES];
    double total = 0.0;
-
    for(int c = 0; c < HA_NB_CLASSES; c++) {
       double p = g_HaNB_Prior[c];
       for(int f = 0; f < HA_NB_FEATURES; f++) {
@@ -4263,32 +4303,36 @@ double CalcNBPosterior(int tradeDir)
          if(bin >= 0 && bin < g_HaNB_FeatureBins[f] && g_HaNB_Likelihood[c][f][bin] > 0)
             p *= g_HaNB_Likelihood[c][f][bin];
       }
-      probs[c] = p;
-      total += p;
+      probs[c] = p; total += p;
    }
 
    if(total > 0) {
-      g_NBPosteriorWin  = (probs[0] / total) * 100.0;
-      g_NBPosteriorLoss = (probs[1] / total) * 100.0;
-      g_NBPosteriorHold = (probs[2] / total) * 100.0;
+      g_NBBuyProb       = (probs[0] / total) * 100.0;  // P(UP)
+      g_NBSellProb      = (probs[1] / total) * 100.0;  // P(DOWN)
+      g_NBPosteriorWin  = g_NBBuyProb;
+      g_NBPosteriorLoss = g_NBSellProb;
+      g_NBPosteriorHold = (probs[2] / total) * 100.0;  // P(NEUTRAL)
    } else {
-      g_NBPosteriorWin = g_NBPosteriorLoss = g_NBPosteriorHold = 33.3;
+      g_NBBuyProb = g_NBSellProb = g_NBPosteriorWin = g_NBPosteriorLoss = g_NBPosteriorHold = 33.3;
    }
 
-   return g_NBPosteriorWin;
+   if(g_NBBuyProb >= g_NBSellProb && g_NBBuyProb > 40.0)       g_NBPredDir =  1;
+   else if(g_NBSellProb > g_NBBuyProb && g_NBSellProb > 40.0)  g_NBPredDir = -1;
+   else                                                          g_NBPredDir =  0;
 }
 
-// Called every new bar — retrain when NB_RetrainBars have elapsed.
-// Uses the most recent known trade direction (or 1/buy as default when idle).
-void RetrainNBIfDue()
+// Called on every new bar: retrain NB when due, then compute live posteriors immediately.
+// NB_RetrainBars=1 means model stays maximally fresh (retrain each bar; ~100 samples * 9 feats).
+void RunNBEveryBar()
 {
    if(!UseNBBrain) return;
    g_HaNB_BarCounter++;
-   if(g_HaNB_BarCounter < NB_RetrainBars) return;
-   g_HaNB_BarCounter = 0;
-
-   // Retrain from buy perspective (the model is symmetric — WIN/LOSS perspective flips at inference)
-   BuildAndTrainNBBrain(1);
+   if(g_HaNB_BarCounter >= NB_RetrainBars) {
+      g_HaNB_BarCounter = 0;
+      BuildAndTrainNBBrain();
+   }
+   // Always recompute live posteriors — dashboard and EvaluateHAPattern read these each bar
+   CalcNBLiveProbs();
 }
 
 //+------------------------------------------------------------------+
@@ -5578,28 +5622,38 @@ void EvaluateHAPattern()
       g_ZoneContextUsed    = false;
       // Flip fast-entry: if bar2 was bearish (momentum flip), the first bottomless bull
       // candle is sufficient confirmation — skip PREPARING and go straight to BUY INCOMING.
-      // The NB brain gate in TryEntry still applies as the quality/probability filter.
-      if(g_HADirFlip) {
-         g_Signal            = "BUY INCOMING";
-         g_ConfirmCandleOpen = iTime(_Symbol, PERIOD_M15, 1);
+      // NB co-driver: if NB strongly agrees, also skip PREPARING.
+      // NB suppression: only veto when NB is MAJORITY-DOWN (>50%) AND P(UP)<NBMinPosterior
+      // AND this is NOT a flip (flips are the strongest HA signals — never NB-suppressed).
+      if(UseNBBrain && g_HaNB_Trained && !g_HADirFlip
+         && g_NBSellProb > 50.0 && g_NBBuyProb < NBMinPosterior) {
+         g_HABullSetup = false;   // undo — NB majority-DOWN vetoes this BUY setup
+         g_Signal      = "WAITING";
+         Print("[NB] BUY suppressed: P(UP)=", DoubleToString(g_NBBuyProb,1),
+               "% < ", DoubleToString(NBMinPosterior,0), "% | P(DOWN)=", DoubleToString(g_NBSellProb,1),
+               "% (majority-DOWN, not a flip)");
       } else {
-         g_Signal            = "PREPARING BUY";
+         bool goDirectBuy = g_HADirFlip || (UseNBBrain && g_HaNB_Trained && g_NBBuyProb >= NBHighThreshold);
+         if(goDirectBuy) {
+            g_Signal            = "BUY INCOMING";
+            g_ConfirmCandleOpen = iTime(_Symbol, PERIOD_M15, 1);
+         } else {
+            g_Signal            = "PREPARING BUY";
+         }
+         g_PrepStartTime      = TimeCurrent();
+         // v6.38: pre-cache confidence immediately at arm time so preflight has live score
+         g_ConfidenceStatic   = CalcConfidence(1, g_ZoneLabel, false, IsSideways(), g_NearLevel);
+         g_ConfidenceArmedBar = iTime(_Symbol, PERIOD_M15, 0);
+         if(goDirectBuy)
+            Print("DIRECT BUY INCOMING: ", (g_HADirFlip ? "bear->bull flip" : "NB high confidence"),
+                  " P(UP)=", DoubleToString(g_NBBuyProb,1), "%",
+                  " Consec=", g_HAConsecCount, " Conf=", DoubleToString(g_ConfidenceStatic, 1), "%");
+         else
+            Print("PREPARING BUY: bottomless bull candle (bar1).",
+                  " P(UP)=", DoubleToString(g_NBBuyProb,1), "%",
+                  " Consec=", g_HAConsecCount, "/", MaxConsecCandles,
+                  " Zone=", g_ZoneLabel, " Conf=", DoubleToString(g_ConfidenceStatic, 1), "%");
       }
-      g_PrepStartTime      = TimeCurrent();
-      // v6.38: pre-cache confidence immediately at arm time so preflight has live score
-      g_ConfidenceStatic   = CalcConfidence(1, g_ZoneLabel, false, IsSideways(), g_NearLevel);
-      g_ConfidenceArmedBar = iTime(_Symbol, PERIOD_M15, 0);
-      if(g_HADirFlip)
-         Print("FLIP FAST-ENTRY BUY: bear->bull momentum flip. First bottomless candle = BUY INCOMING.",
-               " Consec=", g_HAConsecCount, " Conf=", DoubleToString(g_ConfidenceStatic, 1), "%",
-               " NB gate applies in TryEntry.");
-      else
-         Print("PREPARING BUY: Bottomless bull candle detected (bar1). ",
-               "Consec=", g_HAConsecCount, "/", MaxConsecCandles,
-               " Boll=", DoubleToString(g_BollingerMid1, 5),
-               " Zone=", g_ZoneLabel, " Bias=", g_TotalBias,
-               " Conf=", DoubleToString(g_ConfidenceStatic, 1), "%",
-               " — waiting for next bull bar to confirm.");
    }
    // Step 2: setup armed → any bull candle (including further bottomless ones) is the confirming bar
    //         Normal gate: both HA body mids <= Boll midline.
@@ -5664,36 +5718,16 @@ void EvaluateHAPattern()
                      " bar1=", DoubleToString(_rcB1-_roB1,5), " bar2=", DoubleToString(_rcB2-_roB2,5),
                      " — waiting for real alignment.");
             } else if(!_realBull1 || !_realBull2) {
-               // One real candle conflicts — HA chain invalidated; reset count
-               g_HAConsecCount     = 0;
-               g_HABullSetup       = false;
-               g_ConfirmCandleOpen = 0;
-               realCandleOK        = false;
-               // Re-evaluate: do structural factors still support BUY?
-               int _reSS = 0; string _reR = "";
-               if(g_MacroStructLabel == "BULLISH")                      { _reSS++; _reR += "H4Bull "; }
-               if(g_StructureLabel   == "BULLISH")                      { _reSS++; _reR += "H1Bull "; }
-               if(g_MTFAligned && g_MacroStructLabel == "BULLISH")      { _reSS++; _reR += "MTF+ "; }
-               if(g_NearBullFVG)                                        { _reSS++; _reR += "FVG "; }
-               if(g_NearH4BullOB || g_BullOB_High > 0)                 { _reSS++; _reR += "OB "; }
-               if(g_LiquiditySweep && g_SweepDir == 1)                 { _reSS++; _reR += "Sweep "; }
-               if(g_MacroBOSActive && g_MacroStructLabel == "BULLISH")  { _reSS++; _reR += "MacroBOS "; }
-               if(g_TotalBias >= 1)                                     { _reSS++; _reR += "Bias+" + IntegerToString(g_TotalBias) + " "; }
-               StringTrimRight(_reR);
-               if(_reSS >= 2) {
-                  g_Signal             = "PREPARING BUY";
-                  g_SignalPendingReason = _reR + " (" + IntegerToString(_reSS) + " factors, conf "
-                                         + DoubleToString(g_Confidence,0) + "%) — HA reset, awaiting chain";
-                  Print("BUY: Real candle MIXED — bar1=", (_realBull1?"BULL":"BEAR"),
-                        " bar2=", (_realBull2?"BULL":"BEAR"),
-                        " — HA reset. Struct supports BUY [", _reR, "] PREPARING.");
-               } else {
-                  g_Signal             = "WAITING";
-                  g_SignalPendingReason = "";
-                  Print("BUY: Real candle MIXED — bar1=", (_realBull1?"BULL":"BEAR"),
-                        " bar2=", (_realBull2?"BULL":"BEAR"),
-                        " — HA reset. Insufficient factors (", _reSS, "), signal cleared to WAITING.");
-               }
+               // One real candle conflicts — hold in PREPARING (don't reset chain; single pullback candle is normal)
+               g_ConfirmCandleOpen  = 0;
+               realCandleOK         = false;
+               g_Signal             = "PREPARING BUY";
+               g_SignalPendingReason = "real-MIXED bar1=" + (_realBull1?"BULL":"BEAR")
+                                       + " bar2=" + (_realBull2?"BULL":"BEAR")
+                                       + " — awaiting real alignment";
+               Print("BUY: Real candle MIXED — bar1=", (_realBull1?"BULL":"BEAR"),
+                     " bar2=", (_realBull2?"BULL":"BEAR"),
+                     " — staying PREPARING (chain preserved, consec=", g_HAConsecCount, ")");
             }
          }
          if(bollOK && realCandleOK) {
@@ -5784,28 +5818,38 @@ void EvaluateHAPattern()
       g_ZoneContextUsed    = false;
       // Flip fast-entry: if bar2 was bullish (momentum flip), the first topless bear
       // candle is sufficient confirmation — skip PREPARING and go straight to SELL INCOMING.
-      // The NB brain gate in TryEntry still applies as the quality/probability filter.
-      if(g_HADirFlip) {
-         g_Signal            = "SELL INCOMING";
-         g_ConfirmCandleOpen = iTime(_Symbol, PERIOD_M15, 1);
+      // NB co-driver: if NB strongly agrees, also skip PREPARING.
+      // NB suppression: only veto when NB is MAJORITY-UP (>50%) AND P(DOWN)<NBMinPosterior
+      // AND this is NOT a flip (flips are the strongest HA signals — never NB-suppressed).
+      if(UseNBBrain && g_HaNB_Trained && !g_HADirFlip
+         && g_NBBuyProb > 50.0 && g_NBSellProb < NBMinPosterior) {
+         g_HABearSetup = false;   // undo — NB majority-UP vetoes this SELL setup
+         g_Signal      = "WAITING";
+         Print("[NB] SELL suppressed: P(DOWN)=", DoubleToString(g_NBSellProb,1),
+               "% < ", DoubleToString(NBMinPosterior,0), "% | P(UP)=", DoubleToString(g_NBBuyProb,1),
+               "% (majority-UP, not a flip)");
       } else {
-         g_Signal            = "PREPARING SELL";
+         bool goDirectSell = g_HADirFlip || (UseNBBrain && g_HaNB_Trained && g_NBSellProb >= NBHighThreshold);
+         if(goDirectSell) {
+            g_Signal            = "SELL INCOMING";
+            g_ConfirmCandleOpen = iTime(_Symbol, PERIOD_M15, 1);
+         } else {
+            g_Signal            = "PREPARING SELL";
+         }
+         g_PrepStartTime      = TimeCurrent();
+         // v6.38: pre-cache confidence immediately at arm time so preflight has live score
+         g_ConfidenceStatic   = CalcConfidence(-1, g_ZoneLabel, false, IsSideways(), g_NearLevel);
+         g_ConfidenceArmedBar = iTime(_Symbol, PERIOD_M15, 0);
+         if(goDirectSell)
+            Print("DIRECT SELL INCOMING: ", (g_HADirFlip ? "bull->bear flip" : "NB high confidence"),
+                  " P(DOWN)=", DoubleToString(g_NBSellProb,1), "%",
+                  " Consec=", g_HAConsecCount, " Conf=", DoubleToString(g_ConfidenceStatic, 1), "%");
+         else
+            Print("PREPARING SELL: topless bear candle (bar1).",
+                  " P(DOWN)=", DoubleToString(g_NBSellProb,1), "%",
+                  " Consec=", g_HAConsecCount, "/", MaxConsecCandles,
+                  " Zone=", g_ZoneLabel, " Conf=", DoubleToString(g_ConfidenceStatic, 1), "%");
       }
-      g_PrepStartTime      = TimeCurrent();
-      // v6.38: pre-cache confidence immediately at arm time so preflight has live score
-      g_ConfidenceStatic   = CalcConfidence(-1, g_ZoneLabel, false, IsSideways(), g_NearLevel);
-      g_ConfidenceArmedBar = iTime(_Symbol, PERIOD_M15, 0);
-      if(g_HADirFlip)
-         Print("FLIP FAST-ENTRY SELL: bull->bear momentum flip. First topless candle = SELL INCOMING.",
-               " Consec=", g_HAConsecCount, " Conf=", DoubleToString(g_ConfidenceStatic, 1), "%",
-               " NB gate applies in TryEntry.");
-      else
-         Print("PREPARING SELL: Topless bear candle detected (bar1). ",
-               "Consec=", g_HAConsecCount, "/", MaxConsecCandles,
-               " Boll=", DoubleToString(g_BollingerMid1, 5),
-               " Zone=", g_ZoneLabel, " Bias=", g_TotalBias,
-               " Conf=", DoubleToString(g_ConfidenceStatic, 1), "%",
-               " — waiting for next bear bar to confirm.");
    }
    else if(g_HABearSetup && dir1 == -1) {
       if(g_HAConsecCount <= MaxConsecCandles) {
@@ -5865,36 +5909,16 @@ void EvaluateHAPattern()
                      " bar1=", DoubleToString(_rcS1-_roS1,5), " bar2=", DoubleToString(_rcS2-_roS2,5),
                      " — waiting for real alignment.");
             } else if(!_realBear1 || !_realBear2) {
-               // One real candle conflicts — HA chain invalidated; reset count
-               g_HAConsecCount     = 0;
-               g_HABearSetup       = false;
-               g_ConfirmCandleOpen = 0;
-               realCandleOKS       = false;
-               // Re-evaluate: do structural factors still support SELL?
-               int _reSSS = 0; string _reRS = "";
-               if(g_MacroStructLabel == "BEARISH")                      { _reSSS++; _reRS += "H4Bear "; }
-               if(g_StructureLabel   == "BEARISH")                      { _reSSS++; _reRS += "H1Bear "; }
-               if(g_MTFAligned && g_MacroStructLabel == "BEARISH")      { _reSSS++; _reRS += "MTF- "; }
-               if(g_NearBearFVG)                                        { _reSSS++; _reRS += "FVG "; }
-               if(g_NearH4BearOB || g_BearOB_High > 0)                 { _reSSS++; _reRS += "OB "; }
-               if(g_LiquiditySweep && g_SweepDir == -1)                { _reSSS++; _reRS += "Sweep "; }
-               if(g_MacroBOSActive && g_MacroStructLabel == "BEARISH")  { _reSSS++; _reRS += "MacroBOS "; }
-               if(g_TotalBias <= -1)                                    { _reSSS++; _reRS += "Bias" + IntegerToString(g_TotalBias) + " "; }
-               StringTrimRight(_reRS);
-               if(_reSSS >= 2) {
-                  g_Signal             = "PREPARING SELL";
-                  g_SignalPendingReason = _reRS + " (" + IntegerToString(_reSSS) + " factors, conf "
-                                         + DoubleToString(g_Confidence,0) + "%) — HA reset, awaiting chain";
-                  Print("SELL: Real candle MIXED — bar1=", (_realBear1?"BEAR":"BULL"),
-                        " bar2=", (_realBear2?"BEAR":"BULL"),
-                        " — HA reset. Struct supports SELL [", _reRS, "] PREPARING.");
-               } else {
-                  g_Signal             = "WAITING";
-                  g_SignalPendingReason = "";
-                  Print("SELL: Real candle MIXED — bar1=", (_realBear1?"BEAR":"BULL"),
-                        " bar2=", (_realBear2?"BEAR":"BULL"),
-                        " — HA reset. Insufficient factors (", _reSSS, "), signal cleared to WAITING.");
-               }
+               // One real candle conflicts — hold in PREPARING (don't reset chain; single pullback candle is normal)
+               g_ConfirmCandleOpen  = 0;
+               realCandleOKS        = false;
+               g_Signal             = "PREPARING SELL";
+               g_SignalPendingReason = "real-MIXED bar1=" + (_realBear1?"BEAR":"BULL")
+                                       + " bar2=" + (_realBear2?"BEAR":"BULL")
+                                       + " — awaiting real alignment";
+               Print("SELL: Real candle MIXED — bar1=", (_realBear1?"BEAR":"BULL"),
+                     " bar2=", (_realBear2?"BEAR":"BULL"),
+                     " — staying PREPARING (chain preserved, consec=", g_HAConsecCount, ")");
             }
          }
          if(bollOK && realCandleOKS) {
@@ -6728,6 +6752,13 @@ void TryEntry()
    if(g_StartupGraceUntil > 0 && TimeCurrent() >= g_StartupGraceUntil) {
       Print("[STARTUP GRACE] expired — allowing entries");
       g_StartupGraceUntil = 0;
+      // Fresh NB retrain: model now has bars formed during the grace window
+      if(UseNBBrain) {
+         BuildAndTrainNBBrain();
+         CalcNBLiveProbs();
+         Print("[NB] Grace-end retrain complete — P(UP)=", DoubleToString(g_NBBuyProb,1),
+               "% P(DN)=", DoubleToString(g_NBSellProb,1), "% samples=", g_HaNB_SampleCount);
+      }
    }
 
    // === NO ENTRY AFTER HOUR ===
@@ -6900,53 +6931,6 @@ void TryEntry()
                           " — wait for clean close below zone";
          if(_hplMsg != g_LastBlockReason) { Print(_hplMsg); g_LastBlockReason = _hplMsg; }
          return;
-      }
-   }
-
-   // === M1/M5 TICK ALIGNMENT GATE ===
-   // The current forming M1 and M5 candle direction must align with the trade direction.
-   // If BOTH short-term candles oppose the trade direction, the HA signal is likely a
-   // smoothing artifact — real price action is moving the other way. Block the entry.
-   // MRV and MacroTrend rides are exempt (structural, not HA-chain based).
-   if(isTrendSignal && !isMeanRev && !isMacroTrend) {
-      double _bidNow = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-      double _m1O    = iOpen(_Symbol, PERIOD_M1, 0);
-      double _m5O    = iOpen(_Symbol, PERIOD_M5, 0);
-      // Use a 2-pip dead-band to avoid noise on flat ticks
-      int    _m1D    = (_m1O > 0) ? ((_bidNow > _m1O + _Point * 2) ? 1 : (_bidNow < _m1O - _Point * 2 ? -1 : 0)) : 0;
-      int    _m5D    = (_m5O > 0) ? ((_bidNow > _m5O + _Point * 2) ? 1 : (_bidNow < _m5O - _Point * 2 ? -1 : 0)) : 0;
-      bool   _m1OK   = (_m1D == 0 || _m1D == tradeDir);   // flat or aligned
-      bool   _m5OK   = (_m5D == 0 || _m5D == tradeDir);   // flat or aligned
-      if(!_m1OK && !_m5OK) {
-         // Both M1 and M5 actively oppose the trade direction
-         // v6.36: soft timeout — allow after 30 seconds with CAUTION instead of permanent block
-         if(g_M1M5BlockStart == 0) g_M1M5BlockStart = TimeCurrent();
-         int blockSecs = (int)(TimeCurrent() - g_M1M5BlockStart);
-         if(blockSecs < 30) {
-            string _brM = ((tradeDir == 1) ? "BUY" : "SELL") +
-                          " BLOCKED: M1=" + IntegerToString(_m1D) +
-                          " M5=" + IntegerToString(_m5D) +
-                          " oppose trade dir — waiting (" + IntegerToString(blockSecs) + "s/30s)";
-            if(_brM != g_LastBlockReason) { Print(_brM); g_LastBlockReason = _brM; }
-            return;
-         }
-         // Timeout expired — proceed with caution
-         string _tmM = ((tradeDir == 1) ? "BUY" : "SELL") +
-                       " M1M5 TIMEOUT: allowing entry after " + IntegerToString(blockSecs) + "s despite opposition";
-         if(_tmM != g_LastBlockReason) { Print(_tmM); g_LastBlockReason = _tmM; }
-      } else {
-         g_M1M5BlockStart = 0;  // reset timeout when alignment restored
-      }
-      if(!_m1OK || !_m5OK) {
-         // One TF aligned, one not — log once per bar as CAUTION
-         string _cautM = ((tradeDir == 1) ? "BUY" : "SELL") +
-                         " CAUTION: M1=" + IntegerToString(_m1D) +
-                         " M5=" + IntegerToString(_m5D) +
-                         " partial alignment (" + DoubleToString(_bidNow, 5) + ")";
-         if(_cautM != g_LastBlockReason && _canPrintBlock) {
-            Print(_cautM); g_LastBlockReason = _cautM;
-         }
-         // Proceed but note: impure HA quality with mixed M1/M5 = extra caution logged
       }
    }
 
@@ -7457,15 +7441,14 @@ void TryEntry()
       }
    }
 
-   // === MA50/20 TOUCH GATE (v6.34) ===
+   // === MA50/20 TOUCH GATE (v6.34 — advisory only) ===
    if(UseMAFilter && MA5020EntryRequired && g_MA50 > 0) {
       bool ma50OK = (tradeDir ==  1) ? (g_AboveMA50 || g_MA50Touch || g_MA50CrossUp)
                                      : (!g_AboveMA50 || g_MA50Touch || g_MA50CrossDn);
       if(!ma50OK) {
-         string _br = (tradeDir==1?"BUY":"SELL") + " blocked: MA50 not touched/crossed ("
-                      + g_MAStatusLabel + ") dist > " + DoubleToString(MA50TouchPips,1) + " pip";
+         string _br = (tradeDir==1?"BUY":"SELL") + " [MA50 CAUTION] not yet touched/crossed ("
+                      + g_MAStatusLabel + ") — proceeding (advisory only)";
          if(_br != g_LastBlockReason) { Print(_br); g_LastBlockReason = _br; }
-         return;
       }
       if(g_MA20Touch)
          Print("[MA20 BONUS] touching MA20 — extra entry quality | ", g_MAStatusLabel);
@@ -7577,26 +7560,14 @@ void TryEntry()
       return;
    }
 
-   // === NB BRAIN GATE — probabilistic second filter ===
-   // Computes P(WIN | zone, session, HA streak, volume, structure, FVG, OB, sweep)
-   // using a Naive Bayes model trained online from the last NB_LookbackBars of history.
-   // Rejects setups where historical evidence for this feature combination is weak.
-   if(UseNBBrain && NBMinPosterior > 0 && tradeDir != 0) {
-      double nbWin = CalcNBPosterior(tradeDir);
-      if(nbWin < NBMinPosterior) {
-         string _nbMsg = "NB BRAIN REJECTED: P(WIN)=" + DoubleToString(nbWin, 1) +
-                         "% < " + DoubleToString(NBMinPosterior, 1) +
-                         "% | Zone=" + zone +
-                         " HA=" + IntegerToString(g_HAConsecCount) +
-                         " Vol=" + g_VolumeState +
-                         " Struct=" + g_StructureLabel;
-         if(_nbMsg != g_LastBlockReason) { Print(_nbMsg); g_LastBlockReason = _nbMsg; }
-         return;
-      }
-      Print("[NB BRAIN] P(WIN)=", DoubleToString(nbWin, 1),
-            "% LOSS=", DoubleToString(g_NBPosteriorLoss, 1),
-            "% HOLD=", DoubleToString(g_NBPosteriorHold, 1),
-            "% — gate passed (min ", DoubleToString(NBMinPosterior, 1), "%)");
+   // === NB BRAIN — entry audit log ===
+   // NB posteriors are computed every bar and have already co-driven signal arming
+   // in EvaluateHAPattern. Log current NB values at entry time for audit only.
+   if(UseNBBrain && g_HaNB_Trained) {
+      Print("[NB] Entry P(UP)=", DoubleToString(g_NBBuyProb,1),
+            "% P(DOWN)=", DoubleToString(g_NBSellProb,1),
+            "% P(NTRL)=", DoubleToString(g_NBPosteriorHold,1),
+            "% | dir=", tradeDir, " pred=", g_NBPredDir);
    }
 
    // === STRUCTURAL STOP-LOSS ===
@@ -7760,37 +7731,6 @@ void TryEntry()
    tag = tag + "_C" + confStr
              + "_SL" + DoubleToString(g_DynamicSL_USD, 2)
              + "_TP" + DoubleToString(g_DynamicTP_USD, 2);
-
-   // === CANDLE OPEN ALIGNMENT GATE ===
-   // For a SELL: the current execution price (bid) must be BELOW the open of the current
-   // M15 bar AND below the open of the previous M15 bar — entering a sell on a rising
-   // (green/bull) candle means price is above its own open, which is adverse momentum.
-   // For a BUY: the ask must be ABOVE both opens — selling into a green open or buying
-   // into a red open are both entry-quality failures.
-   // Exempt: MRV and MacroTrend rides use structural logic; this gate targets trend signals.
-   if(isTrendSignal && !isMeanRev && !isMacroTrend) {
-      double _openBar0 = iOpen(_Symbol, PERIOD_M15, 0);  // forming candle open
-      double _openBar1 = iOpen(_Symbol, PERIOD_M15, 1);  // last confirmed candle open
-      if(_openBar0 > 0 && _openBar1 > 0) {
-         bool _candleAligned = false;
-         if(tradeDir == 1) {
-            // BUY: ask must be above both opens (bullish momentum confirmed by price)
-            _candleAligned = (ask > _openBar0 && ask > _openBar1);
-         } else {
-            // SELL: bid must be below both opens (bearish momentum confirmed by price)
-            _candleAligned = (bid < _openBar0 && bid < _openBar1);
-         }
-         if(!_candleAligned) {
-            string _brCA = (tradeDir == 1 ? "BUY" : "SELL") + " blocked: candle-open misalignment"
-                           + " | price=" + DoubleToString(tradeDir == 1 ? ask : bid, 5)
-                           + " barOpen0=" + DoubleToString(_openBar0, 5)
-                           + " barOpen1=" + DoubleToString(_openBar1, 5)
-                           + " (entering against candle direction)";
-            if(_brCA != g_LastBlockReason) { Print(_brCA); g_LastBlockReason = _brCA; }
-            return;
-         }
-      }
-   }
 
    // === EXECUTE ===
    // v6.36: spread filter — block when spread is too wide (news, illiquid)
@@ -9084,12 +9024,14 @@ void UpdateDashboard()
             _nbStr = "  [NB BRAIN] training...";
             _nbClr = clrSilver;
          } else {
-            _nbStr = "  [NB]  WIN=" + DoubleToString(g_NBPosteriorWin,0)
-                   + "%  LOSS=" + DoubleToString(g_NBPosteriorLoss,0)
-                   + "%  HOLD=" + DoubleToString(g_NBPosteriorHold,0) + "%"
-                   + (g_HADirFlip ? "  [FLIP]" : "");
-            _nbClr = (g_NBPosteriorWin >= NBMinPosterior) ? clrLime
-                   : (g_NBPosteriorWin > 0)              ? clrOrange : clrSilver;
+            string _nbDir = (g_NBPredDir == 1) ? "  [^UP]" : (g_NBPredDir == -1) ? "  [vDN]" : "";
+            _nbStr = "  [NB]  BUY=" + DoubleToString(g_NBBuyProb,0)
+                   + "%  SELL=" + DoubleToString(g_NBSellProb,0)
+                   + "%  NTRL=" + DoubleToString(g_NBPosteriorHold,0) + "%"
+                   + _nbDir + (g_HADirFlip ? "  [FLIP]" : "");
+            _nbClr = (g_NBPredDir ==  1) ? clrLime
+                   : (g_NBPredDir == -1) ? clrOrangeRed
+                   : clrSilver;
          }
          DashLine("02_nb_inline", _nbStr, cx, cy, row, lh, corner, _nbClr, 9); row++;
       } else {

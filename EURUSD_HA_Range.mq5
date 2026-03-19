@@ -9500,6 +9500,28 @@ void UpdateDashboard()
    int rowR = 0;
 
    DashLine("R_title", "[ TRADE & STATS ]",  rx, cy, rowR, lh, corner, clrWhite, 10); rowR++;
+
+   // --- NB Brain posteriors (always shown when UseNBBrain is enabled) ---
+   if(UseNBBrain) {
+      string _nbR_str;
+      color  _nbR_clr;
+      if(!g_HaNB_Trained) {
+         _nbR_str = "[NB Brain] training...";
+         _nbR_clr = clrSilver;
+      } else {
+         string _dir = (g_NBPredDir == 1) ? " ^UP" : (g_NBPredDir == -1) ? " vDN" : " ~NTR";
+         _nbR_str = "NB Brain:" + _dir
+                  + "  UP="   + DoubleToString(g_NBBuyProb,       1) + "%"
+                  + "  DN="   + DoubleToString(g_NBSellProb,      1) + "%"
+                  + "  NTRL=" + DoubleToString(g_NBPosteriorHold, 1) + "%";
+         _nbR_clr = (g_NBPredDir ==  1) ? clrLime
+                  : (g_NBPredDir == -1) ? clrOrangeRed
+                  : clrSilver;
+      }
+      DashLine("R_nb_priors", _nbR_str, rx, cy, rowR, lh, corner, _nbR_clr, 9); rowR++;
+   } else {
+      DashLine("R_nb_priors", "", rx, cy, rowR, lh, corner, clrGray, 8); rowR++;
+   }
    rowR++;
 
    // --- Trade Status (ALL rows ALWAYS rendered — prevents label overlap) ---

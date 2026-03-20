@@ -339,6 +339,9 @@ input int    NB_RetrainBars    = 1;      // Retrain every N new bars (1 = every 
 input bool   NBSessionTrain    = true;   // Train separate NB model per session (Asian/London/NY)
 input bool   NBOnlineLearn     = true;   // Online reinforcement: refine model from each bar outcome
 input double NBOnlineWeight    = 0.15;   // Max blend weight of online updates vs batch (0=off, 0.5=max)
+input bool   LowConvictionTPEnabled = true;  // When NB contradicts/is weak at entry, cap TP tightly
+input double LowConvictionMaxTP     = 1.0;   // TP cap ($) per 0.01 lot for low-conviction entries
+input double LowConvictionNBThresh  = 20.0;  // NB trade-dir P(%) below this = weak/contradicted
 
 //=== GLOBALS ===
 
@@ -546,6 +549,7 @@ string g_VolumeState   = "NORMAL";           // "HIGH" / "ABOVE_AVG" / "NORMAL" 
 double g_VolRatio      = 1.0;               // current vol / average vol
 bool   g_VolDivergence = false;              // price trending but volume declining
 bool   g_DivergenceCaution = false;          // true when TP was capped due to MTF/volume divergence
+bool   g_IsLowConviction   = false;          // true when NB contradicts or is weak — TP capped at LowConvictionMaxTP
 bool   g_RealCandleAligned = false;          // v6.29: true when real candle direction matches HA on bars 1 & 2
 string g_LastBlockReason   = "";             // last TryEntry block message — only print when it changes
 
@@ -8395,6 +8399,28 @@ void TryEntry()
       }
    }
 
+   // === LOW CONVICTION TP CAP ===
+   // When the NB model contradicts the trade direction (predicts opposite) or the probability
+   // in the trade direction is very low, we allow the entry (other gates passed) but cap TP
+   // at LowConvictionMaxTP ($1.00/0.01 lot by default) — take what the market gives quickly.
+   g_IsLowConviction = false;
+   if(LowConvictionTPEnabled && UseNBBrain && g_HaNB_Trained) {
+      double _lcProb   = (tradeDir == 1) ? g_NBBuyProb  : g_NBSellProb;
+      double _lcOppProb = (tradeDir == 1) ? g_NBSellProb : g_NBBuyProb;
+      bool   _nbOpposes = (g_NBPredDir == -tradeDir);          // NB calls the opposite side
+      bool   _nbWeak    = (_lcProb < LowConvictionNBThresh);   // trade-dir probability too low
+      if(_nbOpposes || _nbWeak) {
+         g_IsLowConviction   = true;
+         double _lcCap       = MathMin(baseTpUSD, LowConvictionMaxTP);
+         _lcCap              = MathMax(_lcCap, g_DynamicSL_USD * 0.5);  // floor: 0.5:1 R:R minimum
+         Print("[LOW CONVICTION TP] NB ", (_nbOpposes ? "OPPOSES" : "WEAK"),
+               ": P(trade)=", DoubleToString(_lcProb, 1), "% P(opp)=", DoubleToString(_lcOppProb, 1),
+               "% → TP capped $", DoubleToString(_lcCap, 2), " (was $", DoubleToString(baseTpUSD, 2), ")");
+         baseTpUSD       = _lcCap;
+         g_DynamicTP_USD = baseTpUSD;
+      }
+   }
+
    // Scale SL/TP by lot size
    double slUSD = g_DynamicSL_USD * scale;
    double tpUSD = baseTpUSD * scale;
@@ -8411,6 +8437,7 @@ void TryEntry()
                                : (tradeDir==1 ? "HA_BUY_v6"      : "HA_SELL_v6");
    if(HAEntryMode == 1 || isMacroTrend) tag = tag + "_E";
    if(g_DivergenceCaution)  tag = tag + "_DV";   // divergence-caution marker
+   if(g_IsLowConviction)    tag = tag + "_LC";   // low-conviction NB cap marker
    tag = tag + "_C" + confStr
              + "_SL" + DoubleToString(g_DynamicSL_USD, 2)
              + "_TP" + DoubleToString(g_DynamicTP_USD, 2);

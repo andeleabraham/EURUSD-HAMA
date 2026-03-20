@@ -29,6 +29,10 @@ input double MinSL_USD        = 0.50;   // Minimum SL per 0.01 lot — floor avo
 input double MaxSL_USD        = 1.25;   // Hard SL cap per 0.01 lot (~12.5 pips) — a bad entry is costly; don't give more away
 input double RRRatio          = 1.8;    // Reward:Risk ratio (1.8 = for every $1 risk, target $1.80)
 input double MaxTP_USD        = 2.50;   // Hard TP ceiling per 0.01 lot — 2.0-2.5 USD is statistically achievable; beyond this risks missing the exit
+// Stop-loss options — UseSL=false: no broker SL order; trade closed at profit or EOD (never overnight)
+input bool   UseSL             = true;   // true=place broker SL; false=manage exit manually (EOD close enforced)
+input int    EODCloseHour      = 21;     // When UseSL=false: force-close any open trade at this hour (server time)
+input double SLBufferPips      = 2.0;   // Extra pip cushion added to structural SL for breathing room (TP unchanged)
 // Lock/trail are now proportional to the dynamic SL, not fixed per tier
 input double LockPct          = 0.75;   // Lock profit at 75% of TP — only secure near-target profits
 input double TrailPct         = 0.30;   // Trail gap = 30% of TP — generous room to fluctuate
@@ -67,6 +71,11 @@ input group "=== TIME FILTERS ==="
 input int    MaxHoldBars      = 48;     // Max 15M bars to hold = 12 hours — give trades room to develop
 input int    SidewaysBars     = 8;      // Bars to check for compressed/sideways range
 input double SidewaysPips     = 15;     // If range < this many pips over SidewaysBars = sideways
+
+input group "=== SESSION TRADING MODE ==="
+// Restricts NEW trade entries to selected sessions. Open trades continue and are closed by SL/TP or EOD.
+// 0=All sessions (default)  1=Asian only  2=London only  3=Asian+London
+input int    SessionMode       = 0;      // 0=All | 1=Asian | 2=London | 3=Asian+London
 
 input group "=== SESSION TIMES (Broker Server Time) ==="
 input int    AsianStartHour   = 0;
@@ -133,6 +142,11 @@ input group "=== DAILY EXTENSION CAP ==="
 input bool   UseDailyExtCap        = true;   // Toggle daily extension cap
 input double DailyExtCapPct        = 30.0;   // % of D1 ATR: block if current move from open exceeds this
 input int    MaxConsecCandles    = 4;
+// Spike candle filter: a single HA candle whose total range exceeds SpikeATRMult × ATR is an
+// abnormal impulse (often news-driven). Skip arming the setup; reset the counter so the NEXT
+// two clean candles become the fresh pattern.
+input bool   InvalidateSpikeCandles = true;   // Skip spike HA candles as setup triggers
+input double SpikeATRMult           = 2.0;    // HA total range > N×ATR = spike (2.0 = 200% of ATR)
 input bool   TrendBoldEnabled    = true;   // Evaluate trend bold bet when MaxConsecCandles exceeded (instead of hard reset)
 input int    SmallBoldMinScore   = 4;      // Min confluence score (0-10) for SMALL_BOLD tier (conservative TP)
 input int    HugeBoldMinScore    = 7;      // Min score for HUGE_BOLD tier (TP chases full CI boundary)
@@ -254,6 +268,15 @@ input bool   ZAPFastTrack       = true;    // First HA candle at zone → direct
 input int    ZAPMaxBars         = 12;      // ZAP expiry: bars without HA confirmation (12 = 3 hours)
 input double ZAPFakeoutPips     = 5.0;     // Pips past zone boundary = liquidity sweep (fakeout signal)
 input bool   UseZoneConfluence  = true;    // Use zone confluence % to lower confidence threshold
+// Quick-entry combo: when ZAP is armed AND Asian bias is established in the SAME direction,
+// the confidence gate drops to AsianZAPMinConf — these setups are historically clean.
+// The full confidence model still scores the trade; this just lowers the bar at which it fires.
+input bool   QuickEntryEnabled  = true;    // Enable lower confidence gate for ZAP+AsianBias+HA confluence
+input double AsianZAPMinConf    = 22.0;   // Minimum confidence when ZAP+AsianBias fully aligned (Asian session)
+// EURUSD 3-4AM momentum window: direction established in this window tends to follow through
+// cleanly for 1-3 USD per 0.01 lot. Give an additional confidence bonus for signals in that hour.
+input bool   AM34BonusEnabled   = true;   // Extra confidence for 3-4 AM signals (Asian continuation/flip hour)
+input double AM34BonusPts       = 8.0;    // Confidence bonus when signal fires between 3:00 and 4:00 server time
 
 input group "=== ATR & RANGE CONFIDENCE ==="
 input int    ATRPeriod        = 14;
@@ -1373,6 +1396,26 @@ void OnTick()
                   Print("FRIDAY CLOSE: closing before weekend | P&L=$", DoubleToString(pnl, 2));
                   trade.PositionClose(posInfo.Ticket());
                   ResetTradeGlobals(pnl);
+               }
+            }
+         }
+      }
+   }
+
+   // === v7.00: UseSL=false — EOD FORCE CLOSE ===
+   // When the user runs without a broker SL, every open trade MUST be closed before
+   // the end of day so no position is held overnight. Fires at EODCloseHour.
+   if(!UseSL && g_TradeOpen) {
+      MqlDateTime _eodDt; TimeToStruct(TimeCurrent(), _eodDt);
+      if(_eodDt.hour >= EODCloseHour) {
+         for(int _ei = PositionsTotal() - 1; _ei >= 0; _ei--) {
+            if(posInfo.SelectByIndex(_ei)) {
+               if(posInfo.Symbol() == _Symbol && posInfo.Magic() == 202502) {
+                  double _eodPnl = posInfo.Commission() + posInfo.Swap() + posInfo.Profit();
+                  Print("[EOD CLOSE] No-SL mode: closing trade at hour ", _eodDt.hour,
+                        " | P&L=$", DoubleToString(_eodPnl, 2));
+                  trade.PositionClose(posInfo.Ticket());
+                  ResetTradeGlobals(_eodPnl);
                }
             }
          }
@@ -4992,6 +5035,16 @@ double CalcStructuralSL(int tradeDir)
    adjTP = MathMax(adjSL * 1.0, adjTP);   // TP floor = 1:1 R:R
    adjTP = MathMin(adjTP, MaxTP_USD);      // hard cap — statistically achievable targets
 
+   // v7.00: SLBufferPips — add extra breathing room past the structural SL
+   // This prevents the SL being hit by normal noise just beyond the HA edge.
+   // TP is NOT adjusted (keeps R:R conservative on the risk side).
+   if(SLBufferPips > 0) {
+      double bufferUSD = SLBufferPips * 0.10;   // $0.10 per pip per 0.01 lot
+      adjSL += bufferUSD;
+      // Allow buffer to push slightly past MaxSL (user chose the buffer intentionally)
+      adjSL = MathMin(adjSL, MaxSL_USD + bufferUSD);
+   }
+
    // Store globally
    g_DynamicSL_USD = adjSL;
    g_DynamicTP_USD = adjTP;
@@ -5873,6 +5926,24 @@ void EvaluateHAPattern()
    // Step 1: bottomless bull → arm the setup (only if NOT already armed)
    // A 2nd/3rd consecutive bottomless candle falls to Step 2 as confirmation.
    if(bl1 && dir1 == 1 && !g_HABullSetup) {
+      // --- SPIKE CANDLE FILTER v7.00 ---
+      // A single long impulse candle (range > SpikeATRMult × ATR) is often a news/stop-hunt
+      // spike, typically followed by a reversal or consolidation that eats the SL.
+      // Skip the setup arm; reset the counter so the NEXT two candles form a fresh read.
+      if(InvalidateSpikeCandles && g_ATR > 0) {
+         double _haOS, _haHS, _haLS, _haCS;
+         CalcHA(1, _haOS, _haHS, _haLS, _haCS);
+         double _spikeRange = _haHS - _haLS;
+         if(_spikeRange > SpikeATRMult * g_ATR) {
+            Print("[SPIKE BUY] Bar1 HA range ", DoubleToString(_spikeRange/_Point/10.0,1),
+                  "pip > ", DoubleToString(SpikeATRMult,1), "×ATR=",
+                  DoubleToString(SpikeATRMult*g_ATR/_Point/10.0,1),
+                  "pip — SPIKE invalidated, counter reset, awaiting 2 clean candles");
+            g_HAConsecCount = 0;
+            g_Signal        = "WAITING";
+            return;
+         }
+      }
       g_HABullSetup        = true;
       g_HABearSetup        = false;
       g_ConfirmCandleOpen  = 0;
@@ -6071,6 +6142,21 @@ void EvaluateHAPattern()
 
    // === SELL SETUP STATE MACHINE ===
    else if(tl1 && dir1 == -1 && !g_HABearSetup) {
+      // --- SPIKE CANDLE FILTER v7.00 ---
+      if(InvalidateSpikeCandles && g_ATR > 0) {
+         double _haOSs, _haHSs, _haLSs, _haCss;
+         CalcHA(1, _haOSs, _haHSs, _haLSs, _haCss);
+         double _spikeRangeS = _haHSs - _haLSs;
+         if(_spikeRangeS > SpikeATRMult * g_ATR) {
+            Print("[SPIKE SELL] Bar1 HA range ", DoubleToString(_spikeRangeS/_Point/10.0,1),
+                  "pip > ", DoubleToString(SpikeATRMult,1), "×ATR=",
+                  DoubleToString(SpikeATRMult*g_ATR/_Point/10.0,1),
+                  "pip — SPIKE invalidated, counter reset, awaiting 2 clean candles");
+            g_HAConsecCount = 0;
+            g_Signal        = "WAITING";
+            return;
+         }
+      }
       g_HABearSetup        = true;
       g_HABullSetup        = false;
       g_ConfirmCandleOpen  = 0;
@@ -6715,6 +6801,27 @@ string ClassifyZone(double price)
 //| Is the market currently in a sideways / compressed state?        |
 //| Checks the H-L range of last N bars                              |
 //+------------------------------------------------------------------+
+//+------------------------------------------------------------------+
+//| SESSION GATE v7.00                                               |
+//| Returns true when the current broker time is inside the session  |
+//| mode selected by the user. Only NEW trade ENTRIES are gated here.|
+//| Open trades always continue (closed at SL/TP or EOD).           |
+//+------------------------------------------------------------------+
+bool IsInAllowedSession()
+{
+   if(SessionMode == 0) return true;   // All sessions — no restriction
+   MqlDateTime _sgDt; TimeToStruct(TimeCurrent(), _sgDt);
+   int h = _sgDt.hour;
+   bool _inAsian  = (h >= AsianStartHour  && h < AsianEndHour);
+   bool _inLondon = (h >= LondonStartHour && h < LondonEndHour);
+   switch(SessionMode) {
+      case 1: return _inAsian;                     // Asian only
+      case 2: return _inLondon;                    // London only
+      case 3: return (_inAsian || _inLondon);      // Asian + London
+   }
+   return true;
+}
+
 bool IsSideways()
 {
    if(SidewaysBars <= 0) return false;
@@ -6910,6 +7017,20 @@ bool LiveHABollingerOK(int tradeDir)
 void TryEntry()
 {
    if(g_TradeOpen) return;
+
+   // v7.00: SESSION MODE GATE — block new entries outside the user-selected session(s)
+   if(SessionMode != 0 && !IsInAllowedSession()) {
+      static datetime _sessBlockBar = 0;
+      if(iTime(_Symbol, PERIOD_M15, 0) != _sessBlockBar) {
+         MqlDateTime _sbDt; TimeToStruct(TimeCurrent(), _sbDt);
+         string _modeName[] = {"All","Asian","London","Asian+London"};
+         Print("[SESSION GATE] New entries blocked — hour=", _sbDt.hour,
+               " mode=", _modeName[MathMin(SessionMode,3)],
+               " (open trades continue unaffected)");
+         _sessBlockBar = iTime(_Symbol, PERIOD_M15, 0);
+      }
+      return;
+   }
 
    // v6.36: equity drawdown protection
    if(MaxDrawdownPct > 0 && g_PeakEquity > 0) {
@@ -7826,6 +7947,30 @@ void TryEntry()
       effectiveMinConf = MathMax(MinConfidence - 10.0, MinConfidence * 0.80);
    else if(UseZAP && g_ZAPActive && g_ZAPDir == tradeDir && g_ZAPScore >= ZAPMinScore)
       effectiveMinConf = MathMax(MinConfidence - 5.0, MinConfidence * 0.88);
+
+   // v7.00: QUICK ENTRY — ZAP + Asian Bias perfectly aligned = drop gate to AsianZAPMinConf.
+   // Asian bias signals are historically clean and follow through for 1-3 USD per 0.01 lot.
+   // This ensures the bot does NOT miss well-confirmed Asian-session setups due to slow trackers.
+   bool _quickCombo = QuickEntryEnabled && g_AsianBiasActive && g_AsianBiasDir == tradeDir
+                      && g_ZAPActive && g_ZAPDir == tradeDir && g_ZAPScore >= ZAPMinScore;
+   if(_quickCombo) {
+      effectiveMinConf = MathMin(effectiveMinConf, AsianZAPMinConf);
+      Print("[QUICK ENTRY] ZAP+AsianBias aligned — gate lowered to AsianZAPMinConf=",
+            DoubleToString(AsianZAPMinConf,0), "% (conf=", DoubleToString(confidence,1), "%)");
+   }
+
+   // v7.00: 3-4 AM BONUS — signals in this window are continuation/flip patterns in Asian
+   // session, typically giving a clean trend before London open. Add confidence bonus.
+   if(AM34BonusEnabled && AM34BonusPts > 0) {
+      MqlDateTime _amDt; TimeToStruct(TimeCurrent(), _amDt);
+      if(_amDt.hour >= 3 && _amDt.hour < 4) {
+         confidence += AM34BonusPts;
+         confidence  = MathMin(confidence, 100.0);
+         Print("[3-4AM BONUS] +", DoubleToString(AM34BonusPts,0),
+               " conf pts (Asian momentum window) → new conf=", DoubleToString(confidence,1), "%");
+      }
+   }
+
    if(confidence < effectiveMinConf) {
       Print("ENTRY REJECTED: confidence ", DoubleToString(confidence, 1),
             "% < effective min ", DoubleToString(effectiveMinConf, 1), "%",
@@ -8019,18 +8164,18 @@ void TryEntry()
    g_LastBlockReason = "";   // block cleared — trade is actually firing
    bool ok = false;
    if(tradeDir == 1) {
-      double sl = NormalizeDouble(ask - slDist, _Digits);
+      double sl = UseSL ? NormalizeDouble(ask - slDist, _Digits) : 0;   // v7.00: UseSL=false → no broker SL
       double tp = NormalizeDouble(ask + tpDist, _Digits);
       Print("Attempting ", tag, " | Conf:", DoubleToString(confidence,1), "% Zone:", zone,
-            " Lot:", lot, " Ask:", ask, " SL:", sl, " TP:", tp,
-            " SL$:", DoubleToString(g_DynamicSL_USD,2), " TP$:", DoubleToString(baseTpUSD,2));
+            " Lot:", lot, " Ask:", ask, " SL:", (UseSL ? DoubleToString(sl,_Digits) : "NONE (EOD)"),
+            " TP:", tp, " SL$:", DoubleToString(g_DynamicSL_USD,2), " TP$:", DoubleToString(baseTpUSD,2));
       ok = trade.Buy(lot, _Symbol, ask, sl, tp, tag);
    } else {
-      double sl = NormalizeDouble(bid + slDist, _Digits);
+      double sl = UseSL ? NormalizeDouble(bid + slDist, _Digits) : 0;   // v7.00: UseSL=false → no broker SL
       double tp = NormalizeDouble(bid - tpDist, _Digits);
       Print("Attempting ", tag, " | Conf:", DoubleToString(confidence,1), "% Zone:", zone,
-            " Lot:", lot, " Bid:", bid, " SL:", sl, " TP:", tp,
-            " SL$:", DoubleToString(g_DynamicSL_USD,2), " TP$:", DoubleToString(baseTpUSD,2));
+            " Lot:", lot, " Bid:", bid, " SL:", (UseSL ? DoubleToString(sl,_Digits) : "NONE (EOD)"),
+            " TP:", tp, " SL$:", DoubleToString(g_DynamicSL_USD,2), " TP$:", DoubleToString(baseTpUSD,2));
       ok = trade.Sell(lot, _Symbol, bid, sl, tp, tag);
    }
 
@@ -9524,6 +9669,23 @@ void UpdateDashboard()
       color  abClr = g_AsianBiasActive ? (g_AsianBiasDir == 1 ? clrLime : clrTomato) : clrGray;
       string abStr = g_AsianBiasActive ? g_AsianBiasLabel : "IDLE";
       DashLine("10z_asian", "AsianBias: " + abStr,                               cx, cy, row, lh, corner, abClr,        9); row++;
+   }
+   // Session mode + SL mode + quick entry indicator (v7.00)
+   {
+      string _smNames[] = {"ALL","ASIAN","LONDON","ASIAN+LON"};
+      string _sessStr = _smNames[MathMin(SessionMode, 3)];
+      bool   _inAllowed = IsInAllowedSession();
+      color  _sessClr = _inAllowed ? clrLime : clrDimGray;
+      string _slStr   = UseSL ? ("SL=" + DoubleToString(SLBufferPips,0) + "pip buf") : ("NO-SL EOD@" + IntegerToString(EODCloseHour) + "h");
+      DashLine("10z_sess",  "Session : " + _sessStr + " (" + (_inAllowed?"OPEN":"CLOSED") + ") | " + _slStr,
+                                                                                 cx, cy, row, lh, corner, _sessClr,     8); row++;
+      if(QuickEntryEnabled) {
+         bool _qcActive = g_AsianBiasActive && g_ZAPActive && (g_AsianBiasDir == g_ZAPDir);
+         color _qcClr   = _qcActive ? clrGold : clrDimGray;
+         string _qcStr  = _qcActive ? StringFormat("ARMED dir=%s gate=%.0f%%",
+                                                    (g_ZAPDir==1?"BUY":"SELL"), AsianZAPMinConf) : "IDLE";
+         DashLine("10z_qe",  "QuickEnt: " + _qcStr,                             cx, cy, row, lh, corner, _qcClr,       8); row++;
+      }
    }
    row++;
 

@@ -5304,7 +5304,7 @@ void DetectZoneApproach()
    if(newDir != 0) {
       string newLbl  = (newDir == 1) ? buyZones  : sellZones;
       int    newScr  = (newDir == 1) ? buyScore  : sellScore;
-      if(StringLen(newLbl) > 0) newLbl = StringTrimRight(newLbl);
+      if(StringLen(newLbl) > 0) StringTrimRight(newLbl);
       if(!g_ZAPActive || g_ZAPDir != newDir) {
          g_ZAPActive    = true;
          g_ZAPDir       = newDir;

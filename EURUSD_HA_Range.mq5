@@ -336,6 +336,9 @@ input int    NB_LookbackBars   = 100;    // M15 bars of training history (100 = 
 input int    NB_Lookahead      = 2;      // Bars ahead for label (2 = 30 min)
 input double NB_WinMultiplier  = 0.9;   // UP/DOWN label if |move| >= ATR * this within lookahead
 input int    NB_RetrainBars    = 1;      // Retrain every N new bars (1 = every bar, freshest model)
+input bool   NBSessionTrain    = true;   // Train separate NB model per session (Asian/London/NY)
+input bool   NBOnlineLearn     = true;   // Online reinforcement: refine model from each bar outcome
+input double NBOnlineWeight    = 0.15;   // Max blend weight of online updates vs batch (0=off, 0.5=max)
 
 //=== GLOBALS ===
 
@@ -699,6 +702,21 @@ int    g_HaNB_BarCounter  = 0;     // bars elapsed since last retrain
 bool   g_HaNB_Trained     = false; // true once model has been trained at least once
 int    g_hNB_MA10         = INVALID_HANDLE;  // persistent SMA10 for NB training
 int    g_hNB_MA30         = INVALID_HANDLE;  // persistent SMA30 for NB training
+// Session-stratified NB: separate model per session (0=Asian / 1=London / 2=NY)
+double g_HaNB_Prior_S[3][HA_NB_CLASSES];
+double g_HaNB_Likelihood_S[3][HA_NB_CLASSES][HA_NB_FEATURES][HA_NB_MAX_BINS];
+int    g_HaNB_SampleCount_S[3];            // training samples per session model
+bool   g_HaNB_Trained_S[3];               // true once each session model has been trained
+int    g_CurNBSessionIdx    = 3;           // current session (0=Asian/1=London/2=NY/3=Off)
+int    g_PrevNBSessionIdx   = 3;           // previous session (detect crossings for retrain)
+// Online reinforcement accumulator (updated each bar, blended into live inference)
+int    g_OL_ClassCounts[3][HA_NB_CLASSES];
+int    g_OL_FCounts[3][HA_NB_CLASSES][HA_NB_FEATURES][HA_NB_MAX_BINS];
+int    g_OL_TotalUpdates[3];               // total live updates since last batch retrain per session
+// Previous-bar state for online labelling
+int    g_PrevBarFeats[HA_NB_FEATURES];
+int    g_PrevBarNBDir    = 0;
+bool   g_PrevBarFeatValid = false;
 double g_DynamicSL_USD    = 2.0;           // structural SL for current setup (per 0.01 lot)
 double g_DynamicTP_USD    = 3.6;           // calculated TP = SL × RRRatio (per 0.01 lot)
 
@@ -1317,7 +1335,10 @@ int OnInit()
    // NB Brain: initialise + warm-up train + immediately compute live posteriors
    if(UseNBBrain) {
       InitNBBrain();          // bins, uniform priors, create persistent MA handles
-      BuildAndTrainNBBrain(); // initial train on NB_LookbackBars of history
+      if(NBSessionTrain) {    // pre-train all 3 session models on startup
+         for(int _si = 0; _si < 3; _si++) BuildAndTrainNBBrain_Session(_si);
+      }
+      BuildAndTrainNBBrain(); // always train global model as fallback
       CalcNBLiveProbs();      // immediately sets g_NBBuyProb/SellProb for dashboard
    }
 
@@ -4046,6 +4067,24 @@ void InitNBBrain()
    g_HaNB_BarCounter = 0;
    g_NBBuyProb = g_NBSellProb = 0.0;
    g_NBPredDir = 0;
+   // Initialise session-stratified model state
+   for(int _s_ = 0; _s_ < 3; _s_++) {
+      g_HaNB_Trained_S[_s_]     = false;
+      g_HaNB_SampleCount_S[_s_] = 0;
+      g_OL_TotalUpdates[_s_]    = 0;
+      for(int _c_ = 0; _c_ < HA_NB_CLASSES; _c_++) {
+         g_HaNB_Prior_S[_s_][_c_] = 1.0 / HA_NB_CLASSES;
+         g_OL_ClassCounts[_s_][_c_] = 0;
+         for(int _f_ = 0; _f_ < HA_NB_FEATURES; _f_++)
+            for(int _v_ = 0; _v_ < HA_NB_MAX_BINS; _v_++) {
+               g_HaNB_Likelihood_S[_s_][_c_][_f_][_v_] = 1.0 / g_HaNB_FeatureBins[_f_];
+               g_OL_FCounts[_s_][_c_][_f_][_v_] = 0;
+            }
+      }
+   }
+   g_PrevBarFeatValid = false;
+   g_CurNBSessionIdx  = 3;
+   g_PrevNBSessionIdx = 3;
    // Persistent MA handles for training loop — avoids per-bar iMA() overhead
    if(g_hNB_MA10 == INVALID_HANDLE)
       g_hNB_MA10 = iMA(_Symbol, PERIOD_M15, 10, 0, MODE_SMA, PRICE_CLOSE);
@@ -4368,10 +4407,156 @@ void BuildAndTrainNBBrain()
          "% P(NEUTRAL)=", DoubleToString(g_HaNB_Prior[2]*100,1), "%");
 }
 
+// Train an NB model using ONLY historical bars from session sessIdx (0=Asian/1=London/2=NY).
+// Filters the same NB_LookbackBars window by session hour, so Asian trains on Asian bars only.
+// Stores in g_HaNB_Prior_S[sessIdx] / g_HaNB_Likelihood_S[sessIdx] and resets online accumulator.
+void BuildAndTrainNBBrain_Session(int sessIdx)
+{
+   int avail = Bars(_Symbol, PERIOD_M15);
+   int total = NB_LookbackBars + NB_Lookahead + 10;
+   if(avail < total) {
+      Print("[NB Sess ", sessIdx, "] Not enough bars (", avail, "/", total, ") — skipping");
+      return;
+   }
+   int nSamples = NB_LookbackBars - NB_Lookahead;
+   if(nSamples <= 0) return;
+
+   int classCounts[HA_NB_CLASSES];
+   ArrayInitialize(classCounts, 0);
+   int fCounts[HA_NB_CLASSES][HA_NB_FEATURES][HA_NB_MAX_BINS];
+   ArrayInitialize(fCounts, 0);
+   int validCount = 0;
+
+   for(int i = 0; i < nSamples; i++) {
+      int barIdx = NB_Lookahead + i;
+      // Session filter: only train on bars belonging to sessIdx
+      datetime barTime = iTime(_Symbol, PERIOD_M15, barIdx);
+      MqlDateTime bdt; TimeToStruct(barTime, bdt);
+      if(GetNBSessionBin(bdt.hour) != sessIdx) continue;
+
+      // Local ATR (14-bar average range)
+      double atrSum = 0;
+      for(int a = barIdx; a < barIdx + 14 && a < avail; a++)
+         atrSum += (iHigh(_Symbol, PERIOD_M15, a) - iLow(_Symbol, PERIOD_M15, a));
+      double atrLocal = atrSum / 14.0;
+      if(atrLocal <= 0) continue;
+
+      // Absolute label: UP(0) / DOWN(1) / NEUTRAL(2)
+      double futureClose = iClose(_Symbol, PERIOD_M15, barIdx - NB_Lookahead);
+      double baseClose   = iClose(_Symbol, PERIOD_M15, barIdx);
+      double delta       = futureClose - baseClose;
+      double thresh      = atrLocal * NB_WinMultiplier;
+      int label;
+      if(delta >= thresh)       label = 0;
+      else if(delta <= -thresh) label = 1;
+      else                      label = 2;
+
+      int feats[];
+      GetNBHistoricalFeatures(barIdx, feats);
+      classCounts[label]++;
+      for(int f = 0; f < HA_NB_FEATURES; f++) {
+         int bin = feats[f];
+         if(bin >= 0 && bin < g_HaNB_FeatureBins[f])
+            fCounts[label][f][bin]++;
+      }
+      validCount++;
+   }
+
+   if(validCount < 10) {
+      Print("[NB Sess ", sessIdx, "] Too few session bars (", validCount, ") — model skipped");
+      return;
+   }
+
+   // Build priors and likelihoods with Laplace smoothing
+   for(int c = 0; c < HA_NB_CLASSES; c++)
+      g_HaNB_Prior_S[sessIdx][c] = (double)classCounts[c] / (double)validCount;
+   for(int c = 0; c < HA_NB_CLASSES; c++) {
+      for(int f = 0; f < HA_NB_FEATURES; f++) {
+         int nBins = g_HaNB_FeatureBins[f];
+         for(int v = 0; v < HA_NB_MAX_BINS; v++) {
+            if(v < nBins)
+               g_HaNB_Likelihood_S[sessIdx][c][f][v] =
+                  ((double)fCounts[c][f][v] + 1.0) / ((double)classCounts[c] + (double)nBins);
+            else
+               g_HaNB_Likelihood_S[sessIdx][c][f][v] = 0.0;
+         }
+      }
+   }
+
+   // Reset online accumulator for this session (fresh batch model, discard stale online evidence)
+   g_OL_TotalUpdates[sessIdx] = 0;
+   for(int c = 0; c < HA_NB_CLASSES; c++) {
+      g_OL_ClassCounts[sessIdx][c] = 0;
+      for(int f = 0; f < HA_NB_FEATURES; f++)
+         for(int v = 0; v < HA_NB_MAX_BINS; v++)
+            g_OL_FCounts[sessIdx][c][f][v] = 0;
+   }
+
+   g_HaNB_SampleCount_S[sessIdx] = validCount;
+   g_HaNB_Trained_S[sessIdx]     = true;
+   string _sn = (sessIdx == 0) ? "Asian" : (sessIdx == 1) ? "London" : "NY";
+   Print("[NB Sess:", _sn, "] Trained ", validCount, " bars | P(UP)=",
+         DoubleToString(g_HaNB_Prior_S[sessIdx][0]*100,1), "% P(DOWN)=",
+         DoubleToString(g_HaNB_Prior_S[sessIdx][1]*100,1), "% P(NEUTRAL)=",
+         DoubleToString(g_HaNB_Prior_S[sessIdx][2]*100,1), "%");
+}
+
 // Compute live P(UP)/P(DOWN)/P(NEUTRAL) from current NB model and live market features.
 // Updates g_NBBuyProb, g_NBSellProb, g_NBPosteriorWin/Loss/Hold, g_NBPredDir every call.
 void CalcNBLiveProbs()
 {
+   // --- Session-stratified inference: use per-session model when trained ---
+   if(NBSessionTrain) {
+      int _s = g_CurNBSessionIdx;
+      if(_s <= 2 && g_HaNB_Trained_S[_s]) {
+         int _sf[];
+         GetNBLiveFeatures(_sf);
+         // Online blend weight — grows with sample count, capped at NBOnlineWeight
+         double _olB = 0.0;
+         if(NBOnlineLearn && g_OL_TotalUpdates[_s] >= 5)
+            _olB = MathMin(NBOnlineWeight, (double)g_OL_TotalUpdates[_s] / 100.0);
+         double _pr[HA_NB_CLASSES];
+         double _tot = 0.0;
+         for(int _c = 0; _c < HA_NB_CLASSES; _c++) {
+            double _bp = g_HaNB_Prior_S[_s][_c];
+            double _p  = _bp;
+            if(_olB > 0 && g_OL_TotalUpdates[_s] > 0) {
+               double _op = (g_OL_ClassCounts[_s][_c] + 1.0) /
+                            (g_OL_TotalUpdates[_s] + (double)HA_NB_CLASSES);
+               _p = (1.0 - _olB) * _bp + _olB * _op;
+            }
+            for(int _f = 0; _f < HA_NB_FEATURES; _f++) {
+               int _b = _sf[_f];
+               if(_b >= 0 && _b < g_HaNB_FeatureBins[_f]) {
+                  double _bL = g_HaNB_Likelihood_S[_s][_c][_f][_b];
+                  double _L  = _bL;
+                  if(_olB > 0 && g_OL_ClassCounts[_s][_c] > 0) {
+                     int _nB = g_HaNB_FeatureBins[_f];
+                     double _oL = (g_OL_FCounts[_s][_c][_f][_b] + 1.0) /
+                                  (g_OL_ClassCounts[_s][_c] + (double)_nB);
+                     _L = (1.0 - _olB) * _bL + _olB * _oL;
+                  }
+                  if(_L > 0) _p *= _L;
+               }
+            }
+            _pr[_c] = _p; _tot += _p;
+         }
+         if(_tot > 0) {
+            g_NBBuyProb       = (_pr[0] / _tot) * 100.0;
+            g_NBSellProb      = (_pr[1] / _tot) * 100.0;
+            g_NBPosteriorWin  = g_NBBuyProb;
+            g_NBPosteriorLoss = g_NBSellProb;
+            g_NBPosteriorHold = (_pr[2] / _tot) * 100.0;
+         } else {
+            g_NBBuyProb = g_NBSellProb = g_NBPosteriorWin = g_NBPosteriorLoss = g_NBPosteriorHold = 33.3;
+         }
+         if(g_NBBuyProb >= g_NBSellProb && g_NBBuyProb > 40.0)      g_NBPredDir =  1;
+         else if(g_NBSellProb > g_NBBuyProb && g_NBSellProb > 40.0) g_NBPredDir = -1;
+         else                                                         g_NBPredDir =  0;
+         return;  // session model used — skip global fallback
+      }
+   }
+   // --- Global model fallback (all-session blend, active while session models warm up) ---
    if(!g_HaNB_Trained) return;
 
    int liveFeats[];
@@ -4406,16 +4591,79 @@ void CalcNBLiveProbs()
 
 // Called on every new bar: retrain NB when due, then compute live posteriors immediately.
 // NB_RetrainBars=1 means model stays maximally fresh (retrain each bar; ~100 samples * 9 feats).
+
+// Reinforcement update: compare last bar's saved features against bar[1]'s actual close direction.
+// Labels the outcome and adds it to the online accumulator for the current session.
+// The accumulator is blended into live inference proportionally via NBOnlineWeight.
+void OnlineUpdateNB()
+{
+   if(!g_PrevBarFeatValid) return;
+   int s = g_CurNBSessionIdx;
+   if(s > 2) return;  // off-hours: no update
+
+   // Actual outcome of bar[1] (the bar whose features we captured last call)
+   double o1   = iOpen (_Symbol, PERIOD_M15, 1);
+   double c1   = iClose(_Symbol, PERIOD_M15, 1);
+   double atr  = (g_ATR > 0) ? g_ATR : 0.0002;
+   double delta = c1 - o1;
+   double thresh = atr * NB_WinMultiplier * 0.5;  // half-ATR threshold for online labelling
+   int label;
+   if(delta >= thresh)       label = 0;  // UP
+   else if(delta <= -thresh) label = 1;  // DOWN
+   else                      label = 2;  // NEUTRAL
+
+   // Accumulate into the session's online store
+   g_OL_ClassCounts[s][label]++;
+   for(int f = 0; f < HA_NB_FEATURES; f++) {
+      int bin = g_PrevBarFeats[f];
+      if(bin >= 0 && bin < g_HaNB_FeatureBins[f])
+         g_OL_FCounts[s][label][f][bin]++;
+   }
+   g_OL_TotalUpdates[s]++;
+   g_PrevBarFeatValid = false;  // consumed
+}
+
 void RunNBEveryBar()
 {
    if(!UseNBBrain) return;
+
+   // Detect session crossing — retrain that session's model fresh when we enter it
+   MqlDateTime _nbDt; TimeToStruct(TimeCurrent(), _nbDt);
+   int curSess = GetNBSessionBin(_nbDt.hour);
+   g_CurNBSessionIdx = curSess;
+   if(NBSessionTrain && curSess != g_PrevNBSessionIdx) {
+      g_PrevNBSessionIdx = curSess;
+      if(curSess <= 2)
+         BuildAndTrainNBBrain_Session(curSess);  // retrain on entering new session
+      g_PrevBarFeatValid = false;  // discard prev-bar state at session boundary
+   }
+
+   // Online reinforcement update from previous confirmed bar
+   if(NBOnlineLearn && g_PrevBarFeatValid)
+      OnlineUpdateNB();
+
+   // Periodic batch retrain
    g_HaNB_BarCounter++;
    if(g_HaNB_BarCounter >= NB_RetrainBars) {
       g_HaNB_BarCounter = 0;
-      BuildAndTrainNBBrain();
+      if(NBSessionTrain && curSess <= 2)
+         BuildAndTrainNBBrain_Session(curSess);
+      else
+         BuildAndTrainNBBrain();
    }
-   // Always recompute live posteriors — dashboard and EvaluateHAPattern read these each bar
+
+   // Compute live posteriors (uses session model if NBSessionTrain + trained, else global)
    CalcNBLiveProbs();
+
+   // Capture this bar's live features for next bar's online update
+   if(NBOnlineLearn) {
+      int _tmpF[];
+      GetNBLiveFeatures(_tmpF);
+      for(int _fi = 0; _fi < HA_NB_FEATURES; _fi++)
+         g_PrevBarFeats[_fi] = _tmpF[_fi];
+      g_PrevBarNBDir     = g_NBPredDir;
+      g_PrevBarFeatValid = true;
+   }
 }
 
 //+------------------------------------------------------------------+

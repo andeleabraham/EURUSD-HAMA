@@ -15,6 +15,25 @@ CPositionInfo  posInfo;
 
 //=== INPUTS ===
 
+input group "=== BOT TRADING MODE ==="
+// MASTER SWITCH: when BotTradingEnabled=false the bot runs in DISPLAY-ONLY mode — all
+// signals, calculations, zones and dashboard data are computed and shown, but NO actual
+// trade orders are sent. Use this to confirm setups manually before enabling live trading.
+input bool   BotTradingEnabled  = false;  // false=signal display only; true=live trading
+// TRADING FREQUENCY MODE: defines the risk/reward profile and entry selectivity.
+//   0 = FREQUENT  — HFT-style, many quick trades, tight fixed TP (FrequentTP_USD).
+//                   Bollinger and zone filters are relaxed. Target 10-100+ trades/day.
+//   1 = STANDARD  — Clean entries, ~1-3 trades/day, 1.8 RR. Current default behaviour.
+//   2 = SWING     — Macro reversal only. Fires ONLY near major structure levels
+//                   (PrevDay H/L, 3-Day H/L, Weekly H/L, HPL zone).
+//                   Wide TP (SwingTP_USD) with professional SL (SwingSL_USD).
+input int    TradingMode        = 1;      // 0=Frequent | 1=Standard | 2=Swing
+input double FrequentTP_USD     = 1.0;    // Frequent: fixed TP per 0.01 lot (1.0/1.1/1.15/1.2/1.25)
+input double FrequentRR         = 1.1;    // Frequent: R:R — SL = FrequentTP_USD / FrequentRR
+input double SwingTP_USD        = 5.0;    // Swing: target TP per 0.01 lot (5-10 USD)
+input double SwingSL_USD        = 2.0;    // Swing: SL per 0.01 lot (professional sizing)
+input double SwingProximityPips = 20.0;   // Swing: max pips from major level to qualify for entry
+
 input group "=== LOT SIZING ==="
 input bool   AutoLotSize      = false;   // OFF by default — user can enable for risk-based sizing
 input double ManualLotSize    = 0.01;    // Default for small accounts ($10+)
@@ -4046,8 +4065,8 @@ string NearFibPivotLevel(double price)
 // F3: Volume state   — 3 bins: 0=Low / 1=Normal / 2=High
 // F4: Structure      — 3 bins: 0=BEARISH / 1=NEUTRAL / 2=BULLISH
 // F5: FVG alignment  — 3 bins: 0=none / 1=aligned / 2=opposing
-// F6: OB alignment   — 3 bins: 0=none / 1=aligned / 2=opposing
-// F7: Liq sweep      — 3 bins: 0=none / 1=aligned / 2=opposing
+// F6: PrevDay zone   — 3 bins: 0=away / 1=near PrevDay Low (support) / 2=near PrevDay High (resist)
+// F7: D1 Fib-proxy   — 3 bins: 0=lower third (<38.2%) / 1=mid (38.2-61.8%) / 2=upper (>61.8%)
 // F8: Dir flip       — 2 bins: 0=no flip / 1=flip (bar1 dir opposite bar2 — momentum reversal)
 
 void InitNBBrain()
@@ -4058,8 +4077,8 @@ void InitNBBrain()
    g_HaNB_FeatureBins[3] = 3;  // F3: volume 0=Low/1=Normal/2=High
    g_HaNB_FeatureBins[4] = 3;  // F4: structure 0=BEARISH/1=NEUTRAL/2=BULLISH
    g_HaNB_FeatureBins[5] = 3;  // F5: FVG 0=none/1=BullFVG/2=BearFVG (absolute)
-   g_HaNB_FeatureBins[6] = 3;  // F6: OB  0=none/1=nearBullOB/2=nearBearOB (absolute)
-   g_HaNB_FeatureBins[7] = 3;  // F7: Sweep 0=none/1=bullSweep->UP/2=bearSweep->DOWN (absolute)
+   g_HaNB_FeatureBins[6] = 3;  // F6: PrevDay zone 0=away/1=nearPrevDayLow/2=nearPrevDayHigh
+   g_HaNB_FeatureBins[7] = 3;  // F7: D1 Fib-proxy 0=lower(<38.2%)/1=mid(38-62%)/2=upper(>61.8%)
    g_HaNB_FeatureBins[8] = 2;  // F8: dir flip 0=no/1=yes
    // Flat uniform priors — overwritten on first train
    for(int c = 0; c < HA_NB_CLASSES; c++) g_HaNB_Prior[c] = 1.0 / HA_NB_CLASSES;
@@ -4222,11 +4241,27 @@ void GetNBLiveFeatures(int &out[])
       else                             out[5] = 0;
    }
 
-   // F6: always 0 — OB replay not available historically; consistent with training
-   out[6] = 0;
+   // F6: Previous Day High/Low proximity — 0=away | 1=near PrevDay Low (support) | 2=near PrevDay High (resist)
+   // Replaces OB alignment — same 3-bin shape but fully computable from raw OHLC historically.
+   {
+      double _pdZone = 12.0 * _Point * 10.0;  // 12 pip proximity threshold
+      double _pbid   = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+      if(g_PrevDayLow  > 0 && MathAbs(_pbid - g_PrevDayLow)  <= _pdZone) out[6] = 1;
+      else if(g_PrevDayHigh > 0 && MathAbs(_pbid - g_PrevDayHigh) <= _pdZone) out[6] = 2;
+      else out[6] = 0;
+   }
 
-   // F7: always 0 — Sweep replay not available historically; consistent with training
-   out[7] = 0;
+   // F7: D1 Fibonacci-proxy position — where in today's daily range is price?
+   // 0=lower third (<38.2%) | 1=mid (38.2-61.8%) | 2=upper (>61.8%)
+   // Correlates with the key daily Fib retracement levels used by institutional traders.
+   {
+      double _d1H = iHigh(_Symbol, PERIOD_D1, 0);
+      double _d1L = iLow (_Symbol, PERIOD_D1, 0);
+      if(_d1H > _d1L) {
+         double _pos = (SymbolInfoDouble(_Symbol, SYMBOL_BID) - _d1L) / (_d1H - _d1L);
+         out[7] = (_pos < 0.382) ? 0 : (_pos > 0.618) ? 2 : 1;
+      } else out[7] = 1;
+   }
 
    // F8: direction flip — bar1 vs bar2 (confirmed) OR live bar vs bar1 (forming)
    {
@@ -4313,9 +4348,28 @@ void GetNBHistoricalFeatures(int barIdx, int &out[])
          else                              out[5] = 0;
       } else out[5] = 0;
    }
-   // F6,F7: OB/Sweep replay not feasible historically — keep 0 (consistent with prior training)
-   out[6] = 0;
-   out[7] = 0;
+   // F6: Previous Day High/Low proximity for training bar — uses D1[d1Idx] as the prev completed day
+   // relative to this M15 bar. Same 3-bin scheme as live F6.
+   {
+      double _pdZone = 12.0 * _Point * 10.0;
+      double _pdH = iHigh(_Symbol, PERIOD_D1, d1Idx);
+      double _pdL = iLow (_Symbol, PERIOD_D1, d1Idx);
+      if(_pdL > 0 && MathAbs(bC - _pdL) <= _pdZone)      out[6] = 1;  // near prev day low
+      else if(_pdH > 0 && MathAbs(bC - _pdH) <= _pdZone) out[6] = 2;  // near prev day high
+      else                                                out[6] = 0;
+   }
+
+   // F7: D1 Fib-proxy position — where in the day's range was this bar?
+   // Uses D1[d1Idx-1] = the bar's own day (d1Idx is prev day, d1Idx-1 is current day).
+   {
+      int _fd = (d1Idx > 0) ? d1Idx - 1 : 0;
+      double _fd1H = iHigh(_Symbol, PERIOD_D1, _fd);
+      double _fd1L = iLow (_Symbol, PERIOD_D1, _fd);
+      if(_fd1H > _fd1L) {
+         double _pos = (bC - _fd1L) / (_fd1H - _fd1L);
+         out[7] = (_pos < 0.382) ? 0 : (_pos > 0.618) ? 2 : 1;
+      } else out[7] = 1;
+   }
 
    // F8: direction flip from bar direction change
    {
@@ -6276,7 +6330,11 @@ void EvaluateHAPattern()
          // Bollinger override: when strong multi-factor confluence supports the break,
          // the Boll midline lag should not veto. Position sizing unchanged (normal SL/TP).
          bool bollOverrideApplied = false;
-         if(!bollOK && BollOverrideEnabled) {
+         if(!bollOK && TradingMode == 0) {
+            // FREQUENT mode: bypass Bollinger for more entry signals
+            bollOK = true; bollOverrideApplied = true;
+            g_BollOverridden = true; g_BollOverrideReason = "Frequent mode bypass";
+         } else if(!bollOK && BollOverrideEnabled) {
             string ovReason = "";
             if(BollingerOverrideCheck(1, ovReason)) {
                bollOK             = true;
@@ -6484,7 +6542,11 @@ void EvaluateHAPattern()
          }
          // Bollinger override: same logic as BUY side — key-level break + confluence.
          bool bollOverrideAppliedS = false;
-         if(!bollOK && BollOverrideEnabled) {
+         if(!bollOK && TradingMode == 0) {
+            // FREQUENT mode: bypass Bollinger for more entry signals
+            bollOK = true; bollOverrideAppliedS = true;
+            g_BollOverridden = true; g_BollOverrideReason = "Frequent mode bypass";
+         } else if(!bollOK && BollOverrideEnabled) {
             string ovReasonS = "";
             if(BollingerOverrideCheck(-1, ovReasonS)) {
                bollOK              = true;
@@ -7598,6 +7660,37 @@ void TryEntry()
    else
       g_ZoneHardness = "HARD";  // unknown direction → conservative
 
+   // === SWING MODE: require proximity to a major structure level ===
+   // Swing entries are high-value reversals only — fires ONLY near PrevDay H/L,
+   // 3-Day H/L, prev-week H/L, or an HPL consolidation zone.
+   // All other setups are skipped even if HA + NB + ZAP all agree.
+   if(TradingMode == 2 && tradeDir != 0) {
+      double _swZone = SwingProximityPips * _Point * 10.0;
+      bool _nearMajor = false;
+      // Previous day levels (most reliable intraday swing anchor)
+      if(tradeDir ==  1 && g_PrevDayLow  > 0 && MathAbs(price - g_PrevDayLow)  <= _swZone) _nearMajor = true;
+      if(tradeDir == -1 && g_PrevDayHigh > 0 && MathAbs(price - g_PrevDayHigh) <= _swZone) _nearMajor = true;
+      // 3-Day H/L
+      if(tradeDir ==  1 && g_ThreeDayLow  > 0 && MathAbs(price - g_ThreeDayLow)  <= _swZone) _nearMajor = true;
+      if(tradeDir == -1 && g_ThreeDayHigh > 0 && MathAbs(price - g_ThreeDayHigh) <= _swZone) _nearMajor = true;
+      // Previous week H/L
+      if(tradeDir ==  1 && g_PrevWeekLow  > 0 && MathAbs(price - g_PrevWeekLow)  <= _swZone) _nearMajor = true;
+      if(tradeDir == -1 && g_PrevWeekHigh > 0 && MathAbs(price - g_PrevWeekHigh) <= _swZone) _nearMajor = true;
+      // HPL zones (horizontal consolidation — natural reversal magnets)
+      if(tradeDir ==  1 && g_HPLSupportHigh > 0 && MathAbs(price - g_HPLSupportHigh) <= _swZone) _nearMajor = true;
+      if(tradeDir == -1 && g_HPLResistLow   > 0 && MathAbs(price - g_HPLResistLow)   <= _swZone) _nearMajor = true;
+      if(!_nearMajor) {
+         string _swBr = "[SWING] " + (tradeDir==1?"BUY":"SELL") + " skipped — not near major level "
+                      + "(PrevDay" + (tradeDir==1?"Low:":"High:")
+                      + DoubleToString(tradeDir==1?g_PrevDayLow:g_PrevDayHigh,_Digits)
+                      + " | 3D:" + DoubleToString(tradeDir==1?g_ThreeDayLow:g_ThreeDayHigh,_Digits) + ")";
+         if(_swBr != g_LastBlockReason) { Print(_swBr); g_LastBlockReason = _swBr; }
+         return;
+      }
+      Print("[SWING] Major level confirmed — ", (tradeDir==1?"BUY near Low":"SELL near High"),
+            " zone=", DoubleToString(SwingProximityPips,0), "pip");
+   }
+
    // === ZONE FILTERS FOR TREND TRADES ===
    // Standard rule: avoid UPPER_THIRD for buys (near range high = mean-reversion risk)
    //                and LOWER_THIRD for sells (near range low = bounce risk).
@@ -7637,6 +7730,11 @@ void TryEntry()
       if(g_ZonePending && g_ZonePendingDir != tradeDir)
          g_ZonePending = false;
 
+      // FREQUENT mode: trade anywhere in range — Bollinger and HA gates are sufficient
+      if(wouldBlock && TradingMode == 0) {
+         wouldBlock = false;
+         Print("[FREQ] Zone relaxed for ", (tradeDir==1?"BUY":"SELL"), " in ", zone);
+      }
       if(wouldBlock) {
          // ── MODE 0: STRICT ─────────────────────────────────────────────────────────────
          if(ZoneStrictness == 0) {
@@ -8212,6 +8310,8 @@ void TryEntry()
    // === CONFIDENCE GATE — reject low-probability setups ===
    // v7.00: ZAP zone confluence density lowers the effective threshold dynamically
    double effectiveMinConf = MinConfidence;
+   if(TradingMode == 0)  // FREQUENT: lower bar for more signals (70% of MinConfidence, floor 20%)
+      effectiveMinConf = MathMax(MinConfidence * 0.70, 20.0);
    if(UseZAP && UseZoneConfluence && g_ZoneConfluencePct >= 70.0)
       effectiveMinConf = MathMax(MinConfidence - 10.0, MinConfidence * 0.80);
    else if(UseZAP && g_ZAPActive && g_ZAPDir == tradeDir && g_ZAPScore >= ZAPMinScore)
@@ -8421,6 +8521,27 @@ void TryEntry()
       }
    }
 
+   // === TRADING MODE FINAL SL/TP OVERRIDE ===
+   // Applied LAST — wins over structural SL/TP, CHoCH, BoldTier, MacroTrend and LC blocks.
+   // Frequent: small fixed target for quick in/out; SL derived from R:R.
+   // Swing: wide professional target to next major structure.
+   if(TradingMode == 0) {           // FREQUENT
+      double _frSL = MathMax(FrequentTP_USD / MathMax(FrequentRR, 0.5), MinSL_USD);
+      g_DynamicSL_USD = _frSL;
+      baseTpUSD       = FrequentTP_USD;
+      g_DynamicTP_USD = baseTpUSD;
+      g_IsLowConviction = false;    // already targeting tiny TP — LC tag not meaningful
+      Print("[FREQ] SL$=", DoubleToString(_frSL,2), " TP$=", DoubleToString(FrequentTP_USD,2),
+            " RR=", DoubleToString(FrequentRR,2));
+   } else if(TradingMode == 2) {    // SWING
+      g_DynamicSL_USD = SwingSL_USD;
+      baseTpUSD       = SwingTP_USD;
+      g_DynamicTP_USD = baseTpUSD;
+      g_IsLowConviction = false;    // swing absorbs NB weakness — no LC flag
+      Print("[SWING] SL$=", DoubleToString(SwingSL_USD,2), " TP$=", DoubleToString(SwingTP_USD,2),
+            " RR=", DoubleToString(SwingTP_USD/MathMax(SwingSL_USD,0.01),2));
+   }
+
    // Scale SL/TP by lot size
    double slUSD = g_DynamicSL_USD * scale;
    double tpUSD = baseTpUSD * scale;
@@ -8438,6 +8559,8 @@ void TryEntry()
    if(HAEntryMode == 1 || isMacroTrend) tag = tag + "_E";
    if(g_DivergenceCaution)  tag = tag + "_DV";   // divergence-caution marker
    if(g_IsLowConviction)    tag = tag + "_LC";   // low-conviction NB cap marker
+   if(TradingMode == 0)     tag = "FRQ_" + tag;  // Frequent mode prefix
+   if(TradingMode == 2)     tag = "SWG_" + tag;  // Swing mode prefix
    tag = tag + "_C" + confStr
              + "_SL" + DoubleToString(g_DynamicSL_USD, 2)
              + "_TP" + DoubleToString(g_DynamicTP_USD, 2);
@@ -8454,6 +8577,24 @@ void TryEntry()
       }
    }
    g_LastBlockReason = "";   // block cleared — trade is actually firing
+
+   // === BOT TRADING GATE ===
+   // BotTradingEnabled=false → DISPLAY-ONLY mode: signal fired and logged but NO order sent.
+   // All gate computation above still ran — use this to validate setups before going live.
+   if(!BotTradingEnabled) {
+      static datetime _botGateBar = 0;
+      datetime _bgBar = iTime(_Symbol, PERIOD_M15, 0);
+      if(_bgBar != _botGateBar) {
+         _botGateBar = _bgBar;
+         string _modeTag = (TradingMode==0) ? "FREQUENT" : (TradingMode==2) ? "SWING" : "STANDARD";
+         Print("[BOT OFF] ", (tradeDir==1?"BUY":"SELL"), " signal ready | Mode:", _modeTag,
+               " Conf:", DoubleToString(confidence,1), "% Zone:", zone,
+               " SL$:", DoubleToString(g_DynamicSL_USD,2), " TP$:", DoubleToString(baseTpUSD,2),
+               " — BotTradingEnabled=false, no order placed");
+      }
+      return;
+   }
+
    bool ok = false;
    if(tradeDir == 1) {
       double sl = UseSL ? NormalizeDouble(ask - slDist, _Digits) : 0;   // v7.00: UseSL=false → no broker SL
@@ -10300,13 +10441,21 @@ void UpdateDashboard()
       }
       rowR++;
 
-      // Row 2: Mode + management strategy
-      if(g_TradeOpen) {
-         string modeStr = g_IsMeanRev ? "MEAN REV" : (g_IsNearMid ? "MID-validated" : "TREND");
-         color  modeClr = g_IsMeanRev ? clrGold : (g_IsNearMid ? clrOrange : clrLime);
-         DashLine("R_mode", "Mode    : " + modeStr + " | " + g_TradeMgmtModeName, rx, cy, rowR, lh, corner, modeClr, 9);
-      } else {
-         DashLine("R_mode", "Mode    : --- | " + g_TradeMgmtModeName, rx, cy, rowR, lh, corner, clrDimGray, 9);
+      // Row 2: Bot status + Trading mode + management strategy
+      {
+         string _tmLabel = (TradingMode==0) ? "FREQUENT" : (TradingMode==2) ? "SWING" : "STANDARD";
+         string _botTag  = BotTradingEnabled ? "BOT:ON" : "BOT:OFF(SIG)";
+         color  _botBase = BotTradingEnabled
+                           ? (TradingMode==0 ? clrOrange : (TradingMode==2 ? clrCyan : clrLime))
+                           : clrYellow;
+         if(g_TradeOpen) {
+            string modeStr = g_IsMeanRev ? "MEAN REV" : (g_IsNearMid ? "MID-val" : "TREND");
+            DashLine("R_mode", _botTag + " " + _tmLabel + " | " + modeStr + " | " + g_TradeMgmtModeName,
+                     rx, cy, rowR, lh, corner, _botBase, 9);
+         } else {
+            DashLine("R_mode", _botTag + " " + _tmLabel + " | --- | " + g_TradeMgmtModeName,
+                     rx, cy, rowR, lh, corner, BotTradingEnabled ? clrDimGray : clrYellow, 9);
+         }
       }
       rowR++;
 

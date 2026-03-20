@@ -1,10 +1,10 @@
 //+------------------------------------------------------------------+
-//|  EURUSD Heiken Ashi Range Bot v6.43                              |
+//|  EURUSD Heiken Ashi Range Bot v7.00                              |
 //|  NB probabilistic gate + OB/FVG/HPL/SMC + 6-mode trade mgmt     |
 //|  STANDARD / SENTINEL / MOMENTUM / ADAPTIVE / HARVESTER / CHRONO |
 //+------------------------------------------------------------------+
 #property copyright   "EURUSD HA Range Bot"
-#property version     "6.43"
+#property version     "7.00"
 #property strict
 
 #include <Trade\Trade.mqh>
@@ -91,6 +91,12 @@ input int    NYObserveBars         = 2;      // v6.32: first N M15 bars of NY op
 // RELAX mode: when prev-day momentum aligns with signal AND multiple factors agree,
 // the standard zone block (UPPER_THIRD for buy / LOWER_THIRD for sell) is lifted in Asian hours.
 // The trade is entered with standard (not narrowed) SL and a logged CAUTION note.
+// Enhanced Asian bias (v7.00): after the observe window, once price moves >= AsianBiasMovePips
+// in a direction, the session has an established bias. Aligned HA signals earn +8 conf pts;
+// counter-direction signals lose -5 pts. This captures the "Asian session direction rule"
+// (first hours define the drift until London joins at 08:00).
+input bool   AsianBiasEnabled      = true;   // Enable enhanced Asian session directional bias
+input double AsianBiasMovePips     = 10.0;   // Min pip move from Asian open to establish bias
 
 input group "=== MANUAL RANGE OVERRIDE ==="
 input bool   UseManualRange   = false;
@@ -233,6 +239,21 @@ input int    ZonePendingMaxBars    = 4;    // CONTEXT mode: auto-expire pending 
 input bool   UseMurrayChannels    = true;  // Compute Murray Math octave levels from H4 swing range
 input bool   UseWeeklySR          = true;  // Track weekly & 3-day H/L for multi-day support/resistance
 input bool   UseFibExtensions     = true;  // Add 127.2% and 161.8% Fib extension levels beyond range
+
+input group "=== ZONE APPROACH PRIMER (ZAP) v7 ==="
+// ZAP watches ALL institutional zones each bar. When price is within ZAPProximityPips of
+// a confluence cluster (CI H/L, OB, FVG, HPL, Murray, Pivot, Fib, Weekly S/R), the bot arms
+// its directional bias BEFORE any HA signal fires. When the first bottomless/topless HA candle
+// then appears AT the zone, it goes DIRECTLY to INCOMING (skips PREPARING state).
+// Fakeout sweep: if price punches ZAPFakeoutPips PAST the zone (liquidity sweep), g_ZAPFakeout
+// is set — the reversal candle entry is the highest-conviction setup and bypasses NB suppression.
+input bool   UseZAP             = true;    // Enable Zone Approach Primer (zone-first brain)
+input double ZAPProximityPips   = 15.0;    // Pips from zone edge to arm ZAP
+input int    ZAPMinScore        = 2;       // Min zone types converging to qualify as a primer
+input bool   ZAPFastTrack       = true;    // First HA candle at zone → direct INCOMING (no PREPARING)
+input int    ZAPMaxBars         = 12;      // ZAP expiry: bars without HA confirmation (12 = 3 hours)
+input double ZAPFakeoutPips     = 5.0;     // Pips past zone boundary = liquidity sweep (fakeout signal)
+input bool   UseZoneConfluence  = true;    // Use zone confluence % to lower confidence threshold
 
 input group "=== ATR & RANGE CONFIDENCE ==="
 input int    ATRPeriod        = 14;
@@ -615,6 +636,21 @@ bool    g_NearBearH4FVG   = false;  // price near a bearish H4 FVG (macro supply
 double  g_NearestH4FVGHigh = 0;
 double  g_NearestH4FVGLow  = 0;
 int     g_NearestH4FVGDir  = 0;
+
+// === ZONE APPROACH PRIMER (ZAP) globals — v7.00 ===
+bool   g_ZAPActive        = false;  // true when price is near a zone confluence cluster
+int    g_ZAPDir           = 0;      // +1=BUY primer, -1=SELL primer, 0=unarmed
+int    g_ZAPScore         = 0;      // number of zone types converging at this price
+string g_ZAPLabel         = "";     // human-readable zone types (e.g. "CIL FVG BullOB")
+bool   g_ZAPFakeout       = false;  // true after a liquidity sweep past zone boundary
+double g_ZAPZonePrice     = 0;      // price of the swept zone (for logging)
+datetime g_ZAPStartTime   = 0;      // when ZAP was last armed (for expiry tracking)
+double g_ZoneConfluencePct = 0;     // 0-100%: % of max possible zone score converging
+
+// === ENHANCED ASIAN BIAS globals — v7.00 ===
+bool   g_AsianBiasActive  = false;  // true once Asian session established >= AsianBiasMovePips move
+int    g_AsianBiasDir     = 0;      // +1=BULL bias, -1=BEAR bias, 0=no bias
+string g_AsianBiasLabel   = "";     // display label: "BULL BIAS +12.3pip" etc.
 
 // Confidence model output (replaces tier system)
 double g_Confidence       = 0;             // 0-100% confidence score for current setup
@@ -1629,6 +1665,10 @@ void OnTick()
 
       // --- FVG H1+H4 overlap confluence detection ---
       DetectFVGOverlap();
+
+      // --- Zone Approach Primer + Asian Bias (v7.00) — always runs to keep ZAP state fresh ---
+      DetectZoneApproach();
+      ComputeAsianBias();
 
       // --- Signal scanning: skip when bot has open trade and PauseScanInTrade ---
       // Structure detection above ALWAYS runs (needed for trade management + comeback).
@@ -4721,6 +4761,33 @@ double CalcConfidence(int tradeDir, string zone, bool isMeanRev, bool isSideways
    }
    g_ConfBreakdown += " BollRm:" + DoubleToString(conf - prevConf, 0); prevConf = conf;
 
+   // --- 20. ZAP ZONE CONFLUENCE (+3 per zone score pt, max +15) v7.00 ---
+   if(UseZAP && g_ZAPActive && g_ZAPDir == tradeDir) {
+      double zapBonus = MathMin(g_ZAPScore * 3.0, 15.0);
+      conf += zapBonus;
+      g_ConfBreakdown += " ZAP:+" + DoubleToString(zapBonus, 0);
+   }
+   // --- 21. ZAP FAKEOUT (liquidity sweep confirmed → reversal bias +10) v7.00 ---
+   if(UseZAP && g_ZAPFakeout && g_ZAPDir == tradeDir) {
+      conf += 10.0;
+      g_ConfBreakdown += " ZAPFko:+10";
+   }
+   // --- 22. ENHANCED ASIAN BIAS (±8 aligned / −5 counter in Asian hours) v7.00 ---
+   if(g_AsianBiasActive) {
+      MqlDateTime _adt22; TimeToStruct(TimeCurrent(), _adt22);
+      bool inAsian22 = (_adt22.hour >= AsianStartHour && _adt22.hour < AsianEndHour);
+      if(inAsian22) {
+         if(g_AsianBiasDir == tradeDir) { conf += 8.0; g_ConfBreakdown += " AsianBias:+8"; }
+         else                           { conf -= 5.0; g_ConfBreakdown += " AsianBias:-5"; }
+      }
+   }
+   // --- 23. ZONE CONFLUENCE DENSITY (ZCP >= 70% adds +5) v7.00 ---
+   if(UseZoneConfluence && g_ZoneConfluencePct >= 70.0) {
+      conf += 5.0;
+      g_ConfBreakdown += " ZCP:+5";
+   }
+   prevConf = conf;
+
    // --- PENALTIES ---
    if(isSideways)  conf -= 8.0;
    if(isMeanRev)   conf -= 3.0;
@@ -5112,6 +5179,201 @@ int LiveHAConsecTotal()
 //| behind rapidly moving price — blocking here is a false negative. |
 //| Position sizing still uses normal SL/TP — no extra risk taken.  |
 //+------------------------------------------------------------------+
+
+//+------------------------------------------------------------------+
+//| ZONE APPROACH PRIMER (ZAP) v7.00                                |
+//| Scans all institutional zones each bar. When price is within    |
+//| ZAPProximityPips, arms the bot's directional bias BEFORE HA.    |
+//| The first qualifying HA candle then fires INCOMING directly.    |
+//| Also detects liquidity sweeps past zone boundaries (fakeouts).  |
+//+------------------------------------------------------------------+
+void DetectZoneApproach()
+{
+   if(!UseZAP) { g_ZAPActive = false; g_ZAPFakeout = false; g_ZoneConfluencePct = 0; return; }
+
+   double bid  = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double prox = ZAPProximityPips * _Point * 10.0;
+
+   int    buyScore = 0, sellScore = 0;
+   string buyZones = "",  sellZones = "";
+
+   // CI Low (statistical support) → BUY; CI High (resistance) → SELL
+   if(g_CILow  > 0 && bid <= g_CILow  + prox && bid >= g_CILow  - prox * 0.5) { buyScore++;  buyZones  += "CIL "; }
+   if(g_CIHigh > 0 && bid >= g_CIHigh - prox && bid <= g_CIHigh + prox * 0.5) { sellScore++; sellZones += "CIH "; }
+
+   // H1 Order Blocks
+   for(int _i = 0; _i < g_BullOBCount; _i++) {
+      if(!g_BullOBs[_i].mitigated && g_BullOBs[_i].high > 0 &&
+         bid >= g_BullOBs[_i].low - prox && bid <= g_BullOBs[_i].high + prox)
+         { buyScore++; buyZones += "H1BullOB "; break; }
+   }
+   for(int _i = 0; _i < g_BearOBCount; _i++) {
+      if(!g_BearOBs[_i].mitigated && g_BearOBs[_i].high > 0 &&
+         bid >= g_BearOBs[_i].low - prox && bid <= g_BearOBs[_i].high + prox)
+         { sellScore++; sellZones += "H1BearOB "; break; }
+   }
+
+   // H4 Order Blocks (macro, weighted +2)
+   if(g_NearH4BullOB) { buyScore += 2;  buyZones  += "H4BullOB "; }
+   if(g_NearH4BearOB) { sellScore += 2; sellZones += "H4BearOB "; }
+
+   // H1 + H4 Fair Value Gaps
+   if(g_NearBullFVG)   { buyScore++;  buyZones  += "H1FVG "; }
+   if(g_NearBearFVG)   { sellScore++; sellZones += "H1FVG "; }
+   if(g_NearBullH4FVG) { buyScore++;  buyZones  += "H4FVG "; }
+   if(g_NearBearH4FVG) { sellScore++; sellZones += "H4FVG "; }
+
+   // Horizontal Price Levels
+   if(UseHPL) {
+      if(g_HPLSupportBlock) { buyScore++;  buyZones  += "HPL-Supp "; }
+      if(g_HPLResistBlock)  { sellScore++; sellZones += "HPL-Res "; }
+   }
+
+   // Murray Math octave levels (0/8,1/8 = strong support; 7/8,8/8 = strong resistance)
+   if(UseMurrayChannels) {
+      for(int _mi = 0; _mi <= 8; _mi++) {
+         if(g_Murray[_mi] <= 0) continue;
+         if(MathAbs(bid - g_Murray[_mi]) <= prox) {
+            if(_mi <= 1) { buyScore++;  buyZones  += "M" + IntegerToString(_mi) + "/8 "; }
+            if(_mi >= 7) { sellScore++; sellZones += "M" + IntegerToString(_mi) + "/8 "; }
+         }
+      }
+   }
+
+   // Daily Pivot support/resistance
+   if(UseDailyPivot) {
+      if(g_PivotS1 > 0 && MathAbs(bid - g_PivotS1) <= prox) { buyScore++;  buyZones  += "S1 "; }
+      if(g_PivotS2 > 0 && MathAbs(bid - g_PivotS2) <= prox) { buyScore++;  buyZones  += "S2 "; }
+      if(g_PivotR1 > 0 && MathAbs(bid - g_PivotR1) <= prox) { sellScore++; sellZones += "R1 "; }
+      if(g_PivotR2 > 0 && MathAbs(bid - g_PivotR2) <= prox) { sellScore++; sellZones += "R2 "; }
+   }
+
+   // Weekly / 3-Day S/R
+   if(UseWeeklySR) {
+      if(g_PrevWeekLow  > 0 && MathAbs(bid - g_PrevWeekLow)  <= prox) { buyScore++;  buyZones  += "WkL "; }
+      if(g_PrevWeekHigh > 0 && MathAbs(bid - g_PrevWeekHigh) <= prox) { sellScore++; sellZones += "WkH "; }
+      if(g_ThreeDayLow  > 0 && MathAbs(bid - g_ThreeDayLow)  <= prox) { buyScore++;  buyZones  += "3dL "; }
+      if(g_ThreeDayHigh > 0 && MathAbs(bid - g_ThreeDayHigh) <= prox) { sellScore++; sellZones += "3dH "; }
+   }
+
+   // Fibonacci levels (61.8/76.4 = deep support → BUY; 23.6/38.2 = resistance → SELL)
+   if(g_Fib382 > 0) {
+      if(MathAbs(bid - g_Fib618) <= prox) { buyScore++;  buyZones  += "F61.8 "; }
+      if(MathAbs(bid - g_Fib764) <= prox) { buyScore++;  buyZones  += "F76.4 "; }
+      if(MathAbs(bid - g_Fib236) <= prox) { sellScore++; sellZones += "F23.6 "; }
+      if(MathAbs(bid - g_Fib382) <= prox) { sellScore++; sellZones += "F38.2 "; }
+   }
+
+   // Zone confluence percentage
+   int topScore = MathMax(buyScore, sellScore);
+   g_ZoneConfluencePct = MathMin(topScore * 100.0 / 12.0, 100.0);
+
+   // Determine ZAP direction (ties resolved via macro structure)
+   int newDir = 0;
+   if(buyScore > sellScore && buyScore >= ZAPMinScore)        newDir =  1;
+   else if(sellScore > buyScore && sellScore >= ZAPMinScore)  newDir = -1;
+   else if(buyScore == sellScore && buyScore >= ZAPMinScore) {
+      if(g_MacroStructLabel == "BULLISH")      newDir =  1;
+      else if(g_MacroStructLabel == "BEARISH") newDir = -1;
+      if(newDir != 0) Print("[ZAP] Tie-break via MacroStr=", g_MacroStructLabel);
+   }
+
+   // Fakeout/sweep detection — spike past zone boundary = liquidity sweep
+   if(g_ZAPActive && g_ZAPDir != 0 && !g_ZAPFakeout) {
+      double sweepDist = ZAPFakeoutPips * _Point * 10.0;
+      bool   fo = false;
+      if(g_ZAPDir == 1) {
+         if(g_CILow         > 0 && bid < g_CILow         - sweepDist) { fo = true; g_ZAPZonePrice = g_CILow; }
+         if(!fo && g_HPLSupportLow > 0 && bid < g_HPLSupportLow - sweepDist) { fo = true; g_ZAPZonePrice = g_HPLSupportLow; }
+         if(!fo && g_PivotS1 > 0 && bid < g_PivotS1 - sweepDist)           { fo = true; g_ZAPZonePrice = g_PivotS1; }
+      } else {
+         if(g_CIHigh        > 0 && bid > g_CIHigh        + sweepDist) { fo = true; g_ZAPZonePrice = g_CIHigh; }
+         if(!fo && g_HPLResistHigh > 0 && bid > g_HPLResistHigh + sweepDist) { fo = true; g_ZAPZonePrice = g_HPLResistHigh; }
+         if(!fo && g_PivotR1 > 0 && bid > g_PivotR1 + sweepDist)           { fo = true; g_ZAPZonePrice = g_PivotR1; }
+      }
+      if(fo) {
+         g_ZAPFakeout = true;
+         Print("[ZAP FAKEOUT] Liquidity sweep @ ", DoubleToString(bid, 5),
+               " past zone=", DoubleToString(g_ZAPZonePrice, 5),
+               " dir=", (g_ZAPDir==1 ? "BUY(swept below support)" : "SELL(swept above resist)"),
+               " — next reversal candle = DIRECT INCOMING (NB suppression bypassed)");
+      }
+   }
+
+   // Update ZAP state
+   if(newDir != 0) {
+      string newLbl  = (newDir == 1) ? buyZones  : sellZones;
+      int    newScr  = (newDir == 1) ? buyScore  : sellScore;
+      if(StringLen(newLbl) > 0) newLbl = StringTrimRight(newLbl);
+      if(!g_ZAPActive || g_ZAPDir != newDir) {
+         g_ZAPActive    = true;
+         g_ZAPDir       = newDir;
+         g_ZAPStartTime = TimeCurrent();
+         g_ZAPFakeout   = false;
+         Print("[ZAP ARMED] dir=", (newDir==1?"BUY":"SELL"),
+               " score=", newScr, " zones=[", newLbl, "]",
+               " ZCP=", DoubleToString(g_ZoneConfluencePct, 0), "%");
+      }
+      g_ZAPScore = newScr;
+      g_ZAPLabel = newLbl;
+   } else if(g_ZAPActive) {
+      int barsSince = (g_ZAPStartTime > 0)
+                      ? (int)((TimeCurrent() - g_ZAPStartTime) / PeriodSeconds(PERIOD_M15))
+                      : ZAPMaxBars;
+      if(barsSince >= ZAPMaxBars) {
+         Print("[ZAP EXPIRED] ", barsSince, " bars without zone contact — resetting");
+         g_ZAPActive = false; g_ZAPDir = 0; g_ZAPScore = 0;
+         g_ZAPLabel = ""; g_ZAPFakeout = false; g_ZAPStartTime = 0; g_ZoneConfluencePct = 0;
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| ENHANCED ASIAN SESSION BIAS TRACKER v7.00                       |
+//| After the observe window, measures net pip move from g_AsianOpen |
+//| Once >= AsianBiasMovePips in a direction, sets g_AsianBiasDir.  |
+//| Resets at London open. Aligned signals earn +8 confidence pts.  |
+//+------------------------------------------------------------------+
+void ComputeAsianBias()
+{
+   if(!AsianBiasEnabled) { g_AsianBiasActive = false; return; }
+
+   MqlDateTime _adt; TimeToStruct(TimeCurrent(), _adt);
+   bool inAsian = (_adt.hour >= AsianStartHour && _adt.hour < AsianEndHour);
+
+   if(!inAsian) {
+      if(g_AsianBiasActive) {
+         Print("[ASIAN BIAS] London open — resetting Asian bias (was ",
+               (g_AsianBiasDir==1?"BULL":"BEAR"), ")");
+         g_AsianBiasActive = false; g_AsianBiasDir = 0; g_AsianBiasLabel = "";
+      }
+      return;
+   }
+   if(g_AsianBarCount <= AsianObserveBars || g_AsianOpen <= 0) return;
+
+   double bid      = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double movePips = (bid - g_AsianOpen) / _Point / 10.0;
+
+   if(movePips >= AsianBiasMovePips) {
+      if(!g_AsianBiasActive || g_AsianBiasDir != 1) {
+         g_AsianBiasActive = true; g_AsianBiasDir = 1;
+         Print("[ASIAN BIAS] BULL established: +", DoubleToString(movePips, 1),
+               "pip from Asian open=", DoubleToString(g_AsianOpen, 5),
+               " — aligned BUY signals earn +8 conf pts");
+      }
+      g_AsianBiasLabel = "BULL BIAS +" + DoubleToString(movePips, 1) + "pip";
+   } else if(movePips <= -AsianBiasMovePips) {
+      if(!g_AsianBiasActive || g_AsianBiasDir != -1) {
+         g_AsianBiasActive = true; g_AsianBiasDir = -1;
+         Print("[ASIAN BIAS] BEAR established: ", DoubleToString(movePips, 1),
+               "pip from Asian open=", DoubleToString(g_AsianOpen, 5),
+               " — aligned SELL signals earn +8 conf pts");
+      }
+      g_AsianBiasLabel = "BEAR BIAS " + DoubleToString(movePips, 1) + "pip";
+   } else {
+      if(!g_AsianBiasActive) { g_AsianBiasDir = 0; g_AsianBiasLabel = ""; }
+   }
+}
 
 //+------------------------------------------------------------------+
 //| MACRO TREND RIDE DETECTION                                       |
@@ -5625,15 +5887,17 @@ void EvaluateHAPattern()
       // NB co-driver: if NB strongly agrees, also skip PREPARING.
       // NB suppression: only veto when NB is MAJORITY-DOWN (>50%) AND P(UP)<NBMinPosterior
       // AND this is NOT a flip (flips are the strongest HA signals — never NB-suppressed).
-      if(UseNBBrain && g_HaNB_Trained && !g_HADirFlip
+      // v7.00: ZAP fakeout bypass — if we swept support and reversed, NB suppression is lifted
+      bool zapFastBuy = UseZAP && ZAPFastTrack && g_ZAPActive && g_ZAPDir == 1 && g_ZAPScore >= ZAPMinScore;
+      if(UseNBBrain && g_HaNB_Trained && !g_HADirFlip && !g_ZAPFakeout
          && g_NBSellProb > 50.0 && g_NBBuyProb < NBMinPosterior) {
-         g_HABullSetup = false;   // undo — NB majority-DOWN vetoes this BUY setup
+         g_HABullSetup = false;   // undo — NB majority-DOWN vetoes this BUY setup (ZAP fakeout exempted)
          g_Signal      = "WAITING";
          Print("[NB] BUY suppressed: P(UP)=", DoubleToString(g_NBBuyProb,1),
                "% < ", DoubleToString(NBMinPosterior,0), "% | P(DOWN)=", DoubleToString(g_NBSellProb,1),
                "% (majority-DOWN, not a flip)");
       } else {
-         bool goDirectBuy = g_HADirFlip || (UseNBBrain && g_HaNB_Trained && g_NBBuyProb >= NBHighThreshold);
+         bool goDirectBuy = g_HADirFlip || zapFastBuy || (UseNBBrain && g_HaNB_Trained && g_NBBuyProb >= NBHighThreshold);
          if(goDirectBuy) {
             g_Signal            = "BUY INCOMING";
             g_ConfirmCandleOpen = iTime(_Symbol, PERIOD_M15, 1);
@@ -5821,15 +6085,17 @@ void EvaluateHAPattern()
       // NB co-driver: if NB strongly agrees, also skip PREPARING.
       // NB suppression: only veto when NB is MAJORITY-UP (>50%) AND P(DOWN)<NBMinPosterior
       // AND this is NOT a flip (flips are the strongest HA signals — never NB-suppressed).
-      if(UseNBBrain && g_HaNB_Trained && !g_HADirFlip
+      // v7.00: ZAP fakeout bypass — if we swept resistance and reversed, NB suppression is lifted
+      bool zapFastSell = UseZAP && ZAPFastTrack && g_ZAPActive && g_ZAPDir == -1 && g_ZAPScore >= ZAPMinScore;
+      if(UseNBBrain && g_HaNB_Trained && !g_HADirFlip && !g_ZAPFakeout
          && g_NBBuyProb > 50.0 && g_NBSellProb < NBMinPosterior) {
-         g_HABearSetup = false;   // undo — NB majority-UP vetoes this SELL setup
+         g_HABearSetup = false;   // undo — NB majority-UP vetoes this SELL setup (ZAP fakeout exempted)
          g_Signal      = "WAITING";
          Print("[NB] SELL suppressed: P(DOWN)=", DoubleToString(g_NBSellProb,1),
                "% < ", DoubleToString(NBMinPosterior,0), "% | P(UP)=", DoubleToString(g_NBBuyProb,1),
                "% (majority-UP, not a flip)");
       } else {
-         bool goDirectSell = g_HADirFlip || (UseNBBrain && g_HaNB_Trained && g_NBSellProb >= NBHighThreshold);
+         bool goDirectSell = g_HADirFlip || zapFastSell || (UseNBBrain && g_HaNB_Trained && g_NBSellProb >= NBHighThreshold);
          if(goDirectSell) {
             g_Signal            = "SELL INCOMING";
             g_ConfirmCandleOpen = iTime(_Symbol, PERIOD_M15, 1);
@@ -7554,9 +7820,16 @@ void TryEntry()
    }
 
    // === CONFIDENCE GATE — reject low-probability setups ===
-   if(confidence < MinConfidence) {
+   // v7.00: ZAP zone confluence density lowers the effective threshold dynamically
+   double effectiveMinConf = MinConfidence;
+   if(UseZAP && UseZoneConfluence && g_ZoneConfluencePct >= 70.0)
+      effectiveMinConf = MathMax(MinConfidence - 10.0, MinConfidence * 0.80);
+   else if(UseZAP && g_ZAPActive && g_ZAPDir == tradeDir && g_ZAPScore >= ZAPMinScore)
+      effectiveMinConf = MathMax(MinConfidence - 5.0, MinConfidence * 0.88);
+   if(confidence < effectiveMinConf) {
       Print("ENTRY REJECTED: confidence ", DoubleToString(confidence, 1),
-            "% < min ", DoubleToString(MinConfidence, 1), "%");
+            "% < effective min ", DoubleToString(effectiveMinConf, 1), "%",
+            (effectiveMinConf < MinConfidence ? " (ZAP/ZCP discount applied)" : ""));
       return;
    }
 
@@ -7764,6 +8037,8 @@ void TryEntry()
    if(ok) {
       SetScaledThresholds(lot);
       g_TradeOpen     = true;
+      g_ZAPActive     = false;  // v7.00: trade placed — reset ZAP primer
+      g_ZAPFakeout    = false;
       g_ProfitLocked  = false;
       g_PeakProfit    = 0;
       g_TroughProfit  = 0;
@@ -9231,6 +9506,25 @@ void UpdateDashboard()
                                                                                  cx, cy, row, lh, corner, clrWhite,      9); row++;
    DashLine("09_cih",    "CI High : " + cihStr,                                 cx, cy, row, lh, corner, clrLightBlue,  9); row++;
    DashLine("10_cil",    "CI Low  : " + cilStr,                                 cx, cy, row, lh, corner, clrLightBlue,  9); row++;
+   // --- ZAP / ZCP / Asian Bias rows (v7.00) ---
+   if(UseZAP) {
+      color  zapClr = g_ZAPActive ? (g_ZAPDir == 1 ? clrLime : clrTomato) : clrGray;
+      string zapStr = g_ZAPActive
+                      ? StringFormat("%s sc=%d [%s]%s", (g_ZAPDir==1?"BUY":"SELL"),
+                                     g_ZAPScore, g_ZAPLabel, (g_ZAPFakeout?" FAKEOUT!":""))
+                      : "IDLE";
+      DashLine("10z_zap",   "ZAP     : " + zapStr,                              cx, cy, row, lh, corner, zapClr,        9); row++;
+   }
+   if(UseZoneConfluence && g_ZAPActive) {
+      color zcpClr = (g_ZoneConfluencePct >= 70.0) ? clrGold : clrSilver;
+      DashLine("10z_zcp",   "ZCP     : " + DoubleToString(g_ZoneConfluencePct, 0) + "%",
+                                                                                 cx, cy, row, lh, corner, zcpClr,        9); row++;
+   }
+   if(AsianBiasEnabled) {
+      color  abClr = g_AsianBiasActive ? (g_AsianBiasDir == 1 ? clrLime : clrTomato) : clrGray;
+      string abStr = g_AsianBiasActive ? g_AsianBiasLabel : "IDLE";
+      DashLine("10z_asian", "AsianBias: " + abStr,                               cx, cy, row, lh, corner, abClr,        9); row++;
+   }
    row++;
 
    // --- Market Structure & Smart Money ---

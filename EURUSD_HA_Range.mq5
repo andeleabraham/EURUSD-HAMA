@@ -6007,6 +6007,11 @@ bool BollingerOverrideCheck(int tradeDir, string &reason)
    // 10 — MTF alignment (H4 and H1 both agree — fullest structural conviction)
    if(g_MTFAligned) { score++; factors += "MTF-aligned "; }
 
+   // 11 — Established Asian Bias confirmed and aligned with trade direction.
+   // When price has already moved AsianBiasMovePips in the trade direction this session,
+   // that is real directional evidence — not noise — and earns one override vote.
+   if(g_AsianBiasActive && g_AsianBiasDir == tradeDir) { score++; factors += "AsianBias "; }
+
    reason = "score=" + IntegerToString(score) + "/" + IntegerToString(BollOverrideMinScore)
             + " [" + factors + "]";
    return (score >= BollOverrideMinScore);
@@ -6864,8 +6869,20 @@ void EvaluateHAPattern()
             hpSessObsBlocker = "NYObs "     + IntegerToString(g_NYBarCount)     + "/" + IntegerToString(NYObserveBars);
          }
          if(hpSessObsOK && g_SessionFakeoutWatch && g_FakeoutDir != 0 && g_FakeoutDir == (isBuy ? 1 : -1)) {
-            hpSessObsOK = false;
-            hpSessObsBlocker = "FakeoutWatch[" + g_FakeoutConfidence + "]: " + g_InterSessContext;
+            // If the Asian Bias is established and aligned with this trade direction, a MEDIUM
+            // fakeout watch is overruled: the price has already moved the required pip distance
+            // in this direction — it is a confirmed Asian trend, not a trap.
+            // A HIGH-confidence fakeout (strong multi-session agreement) still blocks regardless.
+            bool _asianBiasOverrules = AsianBiasEnabled && g_AsianBiasActive
+                                       && g_AsianBiasDir == (isBuy ? 1 : -1)
+                                       && g_FakeoutConfidence != "HIGH";
+            if(_asianBiasOverrules) {
+               hpSessObsBlocker = "";  // allowed — Asian Bias confirmed; MEDIUM fakeout watch suspended
+               Print("[FAKEOUT OVERRIDE] Asian Bias confirmed (", g_AsianBiasLabel, ") overrules MEDIUM fakeout watch");
+            } else {
+               hpSessObsOK = false;
+               hpSessObsBlocker = "FakeoutWatch[" + g_FakeoutConfidence + "]: " + g_InterSessContext;
+            }
          }
       }
       // v6.34: MA200 macro block preflight check (declared here so nextGates can reference them)

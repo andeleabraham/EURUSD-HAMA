@@ -322,8 +322,8 @@ input group "=== VWAP SIGNAL THRESHOLDS ==="
 // Controls when the VWAP sigma-band dashboard decision label fires a BUY/SELL signal.
 // ±1σ (68% zone) is noisy and always shows WAIT. Signals only fire at ±2σ/±3σ with RSI
 // confirmation and sufficient TP room (mean-reversion must have space to reach VWAP).
-input double VWAPRSIOversoldBuy    = 40.0;  // RSI ≤ this: "near oversold" → BUY at -σ2; (−5 pts) = extreme for S.BUY at -σ3
-input double VWAPRSIOverboughtSell = 60.0;  // RSI ≥ this: "near overbought" → SELL at +σ2; (+5 pts) = extreme for S.SELL at +σ3
+input double VWAPRSIOversoldBuy    = 40.0;  // "Strong" BUY RSI thresh (35pts); ≤30=extreme(50pts); ≤(this+5=45)=moderate(20pts); >45=no signal
+input double VWAPRSIOverboughtSell = 60.0;  // "Strong" SELL RSI thresh (35pts); ≥70=extreme(50pts); ≥(this-5=55)=moderate(20pts); <55=no signal
 input double VWAPMinTPRoomUSD      = 3.00;  // Min USD/0.01lot from -σ2 (or +σ2) to VWAP — ensures TP room exists (< this = consolidation)
 input double VWAPBandMinSpreadUSD  = 5.00;  // Min total band spread (-s3 to +s1 in USD/0.01lot) — below = compressed/consolidating → HOLD
 
@@ -10916,7 +10916,7 @@ void UpdateDashboard()
       color  _vDecClr   = clrSilver;
       color  _upperClr  = _hasBands ? clrDodgerBlue : clrDimGray;
       color  _lowerClr  = _hasBands ? clrDodgerBlue : clrDimGray;
-      string _vDecSub   = "";   // signal detail row: RSI, TP room, reason
+      string _vDecSub   = "";   // signal detail sub-row
 
       // Nearest sigma level (for display on decision line)
       string _nearSig  = "";
@@ -10927,109 +10927,137 @@ void UpdateDashboard()
          double _usdPerPip = 0.10;            // EURUSD: $0.10 per pip per 0.01 lot
 
          // --- Band compression guard ---
-         // (-s3 to +s1) and (-s1 to +s3) spans: if either is < VWAPBandMinSpreadUSD
-         // the daily bands are too tight to generate reliable deviation signals.
-         double _spreadLo    = g_VWAPU1  - g_VWAPL3;   // -s3 to +s1 in price
-         double _spreadHi    = g_VWAPU3  - g_VWAPL1;   // -s1 to +s3 in price
+         double _spreadLo    = g_VWAPU1  - g_VWAPL3;
+         double _spreadHi    = g_VWAPU3  - g_VWAPL1;
          double _spreadLoUSD = (_spreadLo / _pipVal) * _usdPerPip;
          double _spreadHiUSD = (_spreadHi / _pipVal) * _usdPerPip;
          bool   _compressed  = (_spreadLoUSD < VWAPBandMinSpreadUSD || _spreadHiUSD < VWAPBandMinSpreadUSD);
 
-         // --- TP room: distance from current price to VWAP midline (in USD/0.01lot) ---
-         // Used as a proxy for "is there enough room for the trade to reach its target?"
+         // --- TP room: distance from current price to VWAP midline ---
          double _tpRoomUSD = (g_VWAPDaily > 0)
                              ? MathAbs(_bid - g_VWAPDaily) / _pipVal * _usdPerPip
                              : 0;
 
-         // --- RSI confirmation thresholds ---
-         bool _rsiNearOversold    = (g_RSI > 0 && g_RSI <= VWAPRSIOversoldBuy);               // e.g. ≤40
-         bool _rsiStrongOversold  = (g_RSI > 0 && g_RSI <= (VWAPRSIOversoldBuy - 5.0));       // e.g. ≤35
-         bool _rsiNearOverbought  = (g_RSI > 0 && g_RSI >= VWAPRSIOverboughtSell);             // e.g. ≥60
-         bool _rsiStrongOverbought = (g_RSI > 0 && g_RSI >= (VWAPRSIOverboughtSell + 5.0));   // e.g. ≥65
+         // --- Graduated RSI confidence: 3-tier point system (0-50 pts per direction) ---
+         //   Tier 3 — Extreme  RSI ≤ 30 / ≥ 70                                  → 50 pts
+         //   Tier 2 — Strong   RSI ≤ VWAPRSIOversoldBuy(40)   / ≥ Sell(60)      → 35 pts
+         //   Tier 1 — Moderate RSI ≤ (Oversold+5)(45) / ≥ (Overbought-5)(55)   → 20 pts
+         //   None              Outside range                                      →  0 pts (no signal)
+         // Gap confidence: σ2→σ3 band uses proportional penetration (10/20/30/40 pts);
+         // beyond σ3 uses absolute USD gap past the sigma (45/48/50 pts).
+         // Combined = RSI pts + Gap pts → shown as SIGNAL-XX% (informational, not a trade blocker).
+         double _maxBuyRSI  = VWAPRSIOversoldBuy  + 5.0;   // widest BUY  threshold (45)
+         double _minSellRSI = VWAPRSIOverboughtSell - 5.0;  // widest SELL threshold (55)
+
+         int _rsiScoreBuy = 0;
+         if     (g_RSI > 0 && g_RSI <= 30.0)                _rsiScoreBuy = 50;
+         else if(g_RSI > 0 && g_RSI <= VWAPRSIOversoldBuy)  _rsiScoreBuy = 35;
+         else if(g_RSI > 0 && g_RSI <= _maxBuyRSI)          _rsiScoreBuy = 20;
+
+         int _rsiScoreSell = 0;
+         if     (g_RSI > 0 && g_RSI >= 70.0)                  _rsiScoreSell = 50;
+         else if(g_RSI > 0 && g_RSI >= VWAPRSIOverboughtSell) _rsiScoreSell = 35;
+         else if(g_RSI > 0 && g_RSI >= _minSellRSI)           _rsiScoreSell = 20;
 
          // ---- Decision zone ----
          if(_compressed) {
-            // Bands too tight: market is consolidating — no reliable deviation signal
-            _vDecision = "HOLD";   _vDecClr = clrGray;
+            // Bands too compressed: market consolidating — no deviation signal reliable
+            _vDecision = "HOLD";  _vDecClr = clrGray;
             _upperClr  = clrDimGray; _lowerClr = clrDimGray;
             _vDecSub   = StringFormat("bands compressed: Lo$%.1f Hi$%.1f < $%.0f",
                                       _spreadLoUSD, _spreadHiUSD, VWAPBandMinSpreadUSD);
 
          } else if(_bid > g_VWAPU3) {
-            // Above +3σ: statistical extreme (0.3% of time) — RSI confirms signal strength
-            if(_rsiStrongOverbought) {
-               _vDecision = "S.SELL"; _vDecClr = clrRed;       _upperClr = clrRed;
-               _vDecSub   = "RSI:" + DoubleToString(g_RSI,0) + " EXTREME overbought";
-            } else if(_rsiNearOverbought) {
-               _vDecision = "S.SELL"; _vDecClr = clrOrangeRed; _upperClr = clrOrangeRed;
-               _vDecSub   = "RSI:" + DoubleToString(g_RSI,0) + " overbought";
-            } else {
-               // RSI not yet confirming extreme — cautious SELL
-               _vDecision = "SELL";   _vDecClr = clrOrange;    _upperClr = clrOrange;
-               _vDecSub   = "RSI:" + DoubleToString(g_RSI,0) + " — weak (await ≥" + DoubleToString(VWAPRSIOverboughtSell,0) + ")";
-            }
+            // Above +3σ (0.3% probability) — USD gap beyond +σ3 drives gap confidence
+            double _extraUSD = (_bid - g_VWAPU3) / _pipVal * _usdPerPip;
+            int    _gapPts   = (_extraUSD < 1.0 ? 45 : (_extraUSD < 2.0 ? 48 : 50));
+            int    _conf     = _rsiScoreSell + _gapPts;
+            if     (_rsiScoreSell >= 50) { _vDecision = "S.SELL"; _vDecClr = clrRed;       _upperClr = clrRed;       }
+            else if(_rsiScoreSell >= 35) { _vDecision = "S.SELL"; _vDecClr = clrOrangeRed; _upperClr = clrOrangeRed; }
+            else if(_rsiScoreSell >= 20) { _vDecision = "SELL";   _vDecClr = clrOrange;    _upperClr = clrOrange;    }
+            else                         { _conf /= 2;
+                                           _vDecision = "SELL";   _vDecClr = clrGoldenrod; _upperClr = clrGoldenrod; }
+            _vDecision = _vDecision + "-" + IntegerToString(_conf) + "%";
+            _vDecSub   = StringFormat("RSI:%d(+%dpts) | +$%.1f past +s3(+%dpts)",
+                                      (int)g_RSI, _rsiScoreSell, _extraUSD, _gapPts);
 
          } else if(_bid > g_VWAPU2) {
-            // +2σ to +3σ: SELL if RSI is near overbought AND TP room exists
-            if(_rsiNearOverbought) {
-               bool _roomOK = (_tpRoomUSD >= VWAPMinTPRoomUSD);
-               if(_roomOK) {
-                  _vDecision = "SELL";  _vDecClr = clrOrangeRed; _upperClr = clrOrangeRed;
-                  _vDecSub   = "RSI:" + DoubleToString(g_RSI,0) + " Rm:$" + DoubleToString(_tpRoomUSD,1) + " OK";
-               } else {
-                  _vDecision = "WAIT";  _vDecClr = clrGold;       _upperClr = clrGold;
-                  _vDecSub   = "ROOM<$" + DoubleToString(VWAPMinTPRoomUSD,0)
-                              + " (got $" + DoubleToString(_tpRoomUSD,1) + ") — may be consolidating";
-               }
+            // +σ2 to +σ3: SELL zone — proportional band penetration + RSI tiered
+            bool   _roomOK = (_tpRoomUSD >= VWAPMinTPRoomUSD);
+            double _bandW  = (g_VWAPU3 > g_VWAPU2) ? (g_VWAPU3 - g_VWAPU2) : 1e-10;
+            double _gap    = _bid - g_VWAPU2;
+            double _pen    = _gap / _bandW;
+            int    _gapPts = (_pen < 0.25 ? 10 : (_pen < 0.50 ? 20 : (_pen < 0.75 ? 30 : 40)));
+            int    _conf   = _rsiScoreSell + _gapPts;
+            if(_rsiScoreSell > 0 && _roomOK) {
+               if     (_rsiScoreSell >= 50) { _vDecision = "S.SELL"; _vDecClr = clrOrangeRed; _upperClr = clrOrangeRed; }
+               else if(_rsiScoreSell >= 35) { _vDecision = "SELL";   _vDecClr = clrOrangeRed; _upperClr = clrOrangeRed; }
+               else                         { _vDecision = "SELL";   _vDecClr = clrOrange;    _upperClr = clrOrange;    }
+               _vDecision = _vDecision + "-" + IntegerToString(_conf) + "%";
+               _vDecSub   = StringFormat("RSI:%d(+%dpts) | %.0f%% into +s2-s3(+%dpts) Rm:$%.1f",
+                                         (int)g_RSI, _rsiScoreSell, _pen * 100.0, _gapPts, _tpRoomUSD);
+            } else if(_rsiScoreSell > 0 && !_roomOK) {
+               _vDecision = "WAIT";   _vDecClr = clrGold;   _upperClr = clrGold;
+               _vDecSub   = StringFormat("RSI:%d OK but ROOM<$%.0f (got $%.1f)",
+                                         (int)g_RSI, VWAPMinTPRoomUSD, _tpRoomUSD);
             } else {
-               _vDecision = "WAIT";    _vDecClr = clrGold;       _upperClr = clrGold;
-               _vDecSub   = "RSI:" + DoubleToString(g_RSI,0) + " — await ≥" + DoubleToString(VWAPRSIOverboughtSell,0);
+               _vDecision = "WAIT";   _vDecClr = clrGold;   _upperClr = clrGold;
+               _vDecSub   = StringFormat("RSI:%.0f — await >=%.0f(mod) />=%.0f(strong) />=70(extreme)",
+                                         g_RSI, _minSellRSI, VWAPRSIOverboughtSell);
             }
 
          } else if(_bid >= g_VWAPL1) {
-            // Within -1σ to +2σ: the 68% value area and the approach zone — WAIT
-            // No directional edge here; crossing ±1σ is normal noise.
-            _vDecision = "WAIT";      _vDecClr = clrSilver;
+            // Within -1σ to +2σ: value area — WAIT always (68-95% zone, normal price action)
             bool _approaching = (_bid > g_VWAPU1);   // between +1σ and +2σ
-            _vDecSub = _approaching ? "→+s2 (await +2σ cross + RSI≥" + DoubleToString(VWAPRSIOverboughtSell,0) + ")"
-                                    : "±1σ value area (68% zone) — wait";
+            _vDecision = "WAIT";  _vDecClr = clrSilver;
+            _vDecSub = _approaching
+               ? StringFormat("→+s2 (await +2σ cross + RSI>=%.0f for SELL)", _minSellRSI)
+               : "±1σ value area (68% zone) — wait";
             if(_approaching) _upperClr = clrGold;
 
          } else if(_bid > g_VWAPL2) {
-            // -1σ to -2σ: approaching lower band — observe, not yet at threshold
-            _vDecision = "WAIT";      _vDecClr = clrSilver;  _lowerClr = clrGold;
-            _vDecSub   = "→-s2 (await -2σ cross + RSI≤" + DoubleToString(VWAPRSIOversoldBuy,0) + ")";
+            // -1σ to -2σ: approaching lower threshold — WAIT and observe
+            _vDecision = "WAIT";  _vDecClr = clrSilver;  _lowerClr = clrGold;
+            _vDecSub   = StringFormat("→-s2 (await -2σ cross + RSI<=%.0f for BUY)", _maxBuyRSI);
 
          } else if(_bid > g_VWAPL3) {
-            // Below -2σ: BUY zone if RSI confirms near-oversold AND TP room is sufficient
-            if(_rsiNearOversold) {
-               bool _roomOK = (_tpRoomUSD >= VWAPMinTPRoomUSD);
-               if(_roomOK) {
-                  _vDecision = "BUY";   _vDecClr = clrAqua;    _lowerClr = clrAqua;
-                  _vDecSub   = "RSI:" + DoubleToString(g_RSI,0) + " Rm:$" + DoubleToString(_tpRoomUSD,1) + " OK";
-               } else {
-                  _vDecision = "WAIT";  _vDecClr = clrGold;    _lowerClr = clrGold;
-                  _vDecSub   = "ROOM<$" + DoubleToString(VWAPMinTPRoomUSD,0)
-                              + " (got $" + DoubleToString(_tpRoomUSD,1) + ") — may be consolidating";
-               }
+            // Below -σ2 (above -σ3): BUY zone — proportional band penetration + RSI tiered
+            bool   _roomOK = (_tpRoomUSD >= VWAPMinTPRoomUSD);
+            double _bandW  = (g_VWAPL2 > g_VWAPL3) ? (g_VWAPL2 - g_VWAPL3) : 1e-10;
+            double _gap    = g_VWAPL2 - _bid;
+            double _pen    = _gap / _bandW;
+            int    _gapPts = (_pen < 0.25 ? 10 : (_pen < 0.50 ? 20 : (_pen < 0.75 ? 30 : 40)));
+            int    _conf   = _rsiScoreBuy + _gapPts;
+            if(_rsiScoreBuy > 0 && _roomOK) {
+               if     (_rsiScoreBuy >= 50) { _vDecision = "S.BUY"; _vDecClr = clrAqua;    _lowerClr = clrAqua;    }
+               else if(_rsiScoreBuy >= 35) { _vDecision = "BUY";   _vDecClr = clrAqua;    _lowerClr = clrAqua;    }
+               else                        { _vDecision = "BUY";   _vDecClr = clrSkyBlue; _lowerClr = clrSkyBlue; }
+               _vDecision = _vDecision + "-" + IntegerToString(_conf) + "%";
+               _vDecSub   = StringFormat("RSI:%d(+%dpts) | %.0f%% into -s2-s3(+%dpts) Rm:$%.1f",
+                                         (int)g_RSI, _rsiScoreBuy, _pen * 100.0, _gapPts, _tpRoomUSD);
+            } else if(_rsiScoreBuy > 0 && !_roomOK) {
+               _vDecision = "WAIT";   _vDecClr = clrGold;   _lowerClr = clrGold;
+               _vDecSub   = StringFormat("RSI:%d OK but ROOM<$%.0f (got $%.1f)",
+                                         (int)g_RSI, VWAPMinTPRoomUSD, _tpRoomUSD);
             } else {
-               _vDecision = "WAIT";    _vDecClr = clrGold;    _lowerClr = clrGold;
-               _vDecSub   = "RSI:" + DoubleToString(g_RSI,0) + " — await ≤" + DoubleToString(VWAPRSIOversoldBuy,0);
+               _vDecision = "WAIT";   _vDecClr = clrGold;   _lowerClr = clrGold;
+               _vDecSub   = StringFormat("RSI:%.0f — await <=%.0f(mod) /<=%.0f(strong) /<=30(extreme)",
+                                         g_RSI, _maxBuyRSI, VWAPRSIOversoldBuy);
             }
 
          } else {
-            // Below -3σ: extreme oversold (0.3% zone) — high-conviction mean-reversion
-            if(_rsiStrongOversold) {
-               _vDecision = "S.BUY";  _vDecClr = clrSpringGreen; _lowerClr = clrSpringGreen;
-               _vDecSub   = "RSI:" + DoubleToString(g_RSI,0) + " EXTREME oversold";
-            } else if(_rsiNearOversold) {
-               _vDecision = "S.BUY";  _vDecClr = clrLime;        _lowerClr = clrLime;
-               _vDecSub   = "RSI:" + DoubleToString(g_RSI,0) + " oversold";
-            } else {
-               // Extreme zone but RSI not confirming — conservative BUY
-               _vDecision = "BUY";   _vDecClr = clrAqua;         _lowerClr = clrAqua;
-               _vDecSub   = "RSI:" + DoubleToString(g_RSI,0) + " — weak (await ≤" + DoubleToString(VWAPRSIOversoldBuy,0) + ")";
-            }
+            // Below -σ3 (0.3% probability) — USD gap beyond -σ3 drives gap confidence
+            double _extraUSD = (g_VWAPL3 - _bid) / _pipVal * _usdPerPip;
+            int    _gapPts   = (_extraUSD < 1.0 ? 45 : (_extraUSD < 2.0 ? 48 : 50));
+            int    _conf     = _rsiScoreBuy + _gapPts;
+            if     (_rsiScoreBuy >= 50) { _vDecision = "S.BUY"; _vDecClr = clrSpringGreen; _lowerClr = clrSpringGreen; }
+            else if(_rsiScoreBuy >= 35) { _vDecision = "S.BUY"; _vDecClr = clrLime;        _lowerClr = clrLime;        }
+            else if(_rsiScoreBuy >= 20) { _vDecision = "BUY";   _vDecClr = clrAqua;        _lowerClr = clrAqua;        }
+            else                        { _conf /= 2;
+                                          _vDecision = "BUY";   _vDecClr = clrSkyBlue;     _lowerClr = clrSkyBlue;     }
+            _vDecision = _vDecision + "-" + IntegerToString(_conf) + "%";
+            _vDecSub   = StringFormat("RSI:%d(+%dpts) | -$%.1f past -s3(+%dpts)",
+                                      (int)g_RSI, _rsiScoreBuy, _extraUSD, _gapPts);
          }
 
          // ---- Nearest sigma level to current price ----

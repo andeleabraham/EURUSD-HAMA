@@ -324,7 +324,8 @@ input group "=== VWAP SIGNAL THRESHOLDS ==="
 // confirmation and sufficient TP room (mean-reversion must have space to reach VWAP).
 input double VWAPRSIOversoldBuy    = 40.0;  // "Strong" BUY RSI thresh (35pts); ≤30=extreme(50pts); ≤(this+5=45)=moderate(20pts); >45=no signal
 input double VWAPRSIOverboughtSell = 60.0;  // "Strong" SELL RSI thresh (35pts); ≥70=extreme(50pts); ≥(this-5=55)=moderate(20pts); <55=no signal
-input double VWAPMinTPRoomUSD      = 3.00;  // Min USD/0.01lot from -σ2 (or +σ2) to VWAP — ensures TP room exists (< this = consolidation)
+input double VWAPMinTPRoomUSD      = 3.00;  // Min USD/0.01lot from -σ2 (or +σ2) to VWAP — hard floor during NY overlap+
+input double VWAPMinTPRoomAsiaLon = 2.50;  // Relaxed TP room floor for Asia+London (pre-NY overlap) — fires W.BUY/W.SELL with -15pt confidence penalty
 input double VWAPBandMinSpreadUSD  = 5.00;  // Min total band spread (-s3 to +s1 in USD/0.01lot) — below = compressed/consolidating → HOLD
 
 input group "=== GEOPOLITICAL BIAS ==="
@@ -10938,6 +10939,11 @@ void UpdateDashboard()
                              ? MathAbs(_bid - g_VWAPDaily) / _pipVal * _usdPerPip
                              : 0;
 
+         // Session-aware TP room relaxation: Asia+London (pre-NY overlap) uses $2.5 soft floor
+         // NY overlap and later always require the full $3 hard floor.
+         MqlDateTime _vDt; TimeToStruct(TimeCurrent(), _vDt);
+         bool _preNYOverlap = (_vDt.hour < NewYorkStartHour);
+
          // --- Graduated RSI confidence: 3-tier point system (0-50 pts per direction) ---
          //   Tier 3 — Extreme  RSI ≤ 30 / ≥ 70                                  → 50 pts
          //   Tier 2 — Strong   RSI ≤ VWAPRSIOversoldBuy(40)   / ≥ Sell(60)      → 35 pts
@@ -10983,23 +10989,32 @@ void UpdateDashboard()
 
          } else if(_bid > g_VWAPU2) {
             // +σ2 to +σ3: SELL zone — proportional band penetration + RSI tiered
-            bool   _roomOK = (_tpRoomUSD >= VWAPMinTPRoomUSD);
+            // Full room (>=$3 always valid) | Weak room ($2.5-3 Asia/Lon only, -15pt pen) | No room = WAIT
+            bool   _fullRoom = (_tpRoomUSD >= VWAPMinTPRoomUSD);
+            bool   _weakRoom = (!_fullRoom && _preNYOverlap && _tpRoomUSD >= VWAPMinTPRoomAsiaLon);
             double _bandW  = (g_VWAPU3 > g_VWAPU2) ? (g_VWAPU3 - g_VWAPU2) : 1e-10;
             double _gap    = _bid - g_VWAPU2;
             double _pen    = _gap / _bandW;
             int    _gapPts = (_pen < 0.25 ? 10 : (_pen < 0.50 ? 20 : (_pen < 0.75 ? 30 : 40)));
             int    _conf   = _rsiScoreSell + _gapPts;
-            if(_rsiScoreSell > 0 && _roomOK) {
+            if(_rsiScoreSell > 0 && _fullRoom) {
                if     (_rsiScoreSell >= 50) { _vDecision = "S.SELL"; _vDecClr = clrOrangeRed; _upperClr = clrOrangeRed; }
                else if(_rsiScoreSell >= 35) { _vDecision = "SELL";   _vDecClr = clrOrangeRed; _upperClr = clrOrangeRed; }
                else                         { _vDecision = "SELL";   _vDecClr = clrOrange;    _upperClr = clrOrange;    }
                _vDecision = _vDecision + "-" + IntegerToString(_conf) + "%";
                _vDecSub   = StringFormat("RSI:%d(+%dpts) | %.0f%% into +s2-s3(+%dpts) Rm:$%.1f",
                                          (int)g_RSI, _rsiScoreSell, _pen * 100.0, _gapPts, _tpRoomUSD);
-            } else if(_rsiScoreSell > 0 && !_roomOK) {
+            } else if(_rsiScoreSell > 0 && _weakRoom) {
+               int _wConf = MathMax(_conf - 15, 0);
+               _vDecision = "W.SELL-" + IntegerToString(_wConf) + "%";
+               _vDecClr = clrGoldenrod;  _upperClr = clrGoldenrod;
+               _vDecSub = StringFormat("WEAK(Asia/Lon): Rm$%.1f vs $%.0f req | RSI:%d(+%dpts) pen-15",
+                                        _tpRoomUSD, VWAPMinTPRoomUSD, (int)g_RSI, _rsiScoreSell);
+            } else if(_rsiScoreSell > 0) {
                _vDecision = "WAIT";   _vDecClr = clrGold;   _upperClr = clrGold;
-               _vDecSub   = StringFormat("RSI:%d OK but ROOM<$%.0f (got $%.1f)",
-                                         (int)g_RSI, VWAPMinTPRoomUSD, _tpRoomUSD);
+               double _minR = _preNYOverlap ? VWAPMinTPRoomAsiaLon : VWAPMinTPRoomUSD;
+               _vDecSub   = StringFormat("RSI:%d OK but ROOM<$%.1f (got $%.1f)",
+                                         (int)g_RSI, _minR, _tpRoomUSD);
             } else {
                _vDecision = "WAIT";   _vDecClr = clrGold;   _upperClr = clrGold;
                _vDecSub   = StringFormat("RSI:%.0f — await >=%.0f(mod) />=%.0f(strong) />=70(extreme)",
@@ -11022,23 +11037,32 @@ void UpdateDashboard()
 
          } else if(_bid > g_VWAPL3) {
             // Below -σ2 (above -σ3): BUY zone — proportional band penetration + RSI tiered
-            bool   _roomOK = (_tpRoomUSD >= VWAPMinTPRoomUSD);
+            // Full room (>=$3 always valid) | Weak room ($2.5-3 Asia/Lon only, -15pt pen) | No room = WAIT
+            bool   _fullRoom = (_tpRoomUSD >= VWAPMinTPRoomUSD);
+            bool   _weakRoom = (!_fullRoom && _preNYOverlap && _tpRoomUSD >= VWAPMinTPRoomAsiaLon);
             double _bandW  = (g_VWAPL2 > g_VWAPL3) ? (g_VWAPL2 - g_VWAPL3) : 1e-10;
             double _gap    = g_VWAPL2 - _bid;
             double _pen    = _gap / _bandW;
             int    _gapPts = (_pen < 0.25 ? 10 : (_pen < 0.50 ? 20 : (_pen < 0.75 ? 30 : 40)));
             int    _conf   = _rsiScoreBuy + _gapPts;
-            if(_rsiScoreBuy > 0 && _roomOK) {
+            if(_rsiScoreBuy > 0 && _fullRoom) {
                if     (_rsiScoreBuy >= 50) { _vDecision = "S.BUY"; _vDecClr = clrAqua;    _lowerClr = clrAqua;    }
                else if(_rsiScoreBuy >= 35) { _vDecision = "BUY";   _vDecClr = clrAqua;    _lowerClr = clrAqua;    }
                else                        { _vDecision = "BUY";   _vDecClr = clrSkyBlue; _lowerClr = clrSkyBlue; }
                _vDecision = _vDecision + "-" + IntegerToString(_conf) + "%";
                _vDecSub   = StringFormat("RSI:%d(+%dpts) | %.0f%% into -s2-s3(+%dpts) Rm:$%.1f",
                                          (int)g_RSI, _rsiScoreBuy, _pen * 100.0, _gapPts, _tpRoomUSD);
-            } else if(_rsiScoreBuy > 0 && !_roomOK) {
+            } else if(_rsiScoreBuy > 0 && _weakRoom) {
+               int _wConf = MathMax(_conf - 15, 0);
+               _vDecision = "W.BUY-" + IntegerToString(_wConf) + "%";
+               _vDecClr = clrSteelBlue;  _lowerClr = clrSteelBlue;
+               _vDecSub = StringFormat("WEAK(Asia/Lon): Rm$%.1f vs $%.0f req | RSI:%d(+%dpts) pen-15",
+                                        _tpRoomUSD, VWAPMinTPRoomUSD, (int)g_RSI, _rsiScoreBuy);
+            } else if(_rsiScoreBuy > 0) {
                _vDecision = "WAIT";   _vDecClr = clrGold;   _lowerClr = clrGold;
-               _vDecSub   = StringFormat("RSI:%d OK but ROOM<$%.0f (got $%.1f)",
-                                         (int)g_RSI, VWAPMinTPRoomUSD, _tpRoomUSD);
+               double _minR = _preNYOverlap ? VWAPMinTPRoomAsiaLon : VWAPMinTPRoomUSD;
+               _vDecSub   = StringFormat("RSI:%d OK but ROOM<$%.1f (got $%.1f)",
+                                         (int)g_RSI, _minR, _tpRoomUSD);
             } else {
                _vDecision = "WAIT";   _vDecClr = clrGold;   _lowerClr = clrGold;
                _vDecSub   = StringFormat("RSI:%.0f — await <=%.0f(mod) /<=%.0f(strong) /<=30(extreme)",

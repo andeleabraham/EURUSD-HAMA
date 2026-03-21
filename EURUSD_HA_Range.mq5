@@ -399,6 +399,25 @@ double g_TodayHigh  = 0, g_TodayLow  = 0, g_TodayOpen  = 0;
 double g_RangeHigh  = 0, g_RangeLow  = 0, g_RangeMid = 0;
 double g_PrevDayHigh= 0, g_PrevDayLow = 0;  // yesterday only (fixed reference)
 double g_PrevWeekHigh = 0, g_PrevWeekLow = 0;  // W1[1] previous completed week
+
+// --- VWAP globals (computed each new bar, displayed on dashboard) -----------
+double g_VWAPDaily  = 0;    // Daily VWAP — resets at midnight
+double g_VWAPU1     = 0;    // Daily +1σ band
+double g_VWAPL1     = 0;    // Daily −1σ band
+double g_VWAPU2     = 0;    // Daily +2σ band
+double g_VWAPL2     = 0;    // Daily −2σ band
+double g_VWAPU3     = 0;    // Daily +3σ band
+double g_VWAPL3     = 0;    // Daily −3σ band
+double g_VWAPAsian  = 0;    // Asian session VWAP (0 when outside session)
+double g_VWAPLondon = 0;    // London session VWAP
+double g_VWAPNY     = 0;    // NY session VWAP
+// Cumulative sums — maintained across bars, reset at boundaries
+double g_VCumTP_D   = 0, g_VCumVol_D = 0, g_VCumTSq_D = 0;  // daily
+double g_VCumTP_A   = 0, g_VCumVol_A = 0;                    // Asian
+double g_VCumTP_L   = 0, g_VCumVol_L = 0;                    // London
+double g_VCumTP_N   = 0, g_VCumVol_N = 0;                    // NY
+datetime g_VLastDay   = 0;                                     // boundary trackers
+datetime g_VLastSessA = 0, g_VLastSessL = 0, g_VLastSessN = 0;
 double g_ThreeDayHigh = 0, g_ThreeDayLow = 0;  // rolling 3-day high/low (D1[0..2])
 double g_Murray[9];            // Murray Math octave levels [0/8 .. 8/8]
 double g_MurrayBase  = 0;     // Murray channel base price (lowest octave)
@@ -1618,6 +1637,7 @@ void OnTick()
       UpdateSessionRanges();
       g_CurrentLot = CalcLot();
       ComputeATR();
+      ComputeVWAP();
       CalcBollinger();
       UpdateMAValues();  // v6.36: moved from per-tick to per-bar (values only change on bar close)
       SetActiveRange();
@@ -2262,6 +2282,104 @@ void ComputeATR()
       g_CIHigh = mid + ATRMultiplierCI * g_ATR;
       g_CILow  = mid - ATRMultiplierCI * g_ATR;
    }
+}
+
+//+------------------------------------------------------------------+
+//|  VWAP — Volume-Weighted Average Price                             |
+//|  Called on each new M15 bar.  Uses bar shift 1 (last closed bar).|
+//|  On first call (g_VLastDay == 0) or on day boundary, re-scans    |
+//|  ALL closed bars of today so a cold-start EA is correctly seeded.  |
+//|  σ bands use the single-pass formula: σ²=E(X²)−E(X)²            |
+//+------------------------------------------------------------------+
+void _VWAPAccumBar(int shift)
+{
+   datetime bt = iTime(_Symbol, PERIOD_M15, shift);
+   if(bt <= 0) return;
+   MqlDateTime bdt;
+   TimeToStruct(bt, bdt);
+   datetime barDay = bt - (datetime)(bdt.hour * 3600 + bdt.min * 60 + bdt.sec);
+
+   bool inA = (bdt.hour >= AsianStartHour   && bdt.hour < AsianEndHour);
+   bool inL = (bdt.hour >= LondonStartHour  && bdt.hour < LondonEndHour);
+   bool inN = (bdt.hour >= NewYorkStartHour && bdt.hour < NewYorkEndHour);
+
+   // Session-boundary keys
+   datetime sA = barDay + (datetime)(AsianStartHour   * 3600);
+   datetime sL = barDay + (datetime)(LondonStartHour  * 3600);
+   datetime sN = barDay + (datetime)(NewYorkStartHour * 3600);
+
+   if(inA && sA != g_VLastSessA) { g_VCumTP_A = 0; g_VCumVol_A = 0; g_VLastSessA = sA; }
+   if(inL && sL != g_VLastSessL) { g_VCumTP_L = 0; g_VCumVol_L = 0; g_VLastSessL = sL; }
+   if(inN && sN != g_VLastSessN) { g_VCumTP_N = 0; g_VCumVol_N = 0; g_VLastSessN = sN; }
+
+   double tp  = (iHigh(_Symbol, PERIOD_M15, shift) + iLow(_Symbol, PERIOD_M15, shift)
+               + iClose(_Symbol, PERIOD_M15, shift)) / 3.0;
+   double vol = (double)iTickVolume(_Symbol, PERIOD_M15, shift);
+   if(vol <= 0) vol = 1.0;
+
+   g_VCumTP_D  += tp * vol;
+   g_VCumVol_D += vol;
+   g_VCumTSq_D += vol * tp * tp;
+   if(inA) { g_VCumTP_A += tp * vol; g_VCumVol_A += vol; }
+   if(inL) { g_VCumTP_L += tp * vol; g_VCumVol_L += vol; }
+   if(inN) { g_VCumTP_N += tp * vol; g_VCumVol_N += vol; }
+}
+
+void ComputeVWAP()
+{
+   datetime now = TimeCurrent();
+   MqlDateTime dt;
+   TimeToStruct(now, dt);
+   datetime dayStart = now - (datetime)(dt.hour * 3600 + dt.min * 60 + dt.sec);
+
+   // ---- Day boundary (or cold start when g_VLastDay == 0) ----
+   if(dayStart != g_VLastDay) {
+      g_VLastDay   = dayStart;
+      g_VCumTP_D   = 0; g_VCumVol_D = 0; g_VCumTSq_D = 0;
+      g_VCumTP_A   = 0; g_VCumVol_A = 0;
+      g_VCumTP_L   = 0; g_VCumVol_L = 0;
+      g_VCumTP_N   = 0; g_VCumVol_N = 0;
+      g_VLastSessA = 0; g_VLastSessL = 0; g_VLastSessN = 0;
+      g_VWAPDaily  = 0; g_VWAPU1 = 0; g_VWAPL1 = 0; g_VWAPU2 = 0; g_VWAPL2 = 0; g_VWAPU3 = 0; g_VWAPL3 = 0;
+      g_VWAPAsian  = 0; g_VWAPLondon = 0; g_VWAPNY = 0;
+
+      // Re-scan all closed bars of today (oldest→newest, skip live bar 0)
+      int barsToday = iBarShift(_Symbol, PERIOD_M15, dayStart, false);
+      if(barsToday < 0) barsToday = 0;
+      if(barsToday > 300) barsToday = 300;   // safety cap
+
+      for(int s = barsToday; s >= 1; s--) {
+         datetime bt = iTime(_Symbol, PERIOD_M15, s);
+         if(bt < dayStart) continue;          // skip any bar before today
+         _VWAPAccumBar(s);
+      }
+   } else {
+      // ---- Same day: accumulate only the newest closed bar (shift 1) ----
+      datetime bt = iTime(_Symbol, PERIOD_M15, 1);
+      if(bt >= dayStart)
+         _VWAPAccumBar(1);
+   }
+
+   // ---- Recompute display values ----
+   if(g_VCumVol_D > 0) {
+      g_VWAPDaily    = g_VCumTP_D / g_VCumVol_D;
+      double var     = (g_VCumTSq_D / g_VCumVol_D) - (g_VWAPDaily * g_VWAPDaily);
+      double sigma   = (var > 0) ? MathSqrt(var) : 0;
+      g_VWAPU1 = g_VWAPDaily + sigma;
+      g_VWAPL1 = g_VWAPDaily - sigma;
+      g_VWAPU2 = g_VWAPDaily + 2.0 * sigma;
+      g_VWAPL2 = g_VWAPDaily - 2.0 * sigma;
+      g_VWAPU3 = g_VWAPDaily + 3.0 * sigma;
+      g_VWAPL3 = g_VWAPDaily - 3.0 * sigma;
+   }
+
+   bool inA = (dt.hour >= AsianStartHour   && dt.hour < AsianEndHour);
+   bool inL = (dt.hour >= LondonStartHour  && dt.hour < LondonEndHour);
+   bool inN = (dt.hour >= NewYorkStartHour && dt.hour < NewYorkEndHour);
+
+   g_VWAPAsian  = (inA && g_VCumVol_A > 0) ? g_VCumTP_A / g_VCumVol_A : 0;
+   g_VWAPLondon = (inL && g_VCumVol_L > 0) ? g_VCumTP_L / g_VCumVol_L : 0;
+   g_VWAPNY     = (inN && g_VCumVol_N > 0) ? g_VCumTP_N / g_VCumVol_N : 0;
 }
 
 //+------------------------------------------------------------------+
@@ -10023,7 +10141,7 @@ void UpdateDashboard()
          ObjectSetInteger(0, bgName, OBJPROP_SELECTABLE,   false);
       }
       // Right-column panel
-      int    bgWR   = 310;
+      int    bgWR   = 390;
       int    bgXR   = MathMax(0, rx - bgPad);
       string bgNameR = DASH_PREFIX + "BG_panel_R";
       if(ObjectFind(0, bgNameR) < 0) {
@@ -10619,6 +10737,58 @@ void UpdateDashboard()
    }
    rowR++;
 
+   // --- VWAP Table (text values — visual lines are in VWAP_Sessions indicator) ---
+   {
+      double _bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+
+      // Header
+      DashLine("R_vwap_hdr", "--- VWAP ---", rx, cy, rowR, lh, corner, clrSilver, 8); rowR++;
+
+      // Daily VWAP + pips from current price
+      string _vDailyStr;
+      color  _vDailyClr;
+      if(g_VWAPDaily > 0) {
+         double _delta = (_bid - g_VWAPDaily) / _Point / 10.0;
+         string _arrow = (_delta >= 0) ? "+" : "";
+         _vDailyStr = "Daily:" + DoubleToString(g_VWAPDaily, _Digits)
+                    + "  " + _arrow + DoubleToString(_delta, 1) + "p";
+         _vDailyClr = (_delta >= 0) ? clrLime : clrTomato;
+      } else {
+         _vDailyStr = "Daily: ---";
+         _vDailyClr = clrDimGray;
+      }
+      DashLine("R_vwap_daily", _vDailyStr, rx, cy, rowR, lh, corner, _vDailyClr, 9); rowR++;
+
+      // Upper bands: +σ1  +σ2  +σ3
+      bool _hasBands = (g_VWAPU1 > 0);
+      string _vUstr = _hasBands
+         ? "+s1:" + DoubleToString(g_VWAPU1, _Digits)
+         + "  +s2:" + DoubleToString(g_VWAPU2, _Digits)
+         + "  +s3:" + DoubleToString(g_VWAPU3, _Digits)
+         : "+s1:---  +s2:---  +s3:---";
+      DashLine("R_vwap_upper", _vUstr, rx, cy, rowR, lh, corner,
+               _hasBands ? clrDodgerBlue : clrDimGray, 8); rowR++;
+
+      // Lower bands: -σ1  -σ2  -σ3
+      string _vLstr = _hasBands
+         ? "-s1:" + DoubleToString(g_VWAPL1, _Digits)
+         + "  -s2:" + DoubleToString(g_VWAPL2, _Digits)
+         + "  -s3:" + DoubleToString(g_VWAPL3, _Digits)
+         : "-s1:---  -s2:---  -s3:---";
+      DashLine("R_vwap_lower", _vLstr, rx, cy, rowR, lh, corner,
+               _hasBands ? clrDodgerBlue : clrDimGray, 8); rowR++;
+
+      // Session VWAPs (active session highlighted in cyan, inactive in silver)
+      string _sAs = (g_VWAPAsian  > 0) ? "As:" + DoubleToString(g_VWAPAsian,  _Digits) : "As:---";
+      string _sLo = (g_VWAPLondon > 0) ? "Lo:" + DoubleToString(g_VWAPLondon, _Digits) : "Lo:---";
+      string _sNY = (g_VWAPNY     > 0) ? "NY:" + DoubleToString(g_VWAPNY,     _Digits) : "NY:---";
+      bool _anySessActive = (g_VWAPAsian > 0 || g_VWAPLondon > 0 || g_VWAPNY > 0);
+      DashLine("R_vwap_sess", _sAs + "  " + _sLo + "  " + _sNY, rx, cy, rowR, lh, corner,
+               _anySessActive ? clrCyan : clrDimGray, 8); rowR++;
+
+      rowR++;  // blank spacer
+   }
+
    // --- Trade Status (ALL rows ALWAYS rendered — prevents label overlap) ---
    {
       // Fetch live entry price + net P&L from the position for display
@@ -11178,7 +11348,7 @@ void UpdateDashboard()
    // --- Right panel sizing ---
    {
       int    bgPad  = 5;
-      int    bgWR   = 310;
+      int    bgWR   = 390;
       int    bgH    = rowR * lh + bgPad * 2;
       int    bgXR   = MathMax(0, rx - bgPad);
       int    bgY    = MathMax(0, cy - bgPad);

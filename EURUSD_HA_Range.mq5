@@ -10809,9 +10809,9 @@ void UpdateDashboard()
    color  rangeAncClr  = _usingPrev ? clrOrange : clrAqua;
    DashLine("04d_ranc", "RngSrc  : " + rangeAnchor,                             cx, cy, row, lh, corner, rangeAncClr,   8); row++;
 
-   DashLine("05_rh",     "Range H:" + rhStr + "  L:" + rlStr + "  M:" + rmStr, cx, cy, row, lh, corner, clrAqua,       9);
-   DashLine("06_rl",     "",                                                     cx, cy, row, lh, corner, clrAqua,       9);
-   DashLine("07_rm",     "",                                                     cx, cy, row, lh, corner, clrAqua,       9);
+   DashLine("05_rh",     "Range H:" + rhStr + "  L:" + rlStr + "  M:" + rmStr, cx, cy, row,  lh, corner, clrAqua,       9);
+   DashLine("06_rl",     "",                                                     cx, cy, 9999, lh, corner, clrAqua,       9);
+   DashLine("07_rm",     "",                                                     cx, cy, 9999, lh, corner, clrAqua,       9);
    row++;
    // Yesterday's fixed reference (does not expand intraday)
    string pdHStr = (g_PrevDayHigh > 0) ? "Prev H:" + DoubleToString(g_PrevDayHigh, 5) +
@@ -10825,8 +10825,8 @@ void UpdateDashboard()
    string cilStr = (g_CILow  > 0) ? DoubleToString(g_CILow,  5) : "N/A";
    DashLine("08_atr",    "ATR H1  : " + DoubleToString(g_ATR * 10000, 1) + " pips",
                                                                                  cx, cy, row, lh, corner, clrWhite,      9); row++;
-   DashLine("09_cih",    "CI  Hi:" + cihStr + "  Lo:" + cilStr,                 cx, cy, row, lh, corner, clrLightBlue,  9);
-   DashLine("10_cil",    "",                                                     cx, cy, row, lh, corner, clrLightBlue,  9);
+   DashLine("09_cih",    "CI  Hi:" + cihStr + "  Lo:" + cilStr,                 cx, cy, row,  lh, corner, clrLightBlue,  9);
+   DashLine("10_cil",    "",                                                     cx, cy, 9999, lh, corner, clrLightBlue,  9);
    row++;
    // --- ZAP / ZCP / Asian Bias rows (v7.00) ---
    if(UseZAP) {
@@ -11001,36 +11001,36 @@ void UpdateDashboard()
    if(g_AsianSeeded || g_AsianHigh > 0) {
       DashLine("11a_asian",  "Asian  O:" + DoubleToString(g_AsianOpen, 5) +
                              "  H:" + DoubleToString(g_AsianHigh, 5) +
-                             "  L:" + DoubleToString(g_AsianLow,  5),           cx, cy, row, lh, corner, clrSilver, 9);
-      DashLine("11b_asian",  "",                                                cx, cy, row, lh, corner, clrSilver, 9);
+                             "  L:" + DoubleToString(g_AsianLow,  5),           cx, cy, row,  lh, corner, clrSilver, 9);
+      DashLine("11b_asian",  "",                                                cx, cy, 9999, lh, corner, clrSilver, 9);
       row++;
    } else {
-      DashLine("11a_asian",  "Asian   : Forming...",                           cx, cy, row, lh, corner, clrGray,   9);
-      DashLine("11b_asian",  "",                                                cx, cy, row, lh, corner, clrGray,   9);
+      DashLine("11a_asian",  "Asian   : Forming...",                           cx, cy, row,  lh, corner, clrGray,   9);
+      DashLine("11b_asian",  "",                                                cx, cy, 9999, lh, corner, clrGray,   9);
       row++;
    }
    // London session O/H/L (one row)
    if(g_LondonSeeded || g_LondonHigh > 0) {
       DashLine("12a_london", "London O:" + DoubleToString(g_LondonOpen, 5) +
                              "  H:" + DoubleToString(g_LondonHigh, 5) +
-                             "  L:" + DoubleToString(g_LondonLow,  5),          cx, cy, row, lh, corner, clrSilver, 9);
-      DashLine("12b_london", "",                                                cx, cy, row, lh, corner, clrSilver, 9);
+                             "  L:" + DoubleToString(g_LondonLow,  5),          cx, cy, row,  lh, corner, clrSilver, 9);
+      DashLine("12b_london", "",                                                cx, cy, 9999, lh, corner, clrSilver, 9);
       row++;
    } else {
-      DashLine("12a_london", "London  : Forming...",                           cx, cy, row, lh, corner, clrGray,   9);
-      DashLine("12b_london", "",                                                cx, cy, row, lh, corner, clrGray,   9);
+      DashLine("12a_london", "London  : Forming...",                           cx, cy, row,  lh, corner, clrGray,   9);
+      DashLine("12b_london", "",                                                cx, cy, 9999, lh, corner, clrGray,   9);
       row++;
    }
    // New York session O/H/L (one row)
    if(g_NYSeeded || g_NYHigh > 0) {
       DashLine("13a_ny",     "NewYork O:" + DoubleToString(g_NYOpen, 5) +
                              "  H:" + DoubleToString(g_NYHigh, 5) +
-                             "  L:" + DoubleToString(g_NYLow,  5),              cx, cy, row, lh, corner, clrSilver, 9);
-      DashLine("13b_ny",     "",                                                cx, cy, row, lh, corner, clrSilver, 9);
+                             "  L:" + DoubleToString(g_NYLow,  5),              cx, cy, row,  lh, corner, clrSilver, 9);
+      DashLine("13b_ny",     "",                                                cx, cy, 9999, lh, corner, clrSilver, 9);
       row++;
    } else {
-      DashLine("13a_ny",     "NewYork : Waiting...",                           cx, cy, row, lh, corner, clrGray,   9);
-      DashLine("13b_ny",     "",                                                cx, cy, row, lh, corner, clrGray,   9);
+      DashLine("13a_ny",     "NewYork : Waiting...",                           cx, cy, row,  lh, corner, clrGray,   9);
+      DashLine("13b_ny",     "",                                                cx, cy, 9999, lh, corner, clrGray,   9);
       row++;
    }
    row++;
@@ -11884,176 +11884,122 @@ void UpdateDashboard()
    }
    rowR++;
 
-   // --- Manual Trades Panel ---
-   // Header shows count and total lots on one line; individual trades below
+   // --- OB / FVG Zones Panel ---
+   // Push all old manual-trade label objects off-screen to clear stale chart text
    {
-      string mtHdrStr;
-      color  mtHdrClr;
-      if(g_ManualTradeCount > 0) {
-         mtHdrStr = "--- MANUAL (" + IntegerToString(g_ManualTradeCount) + " | " +
-                    DoubleToString(g_ForeignLotsSymbol, 2) + "L) ---";
-         mtHdrClr = clrOrangeRed;
-      } else if(g_ForeignCountTotal > 0) {
-         mtHdrStr = "--- MANUAL (other pairs: " + IntegerToString(g_ForeignCountTotal) + ") ---";
-         mtHdrClr = clrSilver;
-      } else {
-         mtHdrStr = "--- MANUAL TRADES ---";
-         mtHdrClr = clrSilver;
-      }
-      DashLine("R_mthdr", mtHdrStr, rx, cy, rowR, lh, corner, mtHdrClr, 8); rowR++;
+      string _mOld[] = {"R_mthdr","R_mt0_h","R_mt0_sl","R_mt0_st","R_mt0_w",
+                         "R_mt1_h","R_mt1_sl","R_mt1_st","R_mt1_w",
+                         "R_mtxtra","R_mtnone","R_fgnw"};
+      for(int _zm = 0; _zm < 12; _zm++)
+         DashLine(_mOld[_zm], "", rx, cy, 9999, lh, corner, clrDimGray, 8);
    }
-
-   // Up to 1 trade shown in full; 2nd+ summarised
-   int mtShow = MathMin(g_ManualTradeCount, 1);
-   for(int _mi = 0; _mi < 1; _mi++) {   // render 1 trade block; second slot cleared below
-      string pfx = "R_mt" + IntegerToString(_mi);
-      if(_mi < mtShow) {
-         ManualTradeInfo mt = g_ManualTrades[_mi];
-         double bid    = SymbolInfoDouble(_Symbol, SYMBOL_BID);
-         double pipSz  = _Point * 10.0;
-         double slPips = (mt.sl > 0) ? MathAbs(mt.openPrice - mt.sl)   / pipSz : 0;
-         double tpPips = (mt.tp > 0) ? MathAbs(mt.tp        - mt.openPrice) / pipSz : 0;
-         double rr     = (slPips > 0.1 && tpPips > 0.1) ? tpPips / slPips : 0;
-         int    conf   = ManualTradeConf(mt.dir);
-         string dirLbl = (mt.dir == 1) ? "[BUY] " : "[SELL]";
-         color  dirClr = (mt.dir == 1) ? clrLime  : clrTomato;
-         string srcLbl = mt.isManual ? "" : " EA:" + IntegerToString((int)mt.magic);
-         string pnlLbl = (mt.pnl >= 0 ? "+$" : "-$") + DoubleToString(MathAbs(mt.pnl), 2);
-         color  pnlClr = (mt.pnl >= 0) ? clrLime : clrTomato;
-
-         // --- Row 1: Direction | Lots | Entry | Net P&L ---
-         string r1 = dirLbl + " " + DoubleToString(mt.lots, 2) + "L" + srcLbl +
-                     "  @" + DoubleToString(mt.openPrice, _Digits) +
-                     "  Net:" + pnlLbl;
-         DashLine(pfx + "_h", r1, rx, cy, rowR, lh, corner, dirClr, 9); rowR++;
-
-         // --- Row 2: SL/TP details or NO SL warning ---
-         string r2;  color r2Clr;
-         if(mt.sl == 0 && mt.tp == 0) {
-            r2    = "!! NO SL & NO TP — risk fully unmanaged";
-            r2Clr = clrRed;
-         } else if(mt.sl == 0) {
-            double tpP = tpPips;
-            r2    = "!! NO SL  TP:" + DoubleToString(mt.tp, _Digits) +
-                    "(" + DoubleToString(tpP, 1) + "p)  Suggest SL:" +
-                    DoubleToString(mt.dir == 1
-                                   ? mt.openPrice - 1.5 * g_ATR
-                                   : mt.openPrice + 1.5 * g_ATR, _Digits);
-            r2Clr = clrOrangeRed;
-         } else if(mt.tp == 0) {
-            r2    = "SL:" + DoubleToString(mt.sl, _Digits) +
-                    "(" + DoubleToString(slPips, 1) + "p)  !! NO TP — add target";
-            r2Clr = clrOrange;
+   DashLine("R_zhdr", "--- OB / FVG ZONES ---", rx, cy, rowR, lh, corner, clrWhite, 9); rowR++;
+   {
+      double _zbid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+      double _zpip = _Point * 10.0;
+      int    _ztDir = g_VWAPSlopeDir;   // 1=up, -1=down, 0=flat (trend context)
+      string _zLbl[12]; double _zLo[12]; double _zHi[12];
+      int    _zDir[12]; bool   _zH4[12]; bool   _zNear[12];
+      int    _zCnt = 0;
+      // H4 Bull OB (macro demand)
+      if(g_H4BullOB_High > 0 && _zCnt < 12) {
+         _zLbl[_zCnt]="H4-OB"; _zLo[_zCnt]=g_H4BullOB_Low; _zHi[_zCnt]=g_H4BullOB_High;
+         _zDir[_zCnt]=1; _zH4[_zCnt]=true; _zNear[_zCnt]=g_NearH4BullOB; _zCnt++;
+      }
+      // H4 Bear OB (macro supply)
+      if(g_H4BearOB_High > 0 && _zCnt < 12) {
+         _zLbl[_zCnt]="H4-OB"; _zLo[_zCnt]=g_H4BearOB_Low; _zHi[_zCnt]=g_H4BearOB_High;
+         _zDir[_zCnt]=-1; _zH4[_zCnt]=true; _zNear[_zCnt]=g_NearH4BearOB; _zCnt++;
+      }
+      // H4 FVGs (macro imbalance)
+      for(int _zf = 0; _zf < g_H4FVGCount && _zCnt < 12; _zf++) {
+         if(g_H4FVGs[_zf].filled) continue;
+         double _zce = (g_H4FVGs[_zf].high + g_H4FVGs[_zf].low) / 2.0;
+         _zLbl[_zCnt]="H4-FVG"; _zLo[_zCnt]=g_H4FVGs[_zf].low; _zHi[_zCnt]=g_H4FVGs[_zf].high;
+         _zDir[_zCnt]=g_H4FVGs[_zf].dir; _zH4[_zCnt]=true;
+         _zNear[_zCnt]=(MathAbs(_zbid - _zce) < 20.0 * _zpip); _zCnt++;
+      }
+      // H1 Bull OBs (intraday demand)
+      for(int _zb = 0; _zb < g_BullOBCount && _zCnt < 12; _zb++) {
+         if(g_BullOBs[_zb].mitigated) continue;
+         double _zce = (g_BullOBs[_zb].high + g_BullOBs[_zb].low) / 2.0;
+         _zLbl[_zCnt]="OB"; _zLo[_zCnt]=g_BullOBs[_zb].low; _zHi[_zCnt]=g_BullOBs[_zb].high;
+         _zDir[_zCnt]=1; _zH4[_zCnt]=false;
+         _zNear[_zCnt]=(MathAbs(_zbid - _zce) < 10.0 * _zpip); _zCnt++;
+      }
+      // H1 Bear OBs (intraday supply)
+      for(int _zb = 0; _zb < g_BearOBCount && _zCnt < 12; _zb++) {
+         if(g_BearOBs[_zb].mitigated) continue;
+         double _zce = (g_BearOBs[_zb].high + g_BearOBs[_zb].low) / 2.0;
+         _zLbl[_zCnt]="OB"; _zLo[_zCnt]=g_BearOBs[_zb].low; _zHi[_zCnt]=g_BearOBs[_zb].high;
+         _zDir[_zCnt]=-1; _zH4[_zCnt]=false;
+         _zNear[_zCnt]=(MathAbs(_zbid - _zce) < 10.0 * _zpip); _zCnt++;
+      }
+      // H1 FVGs (intraday imbalance, unfilled)
+      for(int _zf = 0; _zf < g_FVGCount && _zCnt < 12; _zf++) {
+         if(g_FVGs[_zf].filled) continue;
+         double _zce = (g_FVGs[_zf].high + g_FVGs[_zf].low) / 2.0;
+         _zLbl[_zCnt]="FVG"; _zLo[_zCnt]=g_FVGs[_zf].low; _zHi[_zCnt]=g_FVGs[_zf].high;
+         _zDir[_zCnt]=g_FVGs[_zf].dir; _zH4[_zCnt]=false;
+         _zNear[_zCnt]=(MathAbs(_zbid - _zce) < 10.0 * _zpip); _zCnt++;
+      }
+      // Bubble-sort by distance from bid (closest zone first)
+      for(int _za = 0; _za < _zCnt - 1; _za++) {
+         for(int _zbb = 0; _zbb < _zCnt - 1 - _za; _zbb++) {
+            double _zda = MathAbs(_zbid - (_zHi[_zbb]   + _zLo[_zbb])   / 2.0);
+            double _zdb = MathAbs(_zbid - (_zHi[_zbb+1] + _zLo[_zbb+1]) / 2.0);
+            if(_zda > _zdb) {
+               string _zt  = _zLbl[_zbb]; _zLbl[_zbb] = _zLbl[_zbb+1]; _zLbl[_zbb+1] = _zt;
+               double _zd  = _zLo[_zbb];  _zLo[_zbb]  = _zLo[_zbb+1];  _zLo[_zbb+1]  = _zd;
+                      _zd  = _zHi[_zbb];  _zHi[_zbb]  = _zHi[_zbb+1];  _zHi[_zbb+1]  = _zd;
+               int    _zi2 = _zDir[_zbb]; _zDir[_zbb] = _zDir[_zbb+1]; _zDir[_zbb+1] = _zi2;
+               bool   _zbt = _zH4[_zbb];  _zH4[_zbb]  = _zH4[_zbb+1];  _zH4[_zbb+1]  = _zbt;
+                      _zbt = _zNear[_zbb]; _zNear[_zbb]= _zNear[_zbb+1]; _zNear[_zbb+1]= _zbt;
+            }
+         }
+      }
+      // Render up to 10 zone rows (R_z0 ... R_z9)
+      for(int _zi = 0; _zi < 10; _zi++) {
+         string _sfx = "R_z" + IntegerToString(_zi);
+         if(_zi == 0 && _zCnt == 0) {
+            DashLine(_sfx, "  (no active OB/FVG zones)", rx, cy, rowR, lh, corner, clrGray, 8);
+            rowR++; continue;
+         }
+         if(_zi < _zCnt) {
+            double _lo  = _zLo[_zi]; double _hi = _zHi[_zi];
+            int    _zd2 = _zDir[_zi];
+            bool   _h4  = _zH4[_zi]; bool _near = _zNear[_zi];
+            bool   _above  = (_lo > _zbid);
+            bool   _below  = (_hi < _zbid);
+            bool   _inside = (!_above && !_below);
+            // Approaching: trend moving directly toward this zone
+            bool   _appr = (_ztDir == 1  && _above && _zd2 == -1) ||
+                           (_ztDir == -1 && _below && _zd2 ==  1);
+            // Decision label
+            string _dec;
+            if(_inside)     _dec = _zd2 == 1 ? "BUY NOW (in demand)"  : "SELL NOW (in supply)";
+            else if(_above) _dec = _zd2 ==-1  ? (_appr ? ">>SELL@zone" : "SELL@zone") : "Demand above";
+            else            _dec = _zd2 == 1  ? (_appr ? ">>BUY@zone"  : "BUY@zone")  : "Supply below";
+            // Zone type label padded to 6 chars for alignment
+            string _tl = _zLbl[_zi];
+            while(StringLen(_tl) < 6) _tl += " ";
+            string _tag = (_near || _inside) ? " [*]" : "";
+            string _txt = _tl + (_zd2 == 1 ? " Bull  " : " Bear  ") +
+                          DoubleToString(_lo, 5) + "-" + DoubleToString(_hi, 5) +
+                          "  " + _dec + _tag;
+            color _clr;
+            if(_inside)    _clr = clrYellow;
+            else if(_near) _clr = clrGold;
+            else if(_h4)   _clr = _zd2 == 1 ? clrCyan      : clrOrangeRed;
+            else           _clr = _zd2 == 1 ? clrAqua      : clrTomato;
+            DashLine(_sfx, _txt, rx, cy, rowR, lh, corner, _clr, 8);
          } else {
-            string rrStr = DoubleToString(rr, 2) + ":1";
-            color  rrClr = (rr >= 1.5) ? clrLime : (rr >= 1.0) ? clrGold : clrTomato;
-            r2    = "SL:" + DoubleToString(mt.sl, _Digits) + "(" + DoubleToString(slPips,1) + "p)" +
-                    "  TP:" + DoubleToString(mt.tp, _Digits) + "(" + DoubleToString(tpPips,1) + "p)" +
-                    "  RR:" + rrStr;
-            r2Clr = (rr < 1.0) ? clrOrangeRed : rrClr;
+            DashLine(_sfx, "", rx, cy, rowR, lh, corner, clrDimGray, 8);
          }
-         DashLine(pfx + "_sl", r2, rx, cy, rowR, lh, corner, r2Clr, 8); rowR++;
-
-         // --- Row 3: Structural confidence + factor tags ---
-         string h4Tag  = (g_MacroStructLabel == "BULLISH") ? "[H4+]" : (g_MacroStructLabel == "BEARISH") ? "[H4-]" : "[H4~]";
-         string h1Tag  = (g_StructureLabel   == "BULLISH") ? "[H1+]" : (g_StructureLabel   == "BEARISH") ? "[H1-]" : "[H1~]";
-         string fvgTag = (mt.dir == 1 && g_NearBullFVG) ? "[FVG]" : (mt.dir == -1 && g_NearBearFVG) ? "[FVG]" : "     ";
-         string obTag  = (mt.dir == 1 && g_BullOB_High > 0) ? "[OB]" : (mt.dir == -1 && g_BearOB_High > 0) ? "[OB]" : "    ";
-         // Flip tags to opposing colour if they work against the trade direction
-         color confClr = (conf >= 65) ? clrCyan : (conf >= 45) ? clrSilver : clrTomato;
-         DashLine(pfx + "_st",
-                  h4Tag + h1Tag + fvgTag + obTag + " Conf:" + IntegerToString(conf) + "% at TP",
-                  rx, cy, rowR, lh, corner, confClr, 8); rowR++;
-
-         // --- Row 4: Contextual warnings (HPL, poor RR, bad conf) ---
-         string warnStr = "";  color warnClr = clrGray;
-         // HPL stagnation zone between price and TP
-         if(mt.dir == 1 && mt.tp > 0) {
-            for(int _hz = 0; _hz < g_HPLCount; _hz++) {
-               if(g_HPLZones[_hz].broken) continue;
-               if(g_HPLZones[_hz].dir == 1) {       // resistance
-                  double zMid = (g_HPLZones[_hz].high + g_HPLZones[_hz].low) / 2.0;
-                  if(zMid > bid && zMid < mt.tp) {   // between now and TP
-                     warnStr = ">> RESIST HPL @" + DoubleToString(g_HPLZones[_hz].low, _Digits) +
-                               "-" + DoubleToString(g_HPLZones[_hz].high, _Digits) +
-                               " (" + IntegerToString(g_HPLZones[_hz].touches) + "t) before TP — early exit";
-                     warnClr = clrOrange;
-                     break;
-                  }
-                  if(g_HPLResistBlock) {             // currently inside resist zone
-                     warnStr = ">> Price in RESIST HPL — stagnation risk, consider close";
-                     warnClr = clrOrangeRed;
-                     break;
-                  }
-               }
-            }
-         } else if(mt.dir == -1 && mt.tp > 0) {
-            for(int _hz = 0; _hz < g_HPLCount; _hz++) {
-               if(g_HPLZones[_hz].broken) continue;
-               if(g_HPLZones[_hz].dir == -1) {      // support
-                  double zMid = (g_HPLZones[_hz].high + g_HPLZones[_hz].low) / 2.0;
-                  if(zMid < bid && zMid > mt.tp) {   // between now and TP (for sell, TP < bid)
-                     warnStr = ">> SUPPORT HPL @" + DoubleToString(g_HPLZones[_hz].low, _Digits) +
-                               "-" + DoubleToString(g_HPLZones[_hz].high, _Digits) +
-                               " (" + IntegerToString(g_HPLZones[_hz].touches) + "t) before TP — early exit";
-                     warnClr = clrOrange;
-                     break;
-                  }
-                  if(g_HPLSupportBlock) {
-                     warnStr = ">> Price in SUPPORT HPL — stagnation risk, consider close";
-                     warnClr = clrOrangeRed;
-                     break;
-                  }
-               }
-            }
-         }
-         // Poor RR warning (supersedes HPL warn if rr even worse)
-         if(warnStr == "" && mt.sl > 0 && mt.tp > 0 && rr < 1.0) {
-            warnStr = ">> POOR RR (" + DoubleToString(rr, 2) + ":1) — SL > reward, reposition";
-            warnClr = clrOrangeRed;
-         }
-         // Structural opposition warning
-         if(warnStr == "" && conf < 35) {
-            warnStr = ">> Structure OPPOSING this trade (" + IntegerToString(conf) + "%)";
-            warnClr = clrTomato;
-         }
-         DashLine(pfx + "_w", warnStr, rx, cy, rowR, lh, corner, warnClr, 8); rowR++;
-      } else {
-         // Empty slot — always render to hold row positions (avoids stale label overlap)
-         DashLine(pfx + "_h",  "", rx, cy, rowR, lh, corner, clrDimGray, 9); rowR++;
-         DashLine(pfx + "_sl", "", rx, cy, rowR, lh, corner, clrDimGray, 8); rowR++;
-         DashLine(pfx + "_st", "", rx, cy, rowR, lh, corner, clrDimGray, 8); rowR++;
-         DashLine(pfx + "_w",  "", rx, cy, rowR, lh, corner, clrDimGray, 8); rowR++;
+         rowR++;
       }
    }
-   // Clear second trade slot to remove stale labels (no longer rendered in loop)
-   DashLine("R_mt1_h",  "", rx, cy, rowR, lh, corner, clrDimGray, 9);
-   DashLine("R_mt1_sl", "", rx, cy, rowR, lh, corner, clrDimGray, 8);
-   DashLine("R_mt1_st", "", rx, cy, rowR, lh, corner, clrDimGray, 8);
-   DashLine("R_mt1_w",  "", rx, cy, rowR, lh, corner, clrDimGray, 8);
-   // If there are > 1 trade, show compact summary for the rest
-   if(g_ManualTradeCount > 1) {
-      string xtraStr = "  +" + IntegerToString(g_ManualTradeCount - 1) + " more: ";
-      for(int _mx = 1; _mx < g_ManualTradeCount; _mx++) {
-         xtraStr += (g_ManualTrades[_mx].dir == 1 ? "BUY " : "SELL ") +
-                    DoubleToString(g_ManualTrades[_mx].lots, 2) + "L  ";
-      }
-      DashLine("R_mtxtra", xtraStr, rx, cy, rowR, lh, corner, clrGray, 7); rowR++;
-   } else {
-      DashLine("R_mtxtra", "", rx, cy, rowR, lh, corner, clrDimGray, 7); rowR++;
-   }
-   // No same-symbol trades — write "none" into the first slot high-water row and keep a blank placeholder
-   DashLine("R_mtnone", (g_ManualTradeCount == 0) ? " none (no manual trades on " + _Symbol + ")" : "",
-            rx, cy, rowR, lh, corner, clrGray, 8); rowR++;
-
-   // Bot paused warning at bottom of section
-   if(g_ForeignCountSymbol > 0 && RespectForeignTrades) {
-      DashLine("R_fgnw", "  >> Bot PAUSED (one-trade rule)", rx, cy, rowR, lh, corner, clrRed, 8);
-   } else {
-      DashLine("R_fgnw", "", rx, cy, rowR, lh, corner, clrGray, 8);
-   }
-   rowR++;
-   rowR++;
+   rowR++;   // blank separator before Daily Stats
 
    // --- Daily Stats ---
    DashLine("R_shdr", "--- DAILY STATS ---", rx, cy, rowR, lh, corner, clrWhite, 9); rowR++;

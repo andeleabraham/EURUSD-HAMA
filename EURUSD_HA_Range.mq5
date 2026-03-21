@@ -20,6 +20,10 @@ input group "=== BOT TRADING MODE ==="
 // signals, calculations, zones and dashboard data are computed and shown, but NO actual
 // trade orders are sent. Use this to confirm setups manually before enabling live trading.
 input bool   BotTradingEnabled  = false;  // false=signal display only; true=live trading
+// TRADE ENTRY MODE: selects which signal system drives actual trade execution.
+//   0 = DEFAULT  — HA range/structure/macro system (current behaviour).
+//   1 = VWAP     — VWAP sigma-band pullback confirmation + Trend Ride entries; EOD close, no broker SL.
+input int    TradeEntryMode     = 0;      // 0=Default(HA) | 1=VWAP(sigma pullback+TR)
 // TRADING FREQUENCY MODE: defines the risk/reward profile and entry selectivity.
 //   0 = FREQUENT  — HFT-style, many quick trades, tight fixed TP (FrequentTP_USD).
 //                   Bollinger and zone filters are relaxed. Target 10-100+ trades/day.
@@ -1612,10 +1616,10 @@ void OnTick()
       }
    }
 
-   // === v7.00: UseSL=false — EOD FORCE CLOSE ===
-   // When the user runs without a broker SL, every open trade MUST be closed before
-   // the end of day so no position is held overnight. Fires at EODCloseHour.
-   if(!UseSL && g_TradeOpen) {
+   // === v7.00: UseSL=false / VWAP mode — EOD FORCE CLOSE ===
+   // When the user runs without a broker SL (or VWAP entry mode with no SL),
+   // every open trade MUST be closed before end of day. Fires at EODCloseHour.
+   if((!UseSL || TradeEntryMode == 1) && g_TradeOpen) {
       MqlDateTime _eodDt; TimeToStruct(TimeCurrent(), _eodDt);
       if(_eodDt.hour >= EODCloseHour) {
          for(int _ei = PositionsTotal() - 1; _ei >= 0; _ei--) {
@@ -2007,7 +2011,9 @@ void OnTick()
 
       bool hasTrendSig = (g_Signal == "BUY INCOMING" || g_Signal == "SELL INCOMING");
       bool hasMeanRev  = (MeanReversionSetup() != 0);
-      if(hasTrendSig || hasMeanRev || g_MacroTrendRide) TryEntry();
+      // TradeEntryMode 0 = Default (HA/structure system drives entries)
+      // TradeEntryMode 1 = VWAP mode (entries driven by VWAP confirmation, TryEntry blocked)
+      if(TradeEntryMode == 0 && (hasTrendSig || hasMeanRev || g_MacroTrendRide)) TryEntry();
    }
 
    // Keep range fresh every tick (g_TodayHigh/Low grows on each tick)
@@ -10327,6 +10333,80 @@ void DashLine(string suffix, string text,
 }
 
 // Add a new entry to the VWAP bet log (called when a new zone-entry signal fires)
+//+------------------------------------------------------------------+
+//| VWAP TRADE EXECUTION                                             |
+//| Called when TradeEntryMode==1 and a confirmed VWAP signal fires  |
+//| Executes real market order with EOD-style management (no SL)     |
+//+------------------------------------------------------------------+
+void TryVWAPEntry(int vDir, double vTP, string vLabel)
+{
+   if(g_TradeOpen) return;
+   if(!BotTradingEnabled) {
+      Print("[VWAP ENTRY] ", vLabel, " — BotTradingEnabled=false, no order placed");
+      return;
+   }
+   // Spread check
+   if(MaxSpreadPips > 0) {
+      long sp = SymbolInfoInteger(_Symbol, SYMBOL_SPREAD);
+      if((double)sp / 10.0 > MaxSpreadPips) {
+         Print("[VWAP ENTRY] spread too wide — blocked");
+         return;
+      }
+   }
+   double lot = CalcLot();
+   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double tpDist = (vDir == 1) ? (vTP - ask) : (bid - vTP);
+   if(tpDist <= 0) { Print("[VWAP ENTRY] TP behind price — skipped"); return; }
+
+   bool ok = false;
+   string tag = "VWAP:" + vLabel;
+   if(vDir == 1) {
+      double tp = NormalizeDouble(vTP, _Digits);
+      Print("[VWAP BUY] ", tag, " Lot:", lot, " Ask:", ask, " TP:", tp, " SL:NONE(EOD)");
+      ok = trade.Buy(lot, _Symbol, ask, 0, tp, tag);
+   } else {
+      double tp = NormalizeDouble(vTP, _Digits);
+      Print("[VWAP SELL] ", tag, " Lot:", lot, " Bid:", bid, " TP:", tp, " SL:NONE(EOD)");
+      ok = trade.Sell(lot, _Symbol, bid, 0, tp, tag);
+   }
+   if(ok) {
+      // Set dynamic SL/TP for VWAP mode — uses EOD close as SL, VWAP TP as target
+      double _vPV  = _Point * 10.0;
+      double _vUPP = 0.10;
+      g_DynamicTP_USD = tpDist / _vPV * _vUPP;  // actual TP in USD/0.01lot
+      g_DynamicSL_USD = MaxLossUSD;              // use MaxLossUSD as management reference
+      SetScaledThresholds(lot);
+      g_TradeOpen     = true;
+      g_ProfitLocked  = false;
+      g_PeakProfit    = 0;
+      g_TroughProfit  = 0;
+      g_BarsSincePeak = 0;
+      g_TradeDir      = vDir;
+      g_OpenBarCount  = 0;
+      g_TradeOpenTime = TimeCurrent();
+      g_IsNearMid     = false;
+      g_IsMeanRev     = false;
+      g_Signal        = "WAITING";
+      g_ConfidenceStatic = 0; g_ConfidenceArmedBar = 0;
+      g_HABullSetup   = false;
+      g_HABearSetup   = false;
+      g_MRVArmed      = false;
+      g_MRVConfirmOpen = 0;
+      g_EntryStructLabel = "VWAP";
+      g_EntryMacroLabel  = vLabel;
+      g_EarlyLockEngaged = false;
+      g_StructShiftCount = 0;
+      g_LastMgmtAction   = "";
+      g_TradeMgmtModeName = "HARVESTER";
+      g_CurrentLot = lot;
+      Print("[VWAP ENTRY] ", tag, " OPENED | Lot:", lot,
+            " TP$:", DoubleToString(g_DynamicTP_USD,2), " SL:EOD");
+   } else {
+      Print("[VWAP ENTRY] ", tag, " FAILED: ", trade.ResultComment());
+   }
+}
+
 // slZoneRef = the σ2/σ3 level to use as SL when VWAPBetSLMode == 1 (S2/R2 band)
 void AddVWAPBet(int dir, double entry, double tp, double slDef, double slZoneRef,
                 string decLabel, string betType)
@@ -11101,6 +11181,9 @@ void UpdateDashboard()
                      AddVWAPBet(g_VWAPArmedDir, _bid, g_VWAPArmedTP,
                                 g_VWAPArmedSLDef, g_VWAPArmedSLZone,
                                 g_VWAPArmedLabel, g_VWAPArmedType);
+                     // VWAP entry mode: execute real trade on confirmation
+                     if(TradeEntryMode == 1)
+                        TryVWAPEntry(g_VWAPArmedDir, g_VWAPArmedTP, g_VWAPArmedLabel);
                   }
                   g_VWAPArmedDir = 0;
                } else {
@@ -11130,6 +11213,9 @@ void UpdateDashboard()
                      // TR uses far sentinel SL (ride with the trend, resolved EOD)
                      double _trSL   = (_trDir == 1) ? _bid - 500.0 * _trPV : _bid + 500.0 * _trPV;
                      AddVWAPBet(_trDir, _bid, _trTP, _trSL, _trSL, _trLbl, "TR");
+                     // VWAP entry mode: execute real trade for TR signals
+                     if(TradeEntryMode == 1)
+                        TryVWAPEntry(_trDir, _trTP, _trLbl);
                   }
                }
             }
@@ -11620,12 +11706,13 @@ void UpdateDashboard()
       // Row 2: Bot status + Trading mode + management strategy
       {
          string _tmLabel = (TradingMode==0) ? "FREQUENT" : (TradingMode==2) ? "SWING" : "STANDARD";
-         string _botTag  = BotTradingEnabled ? "BOT:ON" : "BOT:OFF(SIG)";
+         string _entryTag = (TradeEntryMode == 1) ? "VWAP" : "DEFAULT";
+         string _botTag  = BotTradingEnabled ? ("BOT:ON(" + _entryTag + ")") : "BOT:OFF(SIG)";
          color  _botBase = BotTradingEnabled
-                           ? (TradingMode==0 ? clrOrange : (TradingMode==2 ? clrCyan : clrLime))
+                           ? (TradeEntryMode == 1 ? clrGold : (TradingMode==0 ? clrOrange : (TradingMode==2 ? clrCyan : clrLime)))
                            : clrYellow;
          if(g_TradeOpen) {
-            string modeStr = g_IsMeanRev ? "MEAN REV" : (g_IsNearMid ? "MID-val" : "TREND");
+            string modeStr = (TradeEntryMode == 1) ? "VWAP" : (g_IsMeanRev ? "MEAN REV" : (g_IsNearMid ? "MID-val" : "TREND"));
             DashLine("R_mode", _botTag + " " + _tmLabel + " | " + modeStr + " | " + g_TradeMgmtModeName,
                      rx, cy, rowR, lh, corner, _botBase, 9);
          } else {

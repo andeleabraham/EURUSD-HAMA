@@ -463,6 +463,7 @@ struct VWAPBet {
 VWAPBet  g_VWAPBets[VWAP_BET_MAX];
 int      g_VWAPBetCount = 0;
 string   g_LastVWAPSig  = "";   // category dedup: "BUY"/"SELL"/"BUYINC"/"SELLINC"/""
+int      g_VWAPApproachDir = 0; // 1=in σ1→σ2 BUY corridor, -1=in σ1→σ2 SELL corridor, 0=not
 // VWAP slope / trend detection (BOS filter)
 double   g_VWAPSlopeHist[20];       // ring buffer: [0]=latest VWAP, [19]=19 bars ago
 int      g_VWAPSlopeHistCount = 0;
@@ -10939,7 +10940,15 @@ void UpdateDashboard()
 
       int _dNB   = g_HaNB_Trained ? g_NBPredDir : 0;
       int _dZAP  = (g_ZAPActive && g_ZAPDir != 0) ? g_ZAPDir : 0;
-      int _dVWAP = (g_VWAPArmedDir != 0) ? g_VWAPArmedDir : g_VWAPSlopeDir;
+      // VWAP priority: armed > INC approaching (≥64.5%) > fired BUY/SELL > early approach (any %) > slope
+      int _dVWAP;
+      if     (g_VWAPArmedDir != 0)             _dVWAP = g_VWAPArmedDir;
+      else if(g_LastVWAPSig == "BUYINC")       _dVWAP =  1;
+      else if(g_LastVWAPSig == "SELLINC")      _dVWAP = -1;
+      else if(g_LastVWAPSig == "BUY")          _dVWAP =  1;
+      else if(g_LastVWAPSig == "SELL")         _dVWAP = -1;
+      else if(g_VWAPApproachDir != 0)          _dVWAP = g_VWAPApproachDir;
+      else                                     _dVWAP = g_VWAPSlopeDir;
 
       // OB/FVG: dual-sided — independently show BUY and/or SELL based on which zone types
       // are currently near/inside.  "Far" zones = HOLD for that side.
@@ -11605,6 +11614,9 @@ void UpdateDashboard()
             }
             // Always update category tracker; clear on WAIT/HOLD so next signal fires fresh
             g_LastVWAPSig = _vCat;
+            // Approach corridor: price between σ1 and σ2 (any penetration ≥ 0%)
+            g_VWAPApproachDir = (_bid > _refU1 && _bid < _refU2) ? -1 :   // approaching SELL threshold
+                                (_bid < _refL1 && _bid > _refL2) ?  1 : 0; // approaching BUY threshold
          }
       }
 

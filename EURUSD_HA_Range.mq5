@@ -10922,54 +10922,79 @@ void UpdateDashboard()
       DashLine("10d_sweep", "",                                                  cx, cy, row, lh, corner, clrGray, 8);
    row++;
 
-   string obLine = "";
-   if(g_BullOB_High > 0) obLine += "Bull:" + DoubleToString(g_BullOB_Low,5) + "-" + DoubleToString(g_BullOB_High,5);
-   if(g_BearOB_High > 0) {
-      if(obLine != "") obLine += " ";
-      obLine += "Bear:" + DoubleToString(g_BearOB_Low,5) + "-" + DoubleToString(g_BearOB_High,5);
-   }
-   if(obLine != "")
-      DashLine("10e_ob",  "OB      : " + obLine,                                cx, cy, row, lh, corner, clrYellow, 7);
-   else
-      DashLine("10e_ob",  "",                                                    cx, cy, row, lh, corner, clrGray, 7);
-   row++;
+   // Clear old OB/FVG label objects off-screen (replaced by decision table)
+   DashLine("10e_ob",   "", cx, cy, 9999, lh, corner, clrGray, 7);
+   DashLine("10f_fvg",  "", cx, cy, 9999, lh, corner, clrGray, 8);
+   DashLine("10g_h4ob", "", cx, cy, 9999, lh, corner, clrGray, 7);
+   DashLine("10h_h4fvg","", cx, cy, 9999, lh, corner, clrGray, 7);
 
-   // --- Fair Value Gaps ---
-   if(UseFairValueGaps) {
-      string fvgStr = IntegerToString(g_FVGCount) + " active";
-      if(g_NearBullFVG || g_NearBearFVG) {
-         fvgStr += " | Near: " + (g_NearBullFVG ? "BULL" : "BEAR") + " FVG " +
-                   DoubleToString(g_NearestFVGLow, 5) + "-" + DoubleToString(g_NearestFVGHigh, 5);
-      }
-      color fvgClr = (g_NearBullFVG || g_NearBearFVG) ? clrDodgerBlue : clrGray;
-      DashLine("10f_fvg",  "FVG     : " + fvgStr,                               cx, cy, row, lh, corner, fvgClr, 8); row++;
-   } else {
-      DashLine("10f_fvg",  "",                                                   cx, cy, row, lh, corner, clrGray, 8); row++;
-   }
+   // --- Aggregate Signal Decision Table ---
+   {
+      // Drive each system: +1=BUY, -1=SELL, 0=HOLD/neutral
+      int _dDef = 0;
+      if     (StringFind(g_Signal,"BUY")  >= 0)                             _dDef =  1;
+      else if(StringFind(g_Signal,"SELL") >= 0)                             _dDef = -1;
+      else if(g_StructureLabel=="BULLISH" && g_MacroStructLabel=="BULLISH") _dDef =  1;
+      else if(g_StructureLabel=="BEARISH" && g_MacroStructLabel=="BEARISH") _dDef = -1;
 
-   // --- H4 Supply/Demand: Order Blocks & FVGs (macro zones) ---
-   if(UseH4SMC) {
-      // H4 Order Block row
-      string h4obLine = "";
-      if(g_H4BullOB_High > 0)
-         h4obLine += "D:" + DoubleToString(g_H4BullOB_Low,5) + "-" + DoubleToString(g_H4BullOB_High,5);
-      if(g_H4BearOB_High > 0) {
-         if(h4obLine != "") h4obLine += "  ";
-         h4obLine += "S:" + DoubleToString(g_H4BearOB_Low,5) + "-" + DoubleToString(g_H4BearOB_High,5);
-      }
-      color h4obClr = g_NearH4BullOB ? clrLimeGreen : g_NearH4BearOB ? clrTomato : clrDimGray;
-      DashLine("10g_h4ob", "H4 OB   : " + (h4obLine != "" ? h4obLine : "none"),
-               cx, cy, row, lh, corner, h4obClr, g_NearH4BullOB||g_NearH4BearOB ? 9 : 7); row++;
+      int _dNB   = g_HaNB_Trained ? g_NBPredDir : 0;
+      int _dZAP  = (g_ZAPActive && g_ZAPDir != 0) ? g_ZAPDir : 0;
+      int _bsZ   = (g_NearBullFVG?1:0) + (g_NearH4BullOB?1:0) +
+                   (g_NearBullH4FVG?1:0) + (g_FVGOverlapBullish?1:0);
+      int _brZ   = (g_NearBearFVG?1:0) + (g_NearH4BearOB?1:0) +
+                   (g_NearBearH4FVG?1:0) + (g_FVGOverlapBearish?1:0);
+      int _dOBF  = (_bsZ > _brZ) ? 1 : (_brZ > _bsZ) ? -1 : 0;
+      int _dVWAP = (g_VWAPArmedDir != 0) ? g_VWAPArmedDir : g_VWAPSlopeDir;
 
-      // H4 FVG row
-      string h4fvgStr = IntegerToString(g_H4FVGCount) + " active";
-      if(g_NearBullH4FVG || g_NearBearH4FVG) {
-         h4fvgStr += " | Near: " + (g_NearBullH4FVG ? "BULL" : "BEAR") + " H4FVG " +
-                     DoubleToString(g_NearestH4FVGLow,5) + "-" + DoubleToString(g_NearestH4FVGHigh,5);
+      int _buyV = (_dDef==1?1:0)+(_dNB==1?1:0)+(_dZAP==1?1:0)+(_dOBF==1?1:0)+(_dVWAP==1?1:0);
+      int _selV = (_dDef==-1?1:0)+(_dNB==-1?1:0)+(_dZAP==-1?1:0)+(_dOBF==-1?1:0)+(_dVWAP==-1?1:0);
+      int _hldV = 5 - _buyV - _selV;
+
+      // Header
+      DashLine("10tbl_hdr", " Signal |Dflt| NB |ZAP |OB/F|VWAP",
+               cx, cy, row, lh, corner, clrWhite, 8); row++;
+      // BUY row
+      DashLine("10tbl_buy",
+               " Buy    |" + (_dDef  ==1?" BUY":"    ") + "|" +
+                             (_dNB   ==1?" BUY":"    ") + "|" +
+                             (_dZAP  ==1?" BUY":"    ") + "|" +
+                             (_dOBF  ==1?" BUY":"    ") + "|" +
+                             (_dVWAP ==1?" BUY":"    "),
+               cx, cy, row, lh, corner, _buyV > 0 ? clrLime : clrDimGray, 9); row++;
+      // SELL row
+      DashLine("10tbl_sel",
+               " Sell   |" + (_dDef  ==-1?"SELL":"    ") + "|" +
+                             (_dNB   ==-1?"SELL":"    ") + "|" +
+                             (_dZAP  ==-1?"SELL":"    ") + "|" +
+                             (_dOBF  ==-1?"SELL":"    ") + "|" +
+                             (_dVWAP ==-1?"SELL":"    "),
+               cx, cy, row, lh, corner, _selV > 0 ? clrTomato : clrDimGray, 9); row++;
+      // HOLD row
+      DashLine("10tbl_hld",
+               " Hold   |" + (_dDef  ==0?" HLD":"    ") + "|" +
+                             (_dNB   ==0?" HLD":"    ") + "|" +
+                             (_dZAP  ==0?" HLD":"    ") + "|" +
+                             (_dOBF  ==0?" HLD":"    ") + "|" +
+                             (_dVWAP ==0?" HLD":"    "),
+               cx, cy, row, lh, corner, _hldV > 0 ? clrSilver : clrDimGray, 8); row++;
+      // Verdict
+      string _verd; color _vclr; string _vdet;
+      if(_buyV > _selV && _buyV > _hldV) {
+         _verd = "BUY";   _vclr = clrLime;
+         _vdet = IntegerToString(_buyV) + "/5  " + IntegerToString(_buyV * 20) + "%";
+      } else if(_selV > _buyV && _selV > _hldV) {
+         _verd = "SELL";  _vclr = clrTomato;
+         _vdet = IntegerToString(_selV) + "/5  " + IntegerToString(_selV * 20) + "%";
+      } else if(_hldV > _buyV && _hldV > _selV) {
+         _verd = "HOLD";  _vclr = clrSilver;
+         _vdet = IntegerToString(_hldV) + "/5  " + IntegerToString(_hldV * 20) + "%";
+      } else {
+         _verd = "SPLIT"; _vclr = clrYellow;
+         _vdet = "B:" + IntegerToString(_buyV) + " S:" + IntegerToString(_selV) +
+                 " H:" + IntegerToString(_hldV);
       }
-      color h4fvgClr = g_NearBullH4FVG ? clrCornflowerBlue : g_NearBearH4FVG ? clrMediumOrchid : clrGray;
-      DashLine("10h_h4fvg", "H4 FVG  : " + h4fvgStr,
-               cx, cy, row, lh, corner, h4fvgClr, g_NearBullH4FVG||g_NearBearH4FVG ? 9 : 7); row++;
+      DashLine("10tbl_vrd", "Verdict : " + _verd + " (" + _vdet + ")",
+               cx, cy, row, lh, corner, _vclr, 9); row++;
    }
 
    // --- Confidence Score (SL/TP/RR detail block -- conf% also shown inline near signal above) ---

@@ -429,6 +429,12 @@ double g_VWAPU2     = 0;    // Daily +2σ band
 double g_VWAPL2     = 0;    // Daily −2σ band
 double g_VWAPU3     = 0;    // Daily +3σ band
 double g_VWAPL3     = 0;    // Daily −3σ band
+// Previous-bar σ band snapshots — used for signal zone detection only.
+// Display always shows the live values above; comparison uses these settled values.
+// Prevents fast-expanding VWAP bands from swallowing a valid σ2/σ3 near-touch.
+double g_VWAPU1_prev = 0;  double g_VWAPL1_prev = 0;
+double g_VWAPU2_prev = 0;  double g_VWAPL2_prev = 0;
+double g_VWAPU3_prev = 0;  double g_VWAPL3_prev = 0;
 double g_VWAPAsian  = 0;    // Asian session VWAP (0 when outside session)
 double g_VWAPLondon = 0;    // London session VWAP
 double g_VWAPNY     = 0;    // NY session VWAP
@@ -2368,6 +2374,7 @@ void ComputeVWAP()
       g_VCumTP_N   = 0; g_VCumVol_N = 0;
       g_VLastSessA = 0; g_VLastSessL = 0; g_VLastSessN = 0;
       g_VWAPDaily  = 0; g_VWAPU1 = 0; g_VWAPL1 = 0; g_VWAPU2 = 0; g_VWAPL2 = 0; g_VWAPU3 = 0; g_VWAPL3 = 0;
+      g_VWAPU1_prev = 0; g_VWAPL1_prev = 0; g_VWAPU2_prev = 0; g_VWAPL2_prev = 0; g_VWAPU3_prev = 0; g_VWAPL3_prev = 0;
       g_VWAPAsian  = 0; g_VWAPLondon = 0; g_VWAPNY = 0;
 
       // Re-scan all closed bars of today (oldest→newest, skip live bar 0)
@@ -2381,7 +2388,14 @@ void ComputeVWAP()
          _VWAPAccumBar(s);
       }
    } else {
-      // ---- Same day: accumulate only the newest closed bar (shift 1) ----
+      // ---- Same day: snapshot prev-bar sigma bands BEFORE accumulating newest closed bar ----
+      // This is what allows the dashboard to compare current price against WHERE sigma WAS last bar,
+      // preventing fast-expanding daily bands from swallowing a near-σ2/σ3 touch.
+      if(g_VWAPDaily > 0) {
+         g_VWAPU1_prev = g_VWAPU1; g_VWAPL1_prev = g_VWAPL1;
+         g_VWAPU2_prev = g_VWAPU2; g_VWAPL2_prev = g_VWAPL2;
+         g_VWAPU3_prev = g_VWAPU3; g_VWAPL3_prev = g_VWAPL3;
+      }
       datetime bt = iTime(_Symbol, PERIOD_M15, 1);
       if(bt >= dayStart)
          _VWAPAccumBar(1);
@@ -10965,6 +10979,17 @@ void UpdateDashboard()
          else if(g_RSI > 0 && g_RSI >= VWAPRSIOverboughtSell) _rsiScoreSell = 35;
          else if(g_RSI > 0 && g_RSI >= _minSellRSI)           _rsiScoreSell = 20;
 
+         // ---- Signal reference levels: prev-bar sigma for zone detection ----
+         // Compare current bid vs WHERE sigma WAS last M15 bar; display shows live values.
+         // Prevents fast-expanding daily standard deviation from swallowing a valid touch.
+         // Falls back to current sigma on cold start (first bar of the day, _prev == 0).
+         double _refU1 = (g_VWAPU1_prev > 0) ? g_VWAPU1_prev : g_VWAPU1;
+         double _refL1 = (g_VWAPL1_prev > 0) ? g_VWAPL1_prev : g_VWAPL1;
+         double _refU2 = (g_VWAPU2_prev > 0) ? g_VWAPU2_prev : g_VWAPU2;
+         double _refL2 = (g_VWAPL2_prev > 0) ? g_VWAPL2_prev : g_VWAPL2;
+         double _refU3 = (g_VWAPU3_prev > 0) ? g_VWAPU3_prev : g_VWAPU3;
+         double _refL3 = (g_VWAPL3_prev > 0) ? g_VWAPL3_prev : g_VWAPL3;
+
          // ---- Decision zone ----
          if(_compressed) {
             // Bands too compressed: market consolidating — no deviation signal reliable
@@ -10973,9 +10998,9 @@ void UpdateDashboard()
             _vDecSub   = StringFormat("bands compressed: Lo$%.1f Hi$%.1f < $%.0f",
                                       _spreadLoUSD, _spreadHiUSD, VWAPBandMinSpreadUSD);
 
-         } else if(_bid > g_VWAPU3) {
-            // Above +3σ (0.3% probability) — USD gap beyond +σ3 drives gap confidence
-            double _extraUSD = (_bid - g_VWAPU3) / _pipVal * _usdPerPip;
+         } else if(_bid > _refU3) {
+            // Above +3σ (prev-bar) — USD gap beyond σ3 drives gap confidence
+            double _extraUSD = (_bid - _refU3) / _pipVal * _usdPerPip;
             int    _gapPts   = (_extraUSD < 1.0 ? 45 : (_extraUSD < 2.0 ? 48 : 50));
             int    _conf     = _rsiScoreSell + _gapPts;
             if     (_rsiScoreSell >= 50) { _vDecision = "S.SELL"; _vDecClr = clrRed;       _upperClr = clrRed;       }
@@ -10984,17 +11009,16 @@ void UpdateDashboard()
             else                         { _conf /= 2;
                                            _vDecision = "SELL";   _vDecClr = clrGoldenrod; _upperClr = clrGoldenrod; }
             _vDecision = _vDecision + "-" + IntegerToString(_conf) + "%";
-            _vDecSub   = StringFormat("RSI:%d(+%dpts) | +$%.1f past +s3(+%dpts)",
-                                      (int)g_RSI, _rsiScoreSell, _extraUSD, _gapPts);
+            _vDecSub   = StringFormat("RSI:%d(+%dpts) | +$%.1f past +s3(+%dpts) [prev-s3:%.4f]",
+                                      (int)g_RSI, _rsiScoreSell, _extraUSD, _gapPts, _refU3);
 
-         } else if(_bid > g_VWAPU2) {
-            // +σ2 to +σ3: SELL zone — proportional band penetration + RSI tiered
-            // Full room (>=$3 always valid) | Weak room ($2.5-3 Asia/Lon only, -15pt pen) | No room = WAIT
+         } else if(_bid > _refU2) {
+            // +σ2→+σ3 (prev-bar ref): SELL zone
             bool   _fullRoom = (_tpRoomUSD >= VWAPMinTPRoomUSD);
             bool   _weakRoom = (!_fullRoom && _preNYOverlap && _tpRoomUSD >= VWAPMinTPRoomAsiaLon);
-            double _bandW  = (g_VWAPU3 > g_VWAPU2) ? (g_VWAPU3 - g_VWAPU2) : 1e-10;
-            double _gap    = _bid - g_VWAPU2;
-            double _pen    = _gap / _bandW;
+            double _bandW  = (_refU3 > _refU2) ? (_refU3 - _refU2) : 1e-10;
+            double _gap    = _bid - _refU2;
+            double _pen    = MathMin(_gap / _bandW, 1.0);
             int    _gapPts = (_pen < 0.25 ? 10 : (_pen < 0.50 ? 20 : (_pen < 0.75 ? 30 : 40)));
             int    _conf   = _rsiScoreSell + _gapPts;
             if(_rsiScoreSell > 0 && _fullRoom) {
@@ -11021,28 +11045,62 @@ void UpdateDashboard()
                                          g_RSI, _minSellRSI, VWAPRSIOverboughtSell);
             }
 
-         } else if(_bid >= g_VWAPL1) {
-            // Within -1σ to +2σ: value area — WAIT always (68-95% zone, normal price action)
-            bool _approaching = (_bid > g_VWAPU1);   // between +1σ and +2σ
-            _vDecision = "WAIT";  _vDecClr = clrSilver;
-            _vDecSub = _approaching
-               ? StringFormat("→+s2 (await +2σ cross + RSI>=%.0f for SELL)", _minSellRSI)
-               : "±1σ value area (68% zone) — wait";
-            if(_approaching) _upperClr = clrGold;
+         } else if(_bid >= _refL1) {
+            // Within -σ1→+σ2 (prev-bar ref): value area + upper approaching sub-zones
+            // SELL INCOMING fires at 90%CI (z=1.645, 64.5% through σ1→σ2) and 92.5%CI (78%)
+            bool _approaching = (_bid > _refU1);   // between +σ1 and +σ2
+            if(_approaching) {
+               double _appBandW = (_refU2 - _refU1) > 1e-10 ? (_refU2 - _refU1) : 1e-10;
+               double _appPen   = MathMin((_bid - _refU1) / _appBandW, 1.0);
+               int    _appPct   = (int)(_appPen * 100.0);
+               if(_appPen >= 0.645) {
+                  // 90%+ CI threshold — SELL INCOMING with RSI-scaled reduced confidence
+                  int _rsiApp  = (_rsiScoreSell * 6) / 10;   // 60% weight (not yet confirmed)
+                  int _appPts  = (_appPen >= 0.78) ? 20 : 10;  // 92.5%CI bonus
+                  int _incConf = _rsiApp + _appPts;
+                  string _ciZone = (_appPen >= 0.78) ? "92.5%CI" : "90%CI";
+                  _vDecision = "SELL INC-" + IntegerToString(_incConf) + "%";
+                  _vDecClr = clrDarkOrange;  _upperClr = clrDarkOrange;
+                  _vDecSub = StringFormat("SELL INCOMING: %d%% to prev +s2 [%s] RSI:%d",
+                                           _appPct, _ciZone, (int)g_RSI);
+               } else {
+                  _vDecision = "WAIT";  _vDecClr = clrSilver;  _upperClr = clrGold;
+                  _vDecSub = StringFormat("→+s2: %d%% approach (INC at 65%%) RSI:%d await>=%.0f",
+                                           _appPct, (int)g_RSI, _minSellRSI);
+               }
+            } else {
+               _vDecision = "WAIT";  _vDecClr = clrSilver;
+               _vDecSub = "±1σ value area (68% zone) — wait";
+            }
 
-         } else if(_bid > g_VWAPL2) {
-            // -1σ to -2σ: approaching lower threshold — WAIT and observe
-            _vDecision = "WAIT";  _vDecClr = clrSilver;  _lowerClr = clrGold;
-            _vDecSub   = StringFormat("→-s2 (await -2σ cross + RSI<=%.0f for BUY)", _maxBuyRSI);
+         } else if(_bid > _refL2) {
+            // -σ1→-σ2 (prev-bar ref): approaching lower threshold
+            // BUY INCOMING fires at 90%CI (64.5% through σ1→σ2) and 92.5%CI (78%)
+            double _appBandW = (_refL1 - _refL2) > 1e-10 ? (_refL1 - _refL2) : 1e-10;
+            double _appPen   = MathMin((_refL1 - _bid) / _appBandW, 1.0);
+            int    _appPct   = (int)(_appPen * 100.0);
+            if(_appPen >= 0.645) {
+               int _rsiApp  = (_rsiScoreBuy * 6) / 10;
+               int _appPts  = (_appPen >= 0.78) ? 20 : 10;
+               int _incConf = _rsiApp + _appPts;
+               string _ciZone = (_appPen >= 0.78) ? "92.5%CI" : "90%CI";
+               _vDecision = "BUY INC-" + IntegerToString(_incConf) + "%";
+               _vDecClr = clrDeepSkyBlue;  _lowerClr = clrDeepSkyBlue;
+               _vDecSub = StringFormat("BUY INCOMING: %d%% to prev -s2 [%s] RSI:%d",
+                                        _appPct, _ciZone, (int)g_RSI);
+            } else {
+               _vDecision = "WAIT";  _vDecClr = clrSilver;  _lowerClr = clrGold;
+               _vDecSub = StringFormat("→-s2: %d%% approach (INC at 65%%) RSI:%d await<=%.0f",
+                                        _appPct, (int)g_RSI, _maxBuyRSI);
+            }
 
-         } else if(_bid > g_VWAPL3) {
-            // Below -σ2 (above -σ3): BUY zone — proportional band penetration + RSI tiered
-            // Full room (>=$3 always valid) | Weak room ($2.5-3 Asia/Lon only, -15pt pen) | No room = WAIT
+         } else if(_bid > _refL3) {
+            // Below -σ2 (above -σ3) (prev-bar ref): BUY zone
             bool   _fullRoom = (_tpRoomUSD >= VWAPMinTPRoomUSD);
             bool   _weakRoom = (!_fullRoom && _preNYOverlap && _tpRoomUSD >= VWAPMinTPRoomAsiaLon);
-            double _bandW  = (g_VWAPL2 > g_VWAPL3) ? (g_VWAPL2 - g_VWAPL3) : 1e-10;
-            double _gap    = g_VWAPL2 - _bid;
-            double _pen    = _gap / _bandW;
+            double _bandW  = (_refL2 > _refL3) ? (_refL2 - _refL3) : 1e-10;
+            double _gap    = _refL2 - _bid;
+            double _pen    = MathMin(_gap / _bandW, 1.0);
             int    _gapPts = (_pen < 0.25 ? 10 : (_pen < 0.50 ? 20 : (_pen < 0.75 ? 30 : 40)));
             int    _conf   = _rsiScoreBuy + _gapPts;
             if(_rsiScoreBuy > 0 && _fullRoom) {
@@ -11070,8 +11128,8 @@ void UpdateDashboard()
             }
 
          } else {
-            // Below -σ3 (0.3% probability) — USD gap beyond -σ3 drives gap confidence
-            double _extraUSD = (g_VWAPL3 - _bid) / _pipVal * _usdPerPip;
+            // Below -σ3 (prev-bar reference) — USD gap beyond σ3 drives gap confidence
+            double _extraUSD = (_refL3 - _bid) / _pipVal * _usdPerPip;
             int    _gapPts   = (_extraUSD < 1.0 ? 45 : (_extraUSD < 2.0 ? 48 : 50));
             int    _conf     = _rsiScoreBuy + _gapPts;
             if     (_rsiScoreBuy >= 50) { _vDecision = "S.BUY"; _vDecClr = clrSpringGreen; _lowerClr = clrSpringGreen; }
@@ -11080,8 +11138,8 @@ void UpdateDashboard()
             else                        { _conf /= 2;
                                           _vDecision = "BUY";   _vDecClr = clrSkyBlue;     _lowerClr = clrSkyBlue;     }
             _vDecision = _vDecision + "-" + IntegerToString(_conf) + "%";
-            _vDecSub   = StringFormat("RSI:%d(+%dpts) | -$%.1f past -s3(+%dpts)",
-                                      (int)g_RSI, _rsiScoreBuy, _extraUSD, _gapPts);
+            _vDecSub   = StringFormat("RSI:%d(+%dpts) | -$%.1f past -s3(+%dpts) [prev-s3:%.4f]",
+                                      (int)g_RSI, _rsiScoreBuy, _extraUSD, _gapPts, _refL3);
          }
 
          // ---- Nearest sigma level to current price ----

@@ -10930,7 +10930,7 @@ void UpdateDashboard()
 
    // --- Aggregate Signal Decision Table ---
    {
-      // Drive each system: +1=BUY, -1=SELL, 0=HOLD/neutral
+      // Single-direction signals (each system votes for exactly one of BUY / SELL / HOLD)
       int _dDef = 0;
       if     (StringFind(g_Signal,"BUY")  >= 0)                             _dDef =  1;
       else if(StringFind(g_Signal,"SELL") >= 0)                             _dDef = -1;
@@ -10939,45 +10939,67 @@ void UpdateDashboard()
 
       int _dNB   = g_HaNB_Trained ? g_NBPredDir : 0;
       int _dZAP  = (g_ZAPActive && g_ZAPDir != 0) ? g_ZAPDir : 0;
-      int _bsZ   = (g_NearBullFVG?1:0) + (g_NearH4BullOB?1:0) +
-                   (g_NearBullH4FVG?1:0) + (g_FVGOverlapBullish?1:0);
-      int _brZ   = (g_NearBearFVG?1:0) + (g_NearH4BearOB?1:0) +
-                   (g_NearBearH4FVG?1:0) + (g_FVGOverlapBearish?1:0);
-      int _dOBF  = (_bsZ > _brZ) ? 1 : (_brZ > _bsZ) ? -1 : 0;
       int _dVWAP = (g_VWAPArmedDir != 0) ? g_VWAPArmedDir : g_VWAPSlopeDir;
 
-      int _buyV = (_dDef==1?1:0)+(_dNB==1?1:0)+(_dZAP==1?1:0)+(_dOBF==1?1:0)+(_dVWAP==1?1:0);
-      int _selV = (_dDef==-1?1:0)+(_dNB==-1?1:0)+(_dZAP==-1?1:0)+(_dOBF==-1?1:0)+(_dVWAP==-1?1:0);
-      int _hldV = 5 - _buyV - _selV;
+      // OB/FVG: dual-sided — independently show BUY and/or SELL based on which zone types
+      // are currently near/inside.  "Far" zones = HOLD for that side.
+      bool _obfBuy = g_NearBullFVG || g_NearH4BullOB || g_NearBullH4FVG || g_FVGOverlapBullish;
+      bool _obfSel = g_NearBearFVG || g_NearH4BearOB || g_NearBearH4FVG || g_FVGOverlapBearish;
+      // Also check H1 OBs directly (nearest active bull/bear OB within ~10 pips of CE)
+      {
+         double _tbid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+         double _tpip = _Point * 10.0;
+         if(!_obfBuy && g_BullOB_High > 0) {
+            double _ce = (g_BullOB_High + g_BullOB_Low) / 2.0;
+            if(MathAbs(_tbid - _ce) < 10.0 * _tpip) _obfBuy = true;
+         }
+         if(!_obfSel && g_BearOB_High > 0) {
+            double _ce = (g_BearOB_High + g_BearOB_Low) / 2.0;
+            if(MathAbs(_tbid - _ce) < 10.0 * _tpip) _obfSel = true;
+         }
+      }
+      bool _obfHld = (!_obfBuy && !_obfSel);
+
+      // BUY count: 4 single-direction + OB/F bull side
+      int _buyV = (_dDef==1?1:0) + (_dNB==1?1:0) + (_dZAP==1?1:0) + (_dVWAP==1?1:0) + (_obfBuy?1:0);
+      // SELL count: 4 single-direction + OB/F bear side
+      int _selV = (_dDef==-1?1:0) + (_dNB==-1?1:0) + (_dZAP==-1?1:0) + (_dVWAP==-1?1:0) + (_obfSel?1:0);
+      // HOLD count: 4 single-direction hold + OB/F hold  (non-additive: OB/F can be in BUY+SELL simultaneously)
+      int _hldV = (_dDef==0?1:0) + (_dNB==0?1:0) + (_dZAP==0?1:0) + (_dVWAP==0?1:0) + (_obfHld?1:0);
+
+      // OB/F cell text: show both sides that are active; * = near/inside
+      string _obfBuyCell = _obfBuy ? " BUY" : "    ";
+      string _obfSelCell = _obfSel ? "SELL" : "    ";
+      string _obfHldCell = _obfHld ? " HLD" : "    ";
 
       // Header
       DashLine("10tbl_hdr", " Signal |Dflt| NB |ZAP |OB/F|VWAP",
                cx, cy, row, lh, corner, clrWhite, 8); row++;
       // BUY row
       DashLine("10tbl_buy",
-               " Buy    |" + (_dDef  ==1?" BUY":"    ") + "|" +
-                             (_dNB   ==1?" BUY":"    ") + "|" +
-                             (_dZAP  ==1?" BUY":"    ") + "|" +
-                             (_dOBF  ==1?" BUY":"    ") + "|" +
-                             (_dVWAP ==1?" BUY":"    "),
+               " Buy    |" + (_dDef ==1?" BUY":"    ") + "|" +
+                             (_dNB  ==1?" BUY":"    ") + "|" +
+                             (_dZAP ==1?" BUY":"    ") + "|" +
+                             _obfBuyCell                + "|" +
+                             (_dVWAP==1?" BUY":"    "),
                cx, cy, row, lh, corner, _buyV > 0 ? clrLime : clrDimGray, 9); row++;
       // SELL row
       DashLine("10tbl_sel",
-               " Sell   |" + (_dDef  ==-1?"SELL":"    ") + "|" +
-                             (_dNB   ==-1?"SELL":"    ") + "|" +
-                             (_dZAP  ==-1?"SELL":"    ") + "|" +
-                             (_dOBF  ==-1?"SELL":"    ") + "|" +
-                             (_dVWAP ==-1?"SELL":"    "),
+               " Sell   |" + (_dDef ==-1?"SELL":"    ") + "|" +
+                             (_dNB  ==-1?"SELL":"    ") + "|" +
+                             (_dZAP ==-1?"SELL":"    ") + "|" +
+                             _obfSelCell                 + "|" +
+                             (_dVWAP==-1?"SELL":"    "),
                cx, cy, row, lh, corner, _selV > 0 ? clrTomato : clrDimGray, 9); row++;
       // HOLD row
       DashLine("10tbl_hld",
-               " Hold   |" + (_dDef  ==0?" HLD":"    ") + "|" +
-                             (_dNB   ==0?" HLD":"    ") + "|" +
-                             (_dZAP  ==0?" HLD":"    ") + "|" +
-                             (_dOBF  ==0?" HLD":"    ") + "|" +
-                             (_dVWAP ==0?" HLD":"    "),
+               " Hold   |" + (_dDef ==0?" HLD":"    ") + "|" +
+                             (_dNB  ==0?" HLD":"    ") + "|" +
+                             (_dZAP ==0?" HLD":"    ") + "|" +
+                             _obfHldCell                + "|" +
+                             (_dVWAP==0?" HLD":"    "),
                cx, cy, row, lh, corner, _hldV > 0 ? clrSilver : clrDimGray, 8); row++;
-      // Verdict
+      // Verdict: compare BUY vs SELL, show both if tied, colour the leader
       string _verd; color _vclr; string _vdet;
       if(_buyV > _selV && _buyV > _hldV) {
          _verd = "BUY";   _vclr = clrLime;
@@ -10988,6 +11010,19 @@ void UpdateDashboard()
       } else if(_hldV > _buyV && _hldV > _selV) {
          _verd = "HOLD";  _vclr = clrSilver;
          _vdet = IntegerToString(_hldV) + "/5  " + IntegerToString(_hldV * 20) + "%";
+      } else if(_buyV == _selV && _buyV > _hldV) {
+         // BUY and SELL tied (common when OB/F activates both) — show both with counts
+         _verd = "BUY=" + IntegerToString(_buyV) + "/5  SELL=" + IntegerToString(_selV) + "/5";
+         _vclr = clrYellow;
+         _vdet = "SPLIT";
+      } else if(_buyV > _selV) {
+         // BUY leads but not strictly > HOLD
+         _verd = "BUY";   _vclr = clrLime;
+         _vdet = IntegerToString(_buyV) + "/5  " + IntegerToString(_buyV * 20) + "% (SELL " + IntegerToString(_selV) + ")";
+      } else if(_selV > _buyV) {
+         // SELL leads but not strictly > HOLD
+         _verd = "SELL";  _vclr = clrTomato;
+         _vdet = IntegerToString(_selV) + "/5  " + IntegerToString(_selV * 20) + "% (BUY " + IntegerToString(_buyV) + ")";
       } else {
          _verd = "SPLIT"; _vclr = clrYellow;
          _vdet = "B:" + IntegerToString(_buyV) + " S:" + IntegerToString(_selV) +

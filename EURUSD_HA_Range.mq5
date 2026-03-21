@@ -48,6 +48,7 @@ input double MinSL_USD        = 0.50;   // Minimum SL per 0.01 lot — floor avo
 input double MaxSL_USD        = 1.25;   // Hard SL cap per 0.01 lot (~12.5 pips) — a bad entry is costly; don't give more away
 input double RRRatio          = 1.8;    // Reward:Risk ratio (1.8 = for every $1 risk, target $1.80)
 input double MaxTP_USD        = 2.50;   // Hard TP ceiling per 0.01 lot — 2.0-2.5 USD is statistically achievable; beyond this risks missing the exit
+input double MinTP_USD        = 2.00;   // Minimum TP per 0.01 lot — no entry unless TP ≥ $2 (1:1.8 / $2 rule; overrides MRV/CHoCH/LC caps)
 // Stop-loss options — UseSL=false: no broker SL order; trade closed at profit or EOD (never overnight)
 input bool   UseSL             = true;   // true=place broker SL; false=manage exit manually (EOD close enforced)
 input int    EODCloseHour      = 21;     // When UseSL=false: force-close any open trade at this hour (server time)
@@ -155,6 +156,16 @@ input int    MA200PendingMaxBars   = 8;     // Auto-cancel pending order after t
 input bool   MA200FakeJumpBlock    = true;  // Block buys when price jumped above MA200 but MA50 hasn't followed (likely reversal)
 input bool   MA5020EntryRequired   = true;  // Require price touching or having crossed MA50 for entry
 
+input group "=== RSI MOMENTUM GATE ==="
+// RSI(14) is already computed. These settings promote it from advisory scoring
+// into an actual entry gate, ensuring momentum aligns with the trade direction.
+// A very high-confidence setup (>= RSIGateMinConf%) bypasses this gate — breakouts
+// against RSI are valid when the full signal stack is strongly aligned.
+input bool   UseRSIGate         = true;    // Block entries when RSI momentum opposes trade direction
+input double RSIBuyMin          = 42.0;    // Buy blocked when RSI < this (bearish pressure dominant)
+input double RSISellMax         = 58.0;    // Sell blocked when RSI > this (bullish pressure dominant)
+input double RSIGateMinConf     = 65.0;    // Override threshold: strong confluence skips RSI block at this confidence
+
 input group "=== DAILY EXTENSION CAP ==="
 // Prevents chasing moves already extended far from today's open.
 // Extension is measured as % of the D1 ATR already consumed in one direction from daily open.
@@ -221,7 +232,7 @@ input double          FVGMinGapPips    = 10.0;       // Minimum gap size in pips
 input bool   UseH4SMC           = true;    // Detect H4-timeframe FVGs and Order Blocks (macro supply/demand map)
 input double H4FVGMinGapPips    = 20.0;    // Min gap in pips for H4 FVG detection (major imbalances; H1 threshold is 10p)
 input int    H4OBScanBars       = 40;      // H4 bars to scan for order blocks (~6.7 days of history)
-input double MinConfidence       = 35.0;   // Minimum confidence % to take a trade (0-100)
+input double MinConfidence       = 50.0;   // Minimum confidence % to take a trade (0-100) — raised from 35 to eliminate low-prob entries
 //
 // MacroBOS hard block: when the H4 trend has broken structure (g_MacroBOS=true),
 // taking a trade in the OPPOSITE direction is a high-risk counter-trend bet.
@@ -246,7 +257,7 @@ input group "=== MACRO TREND RIDE ==="
 input bool   MacroTrendRideEnabled  = true;   // Enable MacroBOS intraday trend-ride entries
 input int    MacroTrendMinScore     = 5;      // Min ZoneContextScore (0-15) — higher = more selective
 input double MacroTrendSL_USD       = 1.75;   // SL per 0.01 lot (slightly wider for trend volatility)
-input double MacroTrendMinTP_USD    = 1.80;   // Floor TP per 0.01 lot (minimum target for a trend ride)
+input double MacroTrendMinTP_USD    = 2.00;   // Floor TP per 0.01 lot (minimum target for a trend ride — matches MinTP_USD)
 input double MacroTrendMaxTP_USD    = 2.50;   // Ceiling TP per 0.01 lot — capped at achievable target (mirrors MaxTP_USD)
 input bool   MacroTrendAsianBlock   = true;   // Block during Asian session (wait for London/NY momentum)
 
@@ -297,7 +308,7 @@ input bool   UseZoneConfluence  = true;    // Use zone confluence % to lower con
 // the confidence gate drops to AsianZAPMinConf — these setups are historically clean.
 // The full confidence model still scores the trade; this just lowers the bar at which it fires.
 input bool   QuickEntryEnabled  = true;    // Enable lower confidence gate for ZAP+AsianBias+HA confluence
-input double AsianZAPMinConf    = 22.0;   // Minimum confidence when ZAP+AsianBias fully aligned (Asian session)
+input double AsianZAPMinConf    = 40.0;   // Minimum confidence when ZAP+AsianBias fully aligned (Asian session) — floor raised from 22 to avoid desperate entries
 // EURUSD 3-4AM momentum window: direction established in this window tends to follow through
 // cleanly for 1-3 USD per 0.01 lot. Give an additional confidence bonus for signals in that hour.
 input bool   AM34BonusEnabled   = true;   // Extra confidence for 3-4 AM signals (Asian continuation/flip hour)
@@ -365,7 +376,7 @@ input bool   NBSessionTrain    = true;   // Train separate NB model per session 
 input bool   NBOnlineLearn     = true;   // Online reinforcement: refine model from each bar outcome
 input double NBOnlineWeight    = 0.15;   // Max blend weight of online updates vs batch (0=off, 0.5=max)
 input bool   LowConvictionTPEnabled = true;  // When NB contradicts/is weak at entry, cap TP tightly
-input double LowConvictionMaxTP     = 1.0;   // TP cap ($) per 0.01 lot for low-conviction entries
+input double LowConvictionMaxTP     = 2.00;  // TP cap ($) per 0.01 lot for low-conviction entries — raised to match MinTP_USD floor
 input double LowConvictionNBThresh  = 20.0;  // NB trade-dir P(%) below this = weak/contradicted
 
 //=== GLOBALS ===
@@ -5246,7 +5257,34 @@ double CalcConfidence(int tradeDir, string zone, bool isMeanRev, bool isSideways
    }
    g_ConfBreakdown += " MTF:" + DoubleToString(conf - prevConf, 0); prevConf = conf;
 
-   // --- FACTOR 16 — H4 FVG & Order Blocks (macro supply/demand confluences) ---
+   // --- FACTOR 15b — EMA ALIGNMENT BONUS (v8.00) ---
+   // MA200, MA50, MA20 already computed. Reward setups where the EMA stack is fully
+   // aligned with the trade direction — this is the "signal stack" EMA confirmation layer.
+   //   Fresh MA200 cross in trade direction (+6): trend has just structurally changed
+   //   All MAs aligned (MA50 & MA20 on same side as MA200) (+4): clean trending environment
+   //   MA50 recently crossed MA200 in trade direction (+4): intermediate trend confirmation
+   // These bonuses are additive with MTF — a BOS + EMA cross + HA is a pro-grade setup.
+   if(UseMAFilter) {
+      double emaBonus = 0;
+      // Fresh MA200 cross in trade direction
+      if(tradeDir == 1  && g_MA200CrossUp) emaBonus += 6.0;
+      if(tradeDir == -1 && g_MA200CrossDn) emaBonus += 6.0;
+      // MA50 recently crossed MA200 in trade direction (intermediate alignment)
+      if(tradeDir == 1  && g_MA50CrossUp)  emaBonus += 4.0;
+      if(tradeDir == -1 && g_MA50CrossDn)  emaBonus += 4.0;
+      // All MAs aligned — clean trending environment
+      if(g_MAsAligned) {
+         if(tradeDir == 1  && g_AboveMA200 && g_AboveMA50 && g_AboveMA20) emaBonus += 4.0;
+         if(tradeDir == -1 && !g_AboveMA200 && !g_AboveMA50 && !g_AboveMA20) emaBonus += 4.0;
+      }
+      emaBonus = MathMin(emaBonus, 10.0);  // cap at 10 pts (fair weight vs other factors)
+      conf += emaBonus;
+      if(emaBonus != 0)
+         g_ConfBreakdown += " EMAalign:+" + DoubleToString(emaBonus, 0);
+   }
+   prevConf = conf;
+
+
    // H4 zones represent multi-day institutional memory: the strongest SMC confirmation.
    // Being at an H4 demand/supply zone with MTF alignment = highest-conviction setup.
    // FVG + OB cluster at the same H4 level adds an extra "coin-cluster" bonus.
@@ -5518,6 +5556,16 @@ double CalcStructuralSL(int tradeDir)
       if(_bar2Clean && _haH2p > _haEdge) _haEdge = _haH2p;  // furthest high wins
       _haPrimaryDist = MathAbs(entry - _haEdge) + 1.0 * pipValue;  // +1 pip buffer
    }
+   // v8.00: ATR cap — prevent volatile HA candles from producing an oversized SL.
+   // Spike bars can push the HA edge far from entry; cap at 1.5×ATR to protect RR quality.
+   if(_haPrimaryDist > 0 && g_ATR > 0) {
+      double _atrCapDist = g_ATR * 1.5;
+      if(_haPrimaryDist > _atrCapDist) {
+         Print("[SL ATR Cap] HA primary ", DoubleToString(_haPrimaryDist/_Point/10.0,1),
+               " pips capped to ", DoubleToString(_atrCapDist/_Point/10.0,1), " pips (1.5×ATR)");
+         _haPrimaryDist = _atrCapDist;
+      }
+   }
    if(_haPrimaryDist > 0)
       bestDist = _haPrimaryDist;   // HA edge is the primary SL
 
@@ -5577,6 +5625,10 @@ double CalcStructuralSL(int tradeDir)
    adjSL = MathMax(MinSL_USD, MathMin(MaxSL_USD, adjSL));
    adjTP = MathMax(adjSL * 1.0, adjTP);   // TP floor = 1:1 R:R
    adjTP = MathMin(adjTP, MaxTP_USD);      // hard cap — statistically achievable targets
+   // v8.00: MinTP_USD floor — the $2 rule. When structural SL is tight, the RR-derived
+   // TP may land below $2. Lift it to MinTP_USD so every entry has a proper reward target.
+   // This improves RR (e.g. SL=$0.80 → TP=$2.00, RR=2.5:1) rather than worsening it.
+   adjTP = MathMax(adjTP, MinTP_USD);
 
    // v7.00: SLBufferPips — add extra breathing room past the structural SL
    // This prevents the SL being hit by normal noise just beyond the HA edge.
@@ -8658,6 +8710,10 @@ void TryEntry()
       effectiveMinConf = MathMax(MinConfidence - 10.0, MinConfidence * 0.80);
    else if(UseZAP && g_ZAPActive && g_ZAPDir == tradeDir && g_ZAPScore >= ZAPMinScore)
       effectiveMinConf = MathMax(MinConfidence - 5.0, MinConfidence * 0.88);
+   // v8.00: Absolute floor — zone confluence discounts cannot push gate below 40%.
+   // Ensures a meaningful minimum even for ZAP+Asian quick-entry combos.
+   if(TradingMode != 0)  // Only enforce floor on STANDARD/SWING (FREQUENT has its own logic)
+      effectiveMinConf = MathMax(effectiveMinConf, 40.0);
 
    // v7.00: QUICK ENTRY — ZAP + Asian Bias perfectly aligned = drop gate to AsianZAPMinConf.
    // Asian bias signals are historically clean and follow through for 1-3 USD per 0.01 lot.
@@ -8699,7 +8755,50 @@ void TryEntry()
             "% | dir=", tradeDir, " pred=", g_NBPredDir);
    }
 
-   // === STRUCTURAL STOP-LOSS ===
+   // === RSI MOMENTUM GATE (v8.00) ===
+   // RSI(14) must support the trade direction. Breakout setups with very strong confluence
+   // (>= RSIGateMinConf%) bypass this gate since momentum can lag structural breaks.
+   // Mean-reversion trades are exempt: they deliberately trade against momentum.
+   if(UseRSIGate && g_RSI > 0 && !isMeanRev) {
+      bool rsiBuyBlocked  = (tradeDir == 1  && g_RSI < RSIBuyMin);
+      bool rsiSellBlocked = (tradeDir == -1 && g_RSI > RSISellMax);
+      if(rsiBuyBlocked || rsiSellBlocked) {
+         if(confidence < RSIGateMinConf) {
+            string _rsiBlock = StringFormat("BLOCKED [RSI Gate]: RSI=%.1f opposes %s (conf=%.0f%% < %.0f%% override) — UseRSIGate=false to disable",
+                                            g_RSI, (tradeDir==1 ? "BUY" : "SELL"), confidence, RSIGateMinConf);
+            if(_rsiBlock != g_LastBlockReason) { Print(_rsiBlock); g_LastBlockReason = _rsiBlock; }
+            return;
+         } else {
+            Print("[RSI Gate BYPASSED] RSI=", DoubleToString(g_RSI,1), " opposes ", (tradeDir==1?"BUY":"SELL"),
+                  " but conf=", DoubleToString(confidence,1), "% >= override threshold=", DoubleToString(RSIGateMinConf,0), "%");
+         }
+      }
+   }
+
+   // === BOLLINGER BAND MIDLINE SOFT GATE (v8.00) ===
+   // When price is significantly past the Bollinger midline in the wrong direction AND
+   // confidence is below the RSIGateMinConf override threshold, block the entry.
+   // This implements the Trifecta filter: HA + BB midline alignment + RSI all in sync.
+   // MRV trades are exempt (they trade against the band by design).
+   // Narrow-band environments are also exempt (midline is not meaningful when bands are compressed).
+   if(!isMeanRev && g_BollingerMid1 > 0 && g_ATR > 0) {
+      double _bidBB = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+      double _bwP   = (g_BollingerUpper1 > 0 && g_BollingerLower1 > 0)
+                      ? (g_BollingerUpper1 - g_BollingerLower1) / _Point / 10.0 : 99.0;
+      bool _bandNarrow = (_bwP < NarrowBandPips);
+      if(!_bandNarrow) {
+         double _bbGap      = g_ATR * 0.30;   // 30% of ATR = meaningful opposition threshold
+         bool bbBuyOpposed  = (tradeDir == 1  && _bidBB < g_BollingerMid1 - _bbGap);
+         bool bbSellOpposed = (tradeDir == -1 && _bidBB > g_BollingerMid1 + _bbGap);
+         if((bbBuyOpposed || bbSellOpposed) && confidence < RSIGateMinConf) {
+            string _bbBlock = StringFormat("BLOCKED [BB Midline]: price %s midline by >30%% ATR for a %s (conf=%.0f%%)",
+                              (tradeDir == 1 ? "below" : "above"), (tradeDir == 1 ? "BUY" : "SELL"), confidence);
+            if(_bbBlock != g_LastBlockReason) { Print(_bbBlock); g_LastBlockReason = _bbBlock; }
+            return;
+         }
+      }
+   }
+
    double slBase = CalcStructuralSL(tradeDir);  // sets g_DynamicSL_USD, g_DynamicTP_USD
 
    // === ATR-INFORMED TP BOOST ===
@@ -8843,18 +8942,27 @@ void TryEntry()
 
    // === LOW CONVICTION TP CAP ===
    // When the NB model contradicts the trade direction (predicts opposite) or the probability
-   // in the trade direction is very low, we allow the entry (other gates passed) but cap TP
-   // at LowConvictionMaxTP ($1.00/0.01 lot by default) — take what the market gives quickly.
+   // in the trade direction is very low we evaluate the entry. If the TP cap still meets
+   // MinTP_USD the entry is allowed (with LC tag). If the cap would drop TP below MinTP_USD
+   // the setup does not meet the $2 professional standard — block the trade entirely.
    g_IsLowConviction = false;
    if(LowConvictionTPEnabled && UseNBBrain && g_HaNB_Trained) {
-      double _lcProb   = (tradeDir == 1) ? g_NBBuyProb  : g_NBSellProb;
+      double _lcProb    = (tradeDir == 1) ? g_NBBuyProb  : g_NBSellProb;
       double _lcOppProb = (tradeDir == 1) ? g_NBSellProb : g_NBBuyProb;
       bool   _nbOpposes = (g_NBPredDir == -tradeDir);          // NB calls the opposite side
       bool   _nbWeak    = (_lcProb < LowConvictionNBThresh);   // trade-dir probability too low
       if(_nbOpposes || _nbWeak) {
+         double _lcCap = MathMin(baseTpUSD, LowConvictionMaxTP);
+         if(_lcCap < MinTP_USD) {
+            // Cap would violate the $2 rule — block entirely rather than enter a substandard trade
+            string _lcBlk = StringFormat("BLOCKED [LC+MinTP]: NB %s, TP cap $%.2f < MinTP_USD $%.2f — not entering",
+                              (_nbOpposes ? "OPPOSES" : "WEAK"), _lcCap, MinTP_USD);
+            if(_lcBlk != g_LastBlockReason) { Print(_lcBlk); g_LastBlockReason = _lcBlk; }
+            return;
+         }
+         // Cap is acceptable (>= $2) — apply it and tag for dashboard
          g_IsLowConviction   = true;
-         double _lcCap       = MathMin(baseTpUSD, LowConvictionMaxTP);
-         _lcCap              = MathMax(_lcCap, g_DynamicSL_USD * 0.5);  // floor: 0.5:1 R:R minimum
+         _lcCap              = MathMax(_lcCap, g_DynamicSL_USD * 1.0);  // floor: 1:1 R:R minimum
          Print("[LOW CONVICTION TP] NB ", (_nbOpposes ? "OPPOSES" : "WEAK"),
                ": P(trade)=", DoubleToString(_lcProb, 1), "% P(opp)=", DoubleToString(_lcOppProb, 1),
                "% → TP capped $", DoubleToString(_lcCap, 2), " (was $", DoubleToString(baseTpUSD, 2), ")");
@@ -8885,6 +8993,17 @@ void TryEntry()
    }
 
    // Scale SL/TP by lot size
+   // v8.00: FINAL $2 TP FLOOR GATE — after ALL override layers (MRV, CHoCH scale, Bold,
+   // MacroTrend, LowConviction, TradingMode). If baseTpUSD still can't reach MinTP_USD,
+   // block the trade entirely. This is the consistent professional rule: no entry unless
+   // the reward target is at least $2 per 0.01 lot. FREQUENT mode is exempt (small-target design).
+   if(TradingMode != 0 && baseTpUSD < MinTP_USD) {
+      string _tpFG = StringFormat("BLOCKED [MinTP_USD]: baseTpUSD $%.2f < $%.2f ($2 rule) after all overrides",
+                                  baseTpUSD, MinTP_USD);
+      if(_tpFG != g_LastBlockReason) { Print(_tpFG); g_LastBlockReason = _tpFG; }
+      return;
+   }
+
    double slUSD = g_DynamicSL_USD * scale;
    double tpUSD = baseTpUSD * scale;
 

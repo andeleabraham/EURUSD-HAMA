@@ -10739,46 +10739,104 @@ void UpdateDashboard()
 
    // --- VWAP Table (text values — visual lines are in VWAP_Sessions indicator) ---
    {
-      double _bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+      double _bid      = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+      bool   _hasBands = (g_VWAPU1 > 0 && g_VWAPDaily > 0);
+
+      // ----------------------------------------------------------------
+      //  VWAP Zone: determine which sigma band price is in and derive
+      //  a professional decision signal.
+      //
+      //  Normal distribution law (68/95/99.7 rule):
+      //    ±1σ  = 68% of distribution  → fair value zone
+      //    ±2σ  = 95%                  → extended / stretched
+      //    ±3σ  = 99.7%               → statistical extreme
+      //
+      //  Decision logic (VWAP is the institutional "fair price" anchor):
+      //    > +3σ      STRONG SELL  — extreme over-extension; ~0.3% probability above here; mean
+      //                             reversion is the high-probability trade; institutions fade hard
+      //    +2σ→+3σ   SELL         — price is in the 95-99.7th %ile; very expensive vs fair value;
+      //                             short-sellers step in; longs should trail stops tight
+      //    +1σ→+2σ   HOLD         — above fair value but not extreme; momentum traders hold longs;
+      //                             no clean new-entry edge; wait for pullback to VWAP or +1σ
+      //    VWAP→+1σ  BUY          — above fair value, institutions are accumulating above VWAP;
+      //                             the dominant trend-following long zone; risk/reward favours longs
+      //    ±0.15σ    WAIT         — at equilibrium; bulls and bears balanced; no edge; let the
+      //                             market show its hand before committing
+      //    -1σ→VWAP  SELL         — below fair value; sellers in control; institutions distributing;
+      //                             short bias valid; any rally to VWAP is resistance
+      //    -2σ→-1σ   HOLD         — extended below fair value but not extreme; shorts carry risk of
+      //                             snap-back; wait for failed bounce or fresh push lower
+      //    -3σ→-2σ   BUY          — price stretched below fair value; high-probability mean-reversion
+      //                             long; institutions begin buying the dip (overnight/real-money flow)
+      //    < -3σ      STRONG BUY  — statistical extreme; practically all selling is exhausted;
+      //                             mean-reversion long with very high mathematical expectation
+      // ----------------------------------------------------------------
+      string _vDecision = "WAIT";
+      color  _vDecClr   = clrSilver;
+      color  _upperClr  = _hasBands ? clrDodgerBlue : clrDimGray;
+      color  _lowerClr  = _hasBands ? clrDodgerBlue : clrDimGray;
+
+      if(_hasBands) {
+         double _sig1      = g_VWAPU1 - g_VWAPDaily;  // 1σ distance
+         double _neutral   = _sig1 * 0.15;             // ±15% of 1σ = "at VWAP" dead-zone
+
+         if(_bid > g_VWAPU3) {
+            _vDecision = "STRONG SELL"; _vDecClr = clrRed;        _upperClr = clrRed;
+         } else if(_bid > g_VWAPU2) {
+            _vDecision = "SELL";        _vDecClr = clrOrangeRed;  _upperClr = clrOrangeRed;
+         } else if(_bid > g_VWAPU1) {
+            _vDecision = "HOLD";        _vDecClr = clrGold;       _upperClr = clrGold;
+         } else if(_bid > g_VWAPDaily + _neutral) {
+            _vDecision = "BUY";         _vDecClr = clrLime;       _upperClr = clrLime;
+         } else if(_bid >= g_VWAPDaily - _neutral) {
+            _vDecision = "WAIT";        _vDecClr = clrSilver;
+         } else if(_bid > g_VWAPL1) {
+            _vDecision = "SELL";        _vDecClr = clrOrange;     _lowerClr = clrOrange;
+         } else if(_bid > g_VWAPL2) {
+            _vDecision = "HOLD";        _vDecClr = clrGold;       _lowerClr = clrGold;
+         } else if(_bid > g_VWAPL3) {
+            _vDecision = "BUY";         _vDecClr = clrAqua;       _lowerClr = clrAqua;
+         } else {
+            _vDecision = "STRONG BUY";  _vDecClr = clrSpringGreen; _lowerClr = clrSpringGreen;
+         }
+      }
 
       // Header
       DashLine("R_vwap_hdr", "--- VWAP ---", rx, cy, rowR, lh, corner, clrSilver, 8); rowR++;
 
-      // Daily VWAP + pips from current price
+      // Daily VWAP + pip distance + decision signal (all on one row)
       string _vDailyStr;
       color  _vDailyClr;
       if(g_VWAPDaily > 0) {
          double _delta = (_bid - g_VWAPDaily) / _Point / 10.0;
-         string _arrow = (_delta >= 0) ? "+" : "";
+         string _sign  = (_delta >= 0) ? "+" : "";
          _vDailyStr = "Daily:" + DoubleToString(g_VWAPDaily, _Digits)
-                    + "  " + _arrow + DoubleToString(_delta, 1) + "p";
-         _vDailyClr = (_delta >= 0) ? clrLime : clrTomato;
+                    + " " + _sign + DoubleToString(_delta, 1) + "p"
+                    + "  [" + _vDecision + "]";
+         _vDailyClr = _vDecClr;
       } else {
-         _vDailyStr = "Daily: ---";
+         _vDailyStr = "Daily: ---  [--]";
          _vDailyClr = clrDimGray;
       }
       DashLine("R_vwap_daily", _vDailyStr, rx, cy, rowR, lh, corner, _vDailyClr, 9); rowR++;
 
-      // Upper bands: +σ1  +σ2  +σ3
-      bool _hasBands = (g_VWAPU1 > 0);
+      // Upper bands row — colored to show active zone when price is above VWAP
       string _vUstr = _hasBands
          ? "+s1:" + DoubleToString(g_VWAPU1, _Digits)
          + "  +s2:" + DoubleToString(g_VWAPU2, _Digits)
          + "  +s3:" + DoubleToString(g_VWAPU3, _Digits)
          : "+s1:---  +s2:---  +s3:---";
-      DashLine("R_vwap_upper", _vUstr, rx, cy, rowR, lh, corner,
-               _hasBands ? clrDodgerBlue : clrDimGray, 8); rowR++;
+      DashLine("R_vwap_upper", _vUstr, rx, cy, rowR, lh, corner, _upperClr, 8); rowR++;
 
-      // Lower bands: -σ1  -σ2  -σ3
+      // Lower bands row — colored to show active zone when price is below VWAP
       string _vLstr = _hasBands
          ? "-s1:" + DoubleToString(g_VWAPL1, _Digits)
          + "  -s2:" + DoubleToString(g_VWAPL2, _Digits)
          + "  -s3:" + DoubleToString(g_VWAPL3, _Digits)
          : "-s1:---  -s2:---  -s3:---";
-      DashLine("R_vwap_lower", _vLstr, rx, cy, rowR, lh, corner,
-               _hasBands ? clrDodgerBlue : clrDimGray, 8); rowR++;
+      DashLine("R_vwap_lower", _vLstr, rx, cy, rowR, lh, corner, _lowerClr, 8); rowR++;
 
-      // Session VWAPs (active session highlighted in cyan, inactive in silver)
+      // Session VWAPs (active session highlighted in cyan)
       string _sAs = (g_VWAPAsian  > 0) ? "As:" + DoubleToString(g_VWAPAsian,  _Digits) : "As:---";
       string _sLo = (g_VWAPLondon > 0) ? "Lo:" + DoubleToString(g_VWAPLondon, _Digits) : "Lo:---";
       string _sNY = (g_VWAPNY     > 0) ? "NY:" + DoubleToString(g_VWAPNY,     _Digits) : "NY:---";

@@ -328,6 +328,10 @@ input double VWAPMinTPRoomUSD      = 2.50;  // Min USD/0.01lot from signal price
 input double VWAPBandMinSpreadUSD  = 3.50;  // Min -s3/+s1 (or -s1/+s3) span in USD/0.01lot — below = bands compressed/consolidating → HOLD
 input int    VWAPBetSLMode         = 0;     // Bet SL mode: 0=Default(clamped $0.8-$1.8), 1=S2/R2 sigma band, 2=EOD(no hard SL, close at day end)
 input int    VWAPBetIncMinConf     = 50;    // INC (BOLD approaching) bets: min confidence % to log (50 avoids low-quality desperate entries)
+input int    VWAPSlopeBars         = 10;    // VWAP slope lookback (M15 bars): 10=2.5h of trend detection
+input double VWAPSlopeTrendUSD     = 0.80;  // Slope threshold USD/0.01lot: above=BOS trending, blocks counter-trend signals
+input int    VWAPConfirmBars       = 3;     // Max bars to wait for pullback confirmation after signal arms
+input double VWAPTrendRideUSD      = 1.50;  // Trend Ride (TR) bet TP target USD/0.01lot ($1-$2)
 
 input group "=== GEOPOLITICAL BIAS ==="
 input string GeoPoliticsNote  = "";
@@ -451,10 +455,25 @@ struct VWAPBet {
    bool     trailLocked;  // true once $2/0.01lot profit milestone locked in
    double   pnlUSD;       // realised P&L in $/0.01lot (set on resolution)
 };
-#define VWAP_BET_MAX 8
+#define VWAP_BET_MAX 5
 VWAPBet  g_VWAPBets[VWAP_BET_MAX];
 int      g_VWAPBetCount = 0;
 string   g_LastVWAPSig  = "";   // category dedup: "BUY"/"SELL"/"BUYINC"/"SELLINC"/""
+// VWAP slope / trend detection (BOS filter)
+double   g_VWAPSlopeHist[20];       // ring buffer: [0]=latest VWAP, [19]=19 bars ago
+int      g_VWAPSlopeHistCount = 0;
+datetime g_VWAPSlopeBarTime   = 0;   // last bar time for new-bar detection
+double   g_VWAPSlopeVal       = 0;   // current slope in USD/0.01lot
+int      g_VWAPSlopeDir       = 0;   // +1=trending UP, -1=trending DOWN, 0=flat
+// Armed signal state — awaiting pullback confirmation before firing bet
+int      g_VWAPArmedDir       = 0;     // 0=disarmed, 1=armed BUY, -1=armed SELL
+string   g_VWAPArmedLabel     = "";    // e.g. "S.SELL-87%"
+string   g_VWAPArmedType      = "";    // "BOLD" or "EXACT"
+double   g_VWAPArmedTP        = 0;
+double   g_VWAPArmedSLDef     = 0;
+double   g_VWAPArmedSLZone    = 0;
+int      g_VWAPArmedBarsLeft  = 0;     // countdown to expiry
+datetime g_VWAPArmedBarTime   = 0;     // last bar checked for confirmation
 
 double g_VWAPAsian  = 0;    // Asian session VWAP (0 when outside session)
 double g_VWAPLondon = 0;    // London session VWAP
@@ -2398,6 +2417,15 @@ void ComputeVWAP()
       g_VWAPU1_prev = 0; g_VWAPL1_prev = 0; g_VWAPU2_prev = 0; g_VWAPL2_prev = 0; g_VWAPU3_prev = 0; g_VWAPL3_prev = 0;
       g_VWAPAsian  = 0; g_VWAPLondon = 0; g_VWAPNY = 0;
 
+      // EOD: clear bet log — prevents log bloat across days
+      g_VWAPBetCount = 0; g_LastVWAPSig = "";
+      g_VWAPSlopeHistCount = 0; g_VWAPSlopeBarTime = 0;
+      g_VWAPSlopeVal = 0; g_VWAPSlopeDir = 0;
+      g_VWAPArmedDir = 0; g_VWAPArmedLabel = ""; g_VWAPArmedType = "";
+      g_VWAPArmedTP = 0; g_VWAPArmedSLDef = 0; g_VWAPArmedSLZone = 0;
+      g_VWAPArmedBarsLeft = 0; g_VWAPArmedBarTime = 0;
+      ArrayInitialize(g_VWAPSlopeHist, 0);
+
       // Re-scan all closed bars of today (oldest→newest, skip live bar 0)
       int barsToday = iBarShift(_Symbol, PERIOD_M15, dayStart, false);
       if(barsToday < 0) barsToday = 0;
@@ -2442,6 +2470,28 @@ void ComputeVWAP()
    g_VWAPAsian  = (inA && g_VCumVol_A > 0) ? g_VCumTP_A / g_VCumVol_A : 0;
    g_VWAPLondon = (inL && g_VCumVol_L > 0) ? g_VCumTP_L / g_VCumVol_L : 0;
    g_VWAPNY     = (inN && g_VCumVol_N > 0) ? g_VCumTP_N / g_VCumVol_N : 0;
+
+   // ---- VWAP slope / trend detection (BOS filter) ----
+   if(g_VWAPDaily > 0) {
+      datetime barTime0 = iTime(_Symbol, PERIOD_M15, 0);
+      if(barTime0 != g_VWAPSlopeBarTime) {
+         g_VWAPSlopeBarTime = barTime0;
+         // Shift history ring buffer right, insert latest VWAP at [0]
+         for(int hi = 19; hi > 0; hi--)
+            g_VWAPSlopeHist[hi] = g_VWAPSlopeHist[hi - 1];
+         g_VWAPSlopeHist[0] = g_VWAPDaily;
+         if(g_VWAPSlopeHistCount < 20) g_VWAPSlopeHistCount++;
+      }
+      // Compute slope if enough history bars collected
+      g_VWAPSlopeVal = 0; g_VWAPSlopeDir = 0;
+      if(g_VWAPSlopeHistCount >= VWAPSlopeBars && VWAPSlopeBars > 0) {
+         double pvS = _Point * 10.0;
+         double uppS = 0.10;
+         g_VWAPSlopeVal = (g_VWAPSlopeHist[0] - g_VWAPSlopeHist[VWAPSlopeBars - 1]) / pvS * uppS;
+         if(g_VWAPSlopeVal > VWAPSlopeTrendUSD)       g_VWAPSlopeDir = 1;   // trending UP (bull BOS)
+         else if(g_VWAPSlopeVal < -VWAPSlopeTrendUSD) g_VWAPSlopeDir = -1;  // trending DOWN (bear BOS)
+      }
+   }
 }
 
 //+------------------------------------------------------------------+
@@ -11030,6 +11080,62 @@ void UpdateDashboard()
       double _bid      = SymbolInfoDouble(_Symbol, SYMBOL_BID);
       bool   _hasBands = (g_VWAPU1 > 0 && g_VWAPDaily > 0);
 
+      // ---- Pullback confirmation & Trend Ride (checked on new M15 bar) ----
+      {
+         datetime _armBarNow = iTime(_Symbol, PERIOD_M15, 0);
+         if(_armBarNow != g_VWAPArmedBarTime) {
+            g_VWAPArmedBarTime = _armBarNow;
+            double _c1 = iClose(_Symbol, PERIOD_M15, 1);
+            double _o1 = iOpen(_Symbol, PERIOD_M15, 1);
+
+            // Check armed mean-reversion signal for pullback confirmation
+            if(g_VWAPArmedDir != 0) {
+               bool _armConf = false;
+               if(g_VWAPArmedDir == 1  && _c1 > _o1) _armConf = true;  // bullish candle → BUY confirmed
+               if(g_VWAPArmedDir == -1 && _c1 < _o1) _armConf = true;  // bearish candle → SELL confirmed
+               if(_armConf) {
+                  double _armPV  = _Point * 10.0;
+                  double _armUPP = 0.10;
+                  double _tpDist = MathAbs(g_VWAPArmedTP - _bid) / _armPV * _armUPP;
+                  if(_tpDist >= 1.50) {  // still enough TP room after pullback
+                     AddVWAPBet(g_VWAPArmedDir, _bid, g_VWAPArmedTP,
+                                g_VWAPArmedSLDef, g_VWAPArmedSLZone,
+                                g_VWAPArmedLabel, g_VWAPArmedType);
+                  }
+                  g_VWAPArmedDir = 0;
+               } else {
+                  g_VWAPArmedBarsLeft--;
+                  if(g_VWAPArmedBarsLeft <= 0) g_VWAPArmedDir = 0;  // expired
+               }
+            }
+
+            // Trend Ride: buy dips in uptrend, sell bounces in downtrend
+            if(g_VWAPSlopeDir != 0 && g_VWAPDaily > 0) {
+               bool _hasTR = false;
+               for(int _ti = 0; _ti < g_VWAPBetCount; _ti++)
+                  if(g_VWAPBets[_ti].betType == "TR" && g_VWAPBets[_ti].status == 0) { _hasTR = true; break; }
+
+               if(!_hasTR) {
+                  bool _trPull = false;
+                  int  _trDir  = 0;
+                  if(g_VWAPSlopeDir == 1  && _c1 < _o1) { _trPull = true; _trDir = 1;  }  // uptrend + bearish dip → BUY
+                  if(g_VWAPSlopeDir == -1 && _c1 > _o1) { _trPull = true; _trDir = -1; }  // downtrend + bullish bounce → SELL
+
+                  if(_trPull) {
+                     double _trPV   = _Point * 10.0;
+                     double _trUPP  = 0.10;
+                     double _trPips = VWAPTrendRideUSD / _trUPP * _trPV;
+                     double _trTP   = (_trDir == 1) ? _bid + _trPips : _bid - _trPips;
+                     string _trLbl  = StringFormat("TR %s-$%.1f", (_trDir == 1 ? "BUY" : "SELL"), VWAPTrendRideUSD);
+                     // TR uses far sentinel SL (ride with the trend, resolved EOD)
+                     double _trSL   = (_trDir == 1) ? _bid - 500.0 * _trPV : _bid + 500.0 * _trPV;
+                     AddVWAPBet(_trDir, _bid, _trTP, _trSL, _trSL, _trLbl, "TR");
+                  }
+               }
+            }
+         }
+      }
+
       // ----------------------------------------------------------------
       //  VWAP Zone — Revised Signal Framework (v8.00)
       //
@@ -11257,6 +11363,25 @@ void UpdateDashboard()
                                       (int)g_RSI, _rsiScoreBuy, _extraUSD, _gapPts, _tpRoomUSD, _roomBonusPts);
          }
 
+         // ---- Trend/BOS filter: override counter-trend signals during breakouts ----
+         if(g_VWAPSlopeDir != 0) {
+            bool _isBuyDec  = (StringFind(_vDecision, "BUY") >= 0);
+            bool _isSellDec = (StringFind(_vDecision, "SELL") >= 0);
+            if(g_VWAPSlopeDir == 1 && _isSellDec) {
+               // Bull breakout: VWAP rising hard → suppress SELL mean-reversion
+               _vDecision = StringFormat("BOS UP +$%.1f", g_VWAPSlopeVal);
+               _vDecClr = clrLime; _upperClr = clrLime;
+               _vDecSub = StringFormat("VWAP slope +$%.2f > $%.2f thresh: SELL blocked (bull BOS)",
+                                       g_VWAPSlopeVal, VWAPSlopeTrendUSD);
+            } else if(g_VWAPSlopeDir == -1 && _isBuyDec) {
+               // Bear breakout: VWAP falling hard → suppress BUY mean-reversion
+               _vDecision = StringFormat("BOS DN $%.1f", g_VWAPSlopeVal);
+               _vDecClr = clrTomato; _lowerClr = clrTomato;
+               _vDecSub = StringFormat("VWAP slope $%.2f < -$%.2f thresh: BUY blocked (bear BOS)",
+                                       g_VWAPSlopeVal, VWAPSlopeTrendUSD);
+            }
+         }
+
          // ---- Nearest sigma level to current price ----
          double _sigLvls[7]  = {g_VWAPL3, g_VWAPL2, g_VWAPL1, g_VWAPDaily, g_VWAPU1, g_VWAPU2, g_VWAPU3};
          string _sigNames[7] = {"-s3",    "-s2",    "-s1",    "VWAP",      "+s1",    "+s2",    "+s3"   };
@@ -11309,9 +11434,16 @@ void UpdateDashboard()
                         else                   { _betSLDef = _bid + (_bid - _betTP);             _betSLZone = (_refU3 > 0 ? _refU3 : g_VWAPU3); }
                      }
                   }
-                  if(_betTP > 0)
-                     AddVWAPBet(_bIsBuy ? 1 : -1, _bid, _betTP, _betSLDef, _betSLZone,
-                                _vDecision, _bIsBold ? "BOLD" : "EXACT");
+                  if(_betTP > 0) {
+                     // ARM the signal — wait for pullback confirmation before firing
+                     g_VWAPArmedDir      = _bIsBuy ? 1 : -1;
+                     g_VWAPArmedTP       = _betTP;
+                     g_VWAPArmedSLDef    = _betSLDef;
+                     g_VWAPArmedSLZone   = _betSLZone;
+                     g_VWAPArmedLabel    = _vDecision;
+                     g_VWAPArmedType     = _bIsBold ? "BOLD" : "EXACT";
+                     g_VWAPArmedBarsLeft = VWAPConfirmBars;
+                  }
                }
             }
             // Always update category tracker; clear on WAIT/HOLD so next signal fires fresh
@@ -11321,6 +11453,26 @@ void UpdateDashboard()
 
       // Header
       DashLine("R_vwap_hdr", "--- VWAP ---", rx, cy, rowR, lh, corner, clrSilver, 8); rowR++;
+
+      // Slope / trend status row
+      {
+         string _slopeStr;
+         color  _slopeClr;
+         if(g_VWAPSlopeDir == 1)       { _slopeStr = StringFormat("TREND: UP +$%.2f (TR BUY on dips)", g_VWAPSlopeVal); _slopeClr = clrLime; }
+         else if(g_VWAPSlopeDir == -1) { _slopeStr = StringFormat("TREND: DN $%.2f (TR SELL on bounces)",   g_VWAPSlopeVal); _slopeClr = clrTomato; }
+         else                          { _slopeStr = StringFormat("TREND: FLAT $%.2f (signals OK)",  g_VWAPSlopeVal); _slopeClr = clrDimGray; }
+         DashLine("R_vwap_slope", _slopeStr, rx, cy, rowR, lh, corner, _slopeClr, 8); rowR++;
+      }
+
+      // Armed signal status row
+      if(g_VWAPArmedDir != 0) {
+         string _armStr = StringFormat("ARMED: %s (%d bars left)", g_VWAPArmedLabel, g_VWAPArmedBarsLeft);
+         color  _armClr = (g_VWAPArmedDir == 1) ? clrAqua : clrOrangeRed;
+         DashLine("R_vwap_armed", _armStr, rx, cy, rowR, lh, corner, _armClr, 8);
+      } else {
+         DashLine("R_vwap_armed", "", rx, cy, rowR, lh, corner, clrDimGray, 8);
+      }
+      rowR++;
 
       // Daily VWAP | pip delta | RSI | [Decision] | nearest-sigma distance
       string _vDailyStr;

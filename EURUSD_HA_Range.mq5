@@ -10809,9 +10809,10 @@ void UpdateDashboard()
    color  rangeAncClr  = _usingPrev ? clrOrange : clrAqua;
    DashLine("04d_ranc", "RngSrc  : " + rangeAnchor,                             cx, cy, row, lh, corner, rangeAncClr,   8); row++;
 
-   DashLine("05_rh",     "Range   H: " + rhStr,                                 cx, cy, row, lh, corner, clrAqua,       9); row++;
-   DashLine("06_rl",     "Range   L: " + rlStr,                                 cx, cy, row, lh, corner, clrAqua,       9); row++;
-   DashLine("07_rm",     "Range   M: " + rmStr,                                 cx, cy, row, lh, corner, clrAqua,       9); row++;
+   DashLine("05_rh",     "Range H:" + rhStr + "  L:" + rlStr + "  M:" + rmStr, cx, cy, row, lh, corner, clrAqua,       9);
+   DashLine("06_rl",     "",                                                     cx, cy, row, lh, corner, clrAqua,       9);
+   DashLine("07_rm",     "",                                                     cx, cy, row, lh, corner, clrAqua,       9);
+   row++;
    // Yesterday's fixed reference (does not expand intraday)
    string pdHStr = (g_PrevDayHigh > 0) ? "Prev H:" + DoubleToString(g_PrevDayHigh, 5) +
                                          "  L:"    + DoubleToString(g_PrevDayLow,  5) : "PrevDay: N/A";
@@ -10824,8 +10825,9 @@ void UpdateDashboard()
    string cilStr = (g_CILow  > 0) ? DoubleToString(g_CILow,  5) : "N/A";
    DashLine("08_atr",    "ATR H1  : " + DoubleToString(g_ATR * 10000, 1) + " pips",
                                                                                  cx, cy, row, lh, corner, clrWhite,      9); row++;
-   DashLine("09_cih",    "CI High : " + cihStr,                                 cx, cy, row, lh, corner, clrLightBlue,  9); row++;
-   DashLine("10_cil",    "CI Low  : " + cilStr,                                 cx, cy, row, lh, corner, clrLightBlue,  9); row++;
+   DashLine("09_cih",    "CI  Hi:" + cihStr + "  Lo:" + cilStr,                 cx, cy, row, lh, corner, clrLightBlue,  9);
+   DashLine("10_cil",    "",                                                     cx, cy, row, lh, corner, clrLightBlue,  9);
+   row++;
    // --- ZAP / ZCP / Asian Bias rows (v7.00) ---
    if(UseZAP) {
       color  zapClr = g_ZAPActive ? (g_ZAPDir == 1 ? clrLime : clrTomato) : clrGray;
@@ -10995,32 +10997,41 @@ void UpdateDashboard()
       row++;
    }
 
-   // Asian session O/H/L
+   // Asian session O/H/L (one row)
    if(g_AsianSeeded || g_AsianHigh > 0) {
-      DashLine("11a_asian",  "Asian   : O:" + DoubleToString(g_AsianOpen, 5),  cx, cy, row, lh, corner, clrSilver, 9); row++;
-      DashLine("11b_asian",  "          H:" + DoubleToString(g_AsianHigh, 5) +
-                             "  L:" + DoubleToString(g_AsianLow,  5),           cx, cy, row, lh, corner, clrSilver, 9); row++;
+      DashLine("11a_asian",  "Asian  O:" + DoubleToString(g_AsianOpen, 5) +
+                             "  H:" + DoubleToString(g_AsianHigh, 5) +
+                             "  L:" + DoubleToString(g_AsianLow,  5),           cx, cy, row, lh, corner, clrSilver, 9);
+      DashLine("11b_asian",  "",                                                cx, cy, row, lh, corner, clrSilver, 9);
+      row++;
    } else {
-      DashLine("11a_asian",  "Asian   : Forming...",                           cx, cy, row, lh, corner, clrGray,   9); row++;
-      DashLine("11b_asian",  "",                                                cx, cy, row, lh, corner, clrGray,   9); row++;
+      DashLine("11a_asian",  "Asian   : Forming...",                           cx, cy, row, lh, corner, clrGray,   9);
+      DashLine("11b_asian",  "",                                                cx, cy, row, lh, corner, clrGray,   9);
+      row++;
    }
-   // London session O/H/L
+   // London session O/H/L (one row)
    if(g_LondonSeeded || g_LondonHigh > 0) {
-      DashLine("12a_london", "London  : O:" + DoubleToString(g_LondonOpen, 5), cx, cy, row, lh, corner, clrSilver, 9); row++;
-      DashLine("12b_london", "          H:" + DoubleToString(g_LondonHigh, 5) +
-                             "  L:" + DoubleToString(g_LondonLow,  5),          cx, cy, row, lh, corner, clrSilver, 9); row++;
+      DashLine("12a_london", "London O:" + DoubleToString(g_LondonOpen, 5) +
+                             "  H:" + DoubleToString(g_LondonHigh, 5) +
+                             "  L:" + DoubleToString(g_LondonLow,  5),          cx, cy, row, lh, corner, clrSilver, 9);
+      DashLine("12b_london", "",                                                cx, cy, row, lh, corner, clrSilver, 9);
+      row++;
    } else {
-      DashLine("12a_london", "London  : Forming...",                           cx, cy, row, lh, corner, clrGray,   9); row++;
-      DashLine("12b_london", "",                                                cx, cy, row, lh, corner, clrGray,   9); row++;
+      DashLine("12a_london", "London  : Forming...",                           cx, cy, row, lh, corner, clrGray,   9);
+      DashLine("12b_london", "",                                                cx, cy, row, lh, corner, clrGray,   9);
+      row++;
    }
-   // New York session O/H/L
+   // New York session O/H/L (one row)
    if(g_NYSeeded || g_NYHigh > 0) {
-      DashLine("13a_ny",     "NewYork : O:" + DoubleToString(g_NYOpen, 5),     cx, cy, row, lh, corner, clrSilver, 9); row++;
-      DashLine("13b_ny",     "          H:" + DoubleToString(g_NYHigh, 5) +
-                             "  L:" + DoubleToString(g_NYLow,  5),              cx, cy, row, lh, corner, clrSilver, 9); row++;
+      DashLine("13a_ny",     "NewYork O:" + DoubleToString(g_NYOpen, 5) +
+                             "  H:" + DoubleToString(g_NYHigh, 5) +
+                             "  L:" + DoubleToString(g_NYLow,  5),              cx, cy, row, lh, corner, clrSilver, 9);
+      DashLine("13b_ny",     "",                                                cx, cy, row, lh, corner, clrSilver, 9);
+      row++;
    } else {
-      DashLine("13a_ny",     "NewYork : Waiting...",                           cx, cy, row, lh, corner, clrGray,   9); row++;
-      DashLine("13b_ny",     "",                                                cx, cy, row, lh, corner, clrGray,   9); row++;
+      DashLine("13a_ny",     "NewYork : Waiting...",                           cx, cy, row, lh, corner, clrGray,   9);
+      DashLine("13b_ny",     "",                                                cx, cy, row, lh, corner, clrGray,   9);
+      row++;
    }
    row++;
 
@@ -11737,14 +11748,17 @@ void UpdateDashboard()
       }
       rowR++;
 
-      // Row 4: Lock thresholds
+      // Row 4: Lock thresholds + MaxLoss cap (merged)
       if(g_TradeOpen) {
-         DashLine("R_lktr", "LkTrig:$" + DoubleToString(g_ScaledLockUSD, 2) +
-                  "  TrailTrig:$" + DoubleToString(g_ScaledTrailUSD, 2),
+         double hardLoss = MaxLossUSD * g_CurrentLot / 0.01;
+         DashLine("R_lktr", "MaxLoss:-$" + DoubleToString(hardLoss, 2) +
+                  "  LkTrig:$" + DoubleToString(g_ScaledLockUSD, 2) +
+                  "  Trail:$" + DoubleToString(g_ScaledTrailUSD, 2),
                   rx, cy, rowR, lh, corner, clrAqua, 8);
       } else {
-         DashLine("R_lktr", "Lock/Tr : ---", rx, cy, rowR, lh, corner, clrDimGray, 8);
+         DashLine("R_lktr", "ML/Lock/Tr: ---", rx, cy, rowR, lh, corner, clrDimGray, 8);
       }
+      DashLine("R_cap", "", rx, cy, rowR, lh, corner, clrDimGray, 9); // cleared (merged into R_lktr)
       rowR++;
 
       // Row 5: Confluence level
@@ -11770,17 +11784,7 @@ void UpdateDashboard()
       }
       rowR++;
 
-      // Row 7: Hard loss cap
-      if(g_TradeOpen) {
-         double hardLoss = MaxLossUSD * g_CurrentLot / 0.01;
-         DashLine("R_cap", "MaxLoss : -$" + DoubleToString(hardLoss, 2) + " cap",
-                  rx, cy, rowR, lh, corner, clrTomato, 9);
-      } else {
-         DashLine("R_cap", "MaxLoss : ---", rx, cy, rowR, lh, corner, clrDimGray, 9);
-      }
-      rowR++;
-
-      // Row 8: Lock status + struct shifts
+      // Row 7: Lock status + struct shifts
       if(g_TradeOpen) {
          string lockStr = g_ProfitLocked
                           ? "LOCKED  peak:$" + DoubleToString(g_PeakProfit, 2)
@@ -11899,9 +11903,9 @@ void UpdateDashboard()
       DashLine("R_mthdr", mtHdrStr, rx, cy, rowR, lh, corner, mtHdrClr, 8); rowR++;
    }
 
-   // Up to 2 trades shown in full; 3rd+ summarised
-   int mtShow = MathMin(g_ManualTradeCount, 2);
-   for(int _mi = 0; _mi < 2; _mi++) {   // always render 2 trade blocks to hold slot positions
+   // Up to 1 trade shown in full; 2nd+ summarised
+   int mtShow = MathMin(g_ManualTradeCount, 1);
+   for(int _mi = 0; _mi < 1; _mi++) {   // render 1 trade block; second slot cleared below
       string pfx = "R_mt" + IntegerToString(_mi);
       if(_mi < mtShow) {
          ManualTradeInfo mt = g_ManualTrades[_mi];
@@ -12022,10 +12026,15 @@ void UpdateDashboard()
          DashLine(pfx + "_w",  "", rx, cy, rowR, lh, corner, clrDimGray, 8); rowR++;
       }
    }
-   // If there are > 2 trades, show a compact summary for the rest
-   if(g_ManualTradeCount > 2) {
-      string xtraStr = "  +" + IntegerToString(g_ManualTradeCount - 2) + " more: ";
-      for(int _mx = 2; _mx < g_ManualTradeCount; _mx++) {
+   // Clear second trade slot to remove stale labels (no longer rendered in loop)
+   DashLine("R_mt1_h",  "", rx, cy, rowR, lh, corner, clrDimGray, 9);
+   DashLine("R_mt1_sl", "", rx, cy, rowR, lh, corner, clrDimGray, 8);
+   DashLine("R_mt1_st", "", rx, cy, rowR, lh, corner, clrDimGray, 8);
+   DashLine("R_mt1_w",  "", rx, cy, rowR, lh, corner, clrDimGray, 8);
+   // If there are > 1 trade, show compact summary for the rest
+   if(g_ManualTradeCount > 1) {
+      string xtraStr = "  +" + IntegerToString(g_ManualTradeCount - 1) + " more: ";
+      for(int _mx = 1; _mx < g_ManualTradeCount; _mx++) {
          xtraStr += (g_ManualTrades[_mx].dir == 1 ? "BUY " : "SELL ") +
                     DoubleToString(g_ManualTrades[_mx].lots, 2) + "L  ";
       }

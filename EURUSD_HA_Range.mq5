@@ -85,6 +85,8 @@ input double HPLBreakPips       = 5.0;    // Pips past zone needed for a convinc
 input double HPLBlockBufferPips = 1.5;    // Extra pip buffer: how close price must be to trigger block
 input bool   HPLBlockBuysAtResist = true; // Block BUY entries at unbroken resistance HPL
 input bool   HPLBlockSellsAtSupport = true; // Block SELL entries at unbroken support HPL
+input bool   HPLBreakoutPending  = true;  // Place BuyStop/SellStop above/below HPL zone instead of hard skip
+input int    HPLPendingMaxBars   = 8;     // Cancel HPL breakout pending after N M15 bars (8 = 2 hours)
 
 input group "=== TIME FILTERS ==="
 input int    MaxHoldBars      = 48;     // Max 15M bars to hold = 12 hours — give trades room to develop
@@ -156,10 +158,13 @@ input bool   MA5020EntryRequired   = true;  // Require price touching or having 
 input group "=== DAILY EXTENSION CAP ==="
 // Prevents chasing moves already extended far from today's open.
 // Extension is measured as % of the D1 ATR already consumed in one direction from daily open.
-// 30% cap example: if D1 ATR=80 pips and price has fallen 24+ pips from today's open, block sells.
-// Block lifts when price retraces back inside the cap (e.g. rebound from -34% to -7%).
+// 80% cap example: if D1 ATR=80 pips and price has fallen 64+ pips from today's open, block sells.
+// Block lifts when price retraces back inside the cap (e.g. rebound from -70% to -30%).
+// Note: EURUSD typically moves 60-120% of D1 ATR within a session; 30% is far too restrictive
+// and blocks most valid intraday trend trades. 80% blocks only genuinely exhausted days.
+// Set to 0 or UseDailyExtCap=false to disable entirely.
 input bool   UseDailyExtCap        = true;   // Toggle daily extension cap
-input double DailyExtCapPct        = 30.0;   // % of D1 ATR: block if current move from open exceeds this
+input double DailyExtCapPct        = 80.0;   // % of D1 ATR: block if current move from open exceeds this
 input int    MaxConsecCandles    = 4;
 // Spike candle filter: a single HA candle whose total range exceeds SpikeATRMult × ATR is an
 // abnormal impulse (often news-driven). Skip arming the setup; reset the counter so the NEXT
@@ -204,6 +209,7 @@ input ENUM_TIMEFRAMES MacroStructTF = PERIOD_H4; // Higher timeframe to use for 
 input double BoldBetMinConf      = 55.0;   // Min confidence % to trigger a bold-bet entry (MTF + FVG/OB aligned)
 input bool   BollOverrideEnabled = true;   // Allow Bollinger gate to be bypassed by strong structural confluence
 input int    BollOverrideMinScore= 3;      // Min confluence score (out of 10) needed to override Bollinger gate
+input bool   BollGateEnabled     = false;  // When false (default): Bollinger is advisory only — adds/subtracts from confidence but never blocks signal promotion; true = restored hard gate
 input bool   UseOrderBlocks      = true;   // Detect H1 institutional order blocks
 input double OBMinBodyPips       = 8.0;    // Minimum OB candle body size in pips (filters doji/tiny OBs)
 input int    OBScanBars          = 60;     // H1 bars to scan (~2.5 days; was 30)
@@ -649,6 +655,12 @@ bool    g_HPLResistBlock = false;  // true when an unbroken RESIST HPL is overhe
 bool    g_HPLSupportBlock = false; // true when an unbroken SUPPORT HPL is below (SELL blocked)
 double  g_HPLResistHigh = 0, g_HPLResistLow = 0;   // nearest blocking resistance band
 double  g_HPLSupportHigh = 0, g_HPLSupportLow = 0; // nearest blocking support band
+
+// HPL breakout pending order tracking (v7.xx)
+int      g_HPLPendingTicket = 0;    // ticket of live HPL breakout pending order (0=none)
+int      g_HPLPendingDir    = 0;    // 1=BuyStop above resist HPL / -1=SellStop below support HPL
+datetime g_HPLPendingBar    = 0;    // M15 bar time when the pending was placed (age tracking)
+double   g_HPLPendingEntry  = 0;    // entry price of the pending order
 
 // Fair Value Gaps (FVG) — M15 imbalance zones
 struct FVGZone {
@@ -1249,6 +1261,69 @@ void ManageMA200Pending()
    }
 }
 
+// v7.xx: Manage the HPL breakout BuyStop / SellStop pending order.
+// Called every tick when g_HPLPendingTicket != 0. Handles:
+//   1. Trade opened — clear state once the pending fills (detected via g_TradeOpen)
+//   2. Order gone — clear state if order no longer exists in terminal
+//   3. Age expiry — cancel after HPLPendingMaxBars M15 bars
+//   4. Signal lost — cancel if HA signal no longer supports the pending direction
+//   5. Zone cleared — cancel if the HPL block is no longer active (zone broken → market entry eligible)
+void ManageHPLPending()
+{
+   if(g_HPLPendingTicket == 0) return;
+
+   // If a market trade is now open (pending was filled), clear state
+   if(g_TradeOpen) {
+      g_HPLPendingTicket = 0; g_HPLPendingDir = 0;
+      g_HPLPendingBar    = 0; g_HPLPendingEntry = 0;
+      return;
+   }
+
+   // Confirm the order still exists in the terminal
+   if(!OrderSelect(g_HPLPendingTicket)) {
+      g_HPLPendingTicket = 0; g_HPLPendingDir = 0;
+      g_HPLPendingBar    = 0; g_HPLPendingEntry = 0;
+      return;
+   }
+
+   // Age check — cancel if too old
+   if(HPLPendingMaxBars > 0 && g_HPLPendingBar > 0) {
+      int barsOld = (int)iBarShift(_Symbol, PERIOD_M15, g_HPLPendingBar, false);
+      if(barsOld >= HPLPendingMaxBars) {
+         Print("[HPL PENDING] Expired (", barsOld, " bars old, max=", HPLPendingMaxBars,
+               ") — cancelling #", g_HPLPendingTicket);
+         trade.OrderDelete(g_HPLPendingTicket);
+         g_HPLPendingTicket = 0; g_HPLPendingDir = 0;
+         g_HPLPendingBar    = 0; g_HPLPendingEntry = 0;
+         return;
+      }
+   }
+
+   // Signal check — cancel if HA no longer supports the pending direction
+   bool sigStillValid = (g_HPLPendingDir == 1  && (g_HABullSetup || g_Signal == "PREPARING BUY"))
+                      || (g_HPLPendingDir == -1 && (g_HABearSetup || g_Signal == "PREPARING SELL"));
+   if(!sigStillValid) {
+      Print("[HPL PENDING] Signal gone — cancelling #", g_HPLPendingTicket);
+      trade.OrderDelete(g_HPLPendingTicket);
+      g_HPLPendingTicket = 0; g_HPLPendingDir = 0;
+      g_HPLPendingBar    = 0; g_HPLPendingEntry = 0;
+      return;
+   }
+
+   // Zone cleared — if the HPL block is no longer active, the zone was broken and
+   // a market entry is now eligible. Cancel the pending so TryEntry can fire normally.
+   bool zoneStillActive = (g_HPLPendingDir == 1  && g_HPLResistBlock)
+                        || (g_HPLPendingDir == -1 && g_HPLSupportBlock);
+   if(!zoneStillActive) {
+      Print("[HPL PENDING] Zone cleared — cancelling #", g_HPLPendingTicket,
+            " (HPL block lifted, market entry now eligible)");
+      trade.OrderDelete(g_HPLPendingTicket);
+      g_HPLPendingTicket = 0; g_HPLPendingDir = 0;
+      g_HPLPendingBar    = 0; g_HPLPendingEntry = 0;
+      return;
+   }
+}
+
 //+------------------------------------------------------------------+
 // v6.33: Seed session bar counters at startup so they reflect the correct value
 // even when the EA loads mid-session (not just on the next new-bar event).
@@ -1470,6 +1545,8 @@ void OnTick()
    if(g_TradeOpen) ManageOpenTrade();
    // v6.35: Manage MA200 boundary pending order (cancel if stale/signal-lost/filled)
    if(g_PendingMA200Ticket != 0) ManageMA200Pending();
+   // v7.xx: Manage HPL breakout pending order (cancel if stale/signal-lost/zone-cleared/filled)
+   if(g_HPLPendingTicket != 0) ManageHPLPending();
 
    // --- Retry session seeding if data wasn't ready on OnInit ---
    // Key: use !g_AsianSeeded / !g_LondonSeeded flags (NOT g_AsianHigh==0),
@@ -5083,10 +5160,13 @@ double CalcConfidence(int tradeDir, string zone, bool isMeanRev, bool isSideways
    }
    g_ConfBreakdown += " CdlAlign:" + DoubleToString(conf - prevConf, 0); prevConf = conf;
 
-   // --- FACTOR 19 — BOLLINGER BAND HEADROOM (0-8) ---
-   // If price is below the upper band (buy) or above the lower band (sell),
-   // there is room to move → boost confidence. Stronger during Asian session
-   // when prev-day momentum aligns (carry-over bias with Bollinger runway).
+   // --- FACTOR 19 — BOLLINGER BAND HEADROOM + MIDLINE ALIGNMENT ---
+   // Part A: Band runway — is there room to move in the trade direction?
+   //   +4 base runway, +2 carry-over momentum, +2 Asian carry-over → max +8
+   //   −3 when at/past the band edge (limited room)
+   // Part B: Midline alignment — are body mids on the correct side of the Bollinger midline?
+   //   This is the same test as bollOK in the HA state machine — now used as a confidence
+   //   factor regardless of BollGateEnabled. +5 aligned / −5 against midline.
    {
       double bollBonus = 0;
       if(g_BollingerUpper1 > 0 && g_BollingerLower1 > 0) {
@@ -5104,6 +5184,27 @@ double CalcConfidence(int tradeDir, string zone, bool isMeanRev, bool isSideways
          } else {
             // Price at or past Bollinger band in trade direction → limited room
             bollBonus -= 3.0;
+         }
+         // Part B: Midline alignment — body midpoints vs Bollinger midline
+         // Equivalent to the bollOK check in the HA signal machine.
+         // Contributes ±5 regardless of BollGateEnabled (gate is advisory, scoring is always active).
+         if(g_BollingerMid1 > 0 && g_BollingerMid2 > 0) {
+            double _haO1b, _haH1b, _haL1b, _haC1b, _haO2b, _haH2b, _haL2b, _haC2b;
+            CalcHA(1, _haO1b, _haH1b, _haL1b, _haC1b);
+            CalcHA(2, _haO2b, _haH2b, _haL2b, _haC2b);
+            double _bMid1 = (_haO1b + _haC1b) / 2.0;
+            double _bMid2 = (_haO2b + _haC2b) / 2.0;
+            double _bwP   = (g_BollingerUpper1 - g_BollingerLower1) / _Point / 10.0;
+            bool   _narrow = (_bwP < NarrowBandPips);
+            bool   _bollOK;
+            if(_narrow)
+               _bollOK = (tradeDir == 1) ? (_haH1b >= g_BollingerMid1 && _bMid1 <= g_BollingerUpper1)
+                                         : (_haL1b <= g_BollingerMid1 && _bMid1 >= g_BollingerLower1);
+            else
+               _bollOK = (tradeDir == 1) ? (_bMid1 <= g_BollingerMid1 && _bMid2 <= g_BollingerMid2)
+                                         : (_bMid1 >= g_BollingerMid1 && _bMid2 >= g_BollingerMid2);
+            if(_bollOK)  bollBonus += 5.0;   // midline-aligned: ideal Bollinger position
+            else         bollBonus -= 5.0;   // against midline: room barrier, less conviction
          }
       }
       conf += bollBonus;
@@ -5615,6 +5716,11 @@ void DetectZoneApproach()
       if(g_ThreeDayHigh > 0 && MathAbs(bid - g_ThreeDayHigh) <= prox) { sellScore++; sellZones += "3dH "; }
    }
 
+   // Previous-day High/Low — strong institutional memory, weighted +2 (equal to H4 OB weight)
+   // These are the most-watched daily levels for institutional orders and stop clusters.
+   if(g_PrevDayLow  > 0 && MathAbs(bid - g_PrevDayLow)  <= prox) { buyScore  += 2; buyZones  += "PdL "; }
+   if(g_PrevDayHigh > 0 && MathAbs(bid - g_PrevDayHigh) <= prox) { sellScore += 2; sellZones += "PdH "; }
+
    // Fibonacci levels (61.8/76.4 = deep support → BUY; 23.6/38.2 = resistance → SELL)
    if(g_Fib382 > 0) {
       if(MathAbs(bid - g_Fib618) <= prox) { buyScore++;  buyZones  += "F61.8 "; }
@@ -5643,10 +5749,12 @@ void DetectZoneApproach()
       bool   fo = false;
       if(g_ZAPDir == 1) {
          if(g_CILow         > 0 && bid < g_CILow         - sweepDist) { fo = true; g_ZAPZonePrice = g_CILow; }
+         if(!fo && g_PrevDayLow  > 0 && bid < g_PrevDayLow  - sweepDist) { fo = true; g_ZAPZonePrice = g_PrevDayLow; }
          if(!fo && g_HPLSupportLow > 0 && bid < g_HPLSupportLow - sweepDist) { fo = true; g_ZAPZonePrice = g_HPLSupportLow; }
          if(!fo && g_PivotS1 > 0 && bid < g_PivotS1 - sweepDist)           { fo = true; g_ZAPZonePrice = g_PivotS1; }
       } else {
          if(g_CIHigh        > 0 && bid > g_CIHigh        + sweepDist) { fo = true; g_ZAPZonePrice = g_CIHigh; }
+         if(!fo && g_PrevDayHigh > 0 && bid > g_PrevDayHigh + sweepDist) { fo = true; g_ZAPZonePrice = g_PrevDayHigh; }
          if(!fo && g_HPLResistHigh > 0 && bid > g_HPLResistHigh + sweepDist) { fo = true; g_ZAPZonePrice = g_HPLResistHigh; }
          if(!fo && g_PivotR1 > 0 && bid > g_PivotR1 + sweepDist)           { fo = true; g_ZAPZonePrice = g_PivotR1; }
       }
@@ -6380,17 +6488,21 @@ void EvaluateHAPattern()
                      " — staying PREPARING (chain preserved, consec=", g_HAConsecCount, ")");
             }
          }
-         if(bollOK && realCandleOK) {
+         if((bollOK || !BollGateEnabled) && realCandleOK) {
             if(g_ConfirmCandleOpen == 0)
                g_ConfirmCandleOpen = iTime(_Symbol, PERIOD_M15, 1);
             g_Signal             = "BUY INCOMING";
             g_SignalPendingReason = "";  // clean confirm — clear any stale reason
             if(bollOverrideApplied)
                Print("BUY INCOMING [BOLL OVERRIDE]: entering despite Boll midline — ", g_BollOverrideReason);
+            else if(!bollOK && !BollGateEnabled)
+               Print("BUY INCOMING [BOLL ADVISORY]: against midline — confidence penalty applied",
+                     (isNarrow ? " [NARROW " + DoubleToString(bandWidthPips,1) + "pip]" : ""),
+                     " BodyMid=", DoubleToString(bodyMid1,5), " BollMid=", DoubleToString(g_BollingerMid1,5));
          } else {
             g_Signal            = "PREPARING BUY";
             g_ConfirmCandleOpen = 0;
-            if(!bollOK) {
+            if(!bollOK && BollGateEnabled) {
                g_SignalPendingReason = "";  // Bollinger block — clear MIXED reason
                Print("PREPARING BUY: Bollinger gate BLOCKING",
                      (isNarrow ? " [NARROW band=" + DoubleToString(bandWidthPips,1) + "pip]" : ""),
@@ -6592,17 +6704,21 @@ void EvaluateHAPattern()
                      " — staying PREPARING (chain preserved, consec=", g_HAConsecCount, ")");
             }
          }
-         if(bollOK && realCandleOKS) {
+         if((bollOK || !BollGateEnabled) && realCandleOKS) {
             if(g_ConfirmCandleOpen == 0)
                g_ConfirmCandleOpen = iTime(_Symbol, PERIOD_M15, 1);
             g_Signal             = "SELL INCOMING";
             g_SignalPendingReason = "";  // clean confirm — clear any stale reason
             if(bollOverrideAppliedS)
                Print("SELL INCOMING [BOLL OVERRIDE]: entering despite Boll midline — ", g_BollOverrideReason);
+            else if(!bollOK && !BollGateEnabled)
+               Print("SELL INCOMING [BOLL ADVISORY]: against midline — confidence penalty applied",
+                     (isNarrow ? " [NARROW " + DoubleToString(bandWidthPips,1) + "pip]" : ""),
+                     " BodyMid=", DoubleToString(bodyMid1s,5), " BollMid=", DoubleToString(g_BollingerMid1,5));
          } else {
             g_Signal            = "PREPARING SELL";
             g_ConfirmCandleOpen = 0;
-            if(!bollOK) {
+            if(!bollOK && BollGateEnabled) {
                g_SignalPendingReason = "";  // Bollinger block — clear MIXED reason
                Print("PREPARING SELL: Bollinger gate BLOCKING",
                      (isNarrow ? " [NARROW band=" + DoubleToString(bandWidthPips,1) + "pip]" : ""),
@@ -7635,20 +7751,110 @@ void TryEntry()
    // point of MRV is to fade the level), so isMeanRev is exempt.
    if(UseHPL && tradeDir != 0 && !isMeanRev) {
       if(tradeDir == 1 && HPLBlockBuysAtResist && g_HPLResistBlock) {
-         string _hplMsg = "[HPL BLOCK] BUY blocked — RESIST HPL @" +
-                          DoubleToString(g_HPLResistLow * 1.0, _Digits) + "-" +
-                          DoubleToString(g_HPLResistHigh * 1.0, _Digits) +
-                          " — wait for clean close above zone";
-         if(_hplMsg != g_LastBlockReason) { Print(_hplMsg); g_LastBlockReason = _hplMsg; }
-         return;
+         // === HPL BUY BLOCK → BuyStop breakout pending ===
+         if(HPLBreakoutPending && BotTradingEnabled && !g_TradeOpen
+            && (g_HPLPendingTicket == 0 || g_HPLPendingDir != 1)) {
+            // Entry: HPLBreakPips above the top of the resistance zone
+            double pipSize     = _Point * ((int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS) % 2 == 1 ? 10 : 1);
+            double bufDist     = HPLBreakPips * pipSize;
+            double pendEntry   = NormalizeDouble(g_HPLResistHigh + bufDist, _Digits);
+            // SL / TP — same values used by the market-order path
+            double _slUSD  = g_DynamicSL_USD * (lot / 0.01);
+            double _tpUSD  = g_DynamicTP_USD * (lot / 0.01);
+            double _slDist = USDtoPoints(_slUSD, lot);
+            double _tpDist = USDtoPoints(_tpUSD, lot);
+            double _minSp  = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL) * _Point;
+            if(_slDist < _minSp + _Point * 5) _slDist = _minSp + _Point * 5;
+            if(_tpDist < _minSp + _Point * 5) _tpDist = _minSp + _Point * 5;
+            double pendSL  = NormalizeDouble(pendEntry - _slDist, _Digits);
+            double pendTP  = NormalizeDouble(pendEntry + _tpDist, _Digits);
+            string pendTag = "PEND_BS_HPL_SL" + DoubleToString(g_DynamicSL_USD,2)
+                             + "_TP" + DoubleToString(g_DynamicTP_USD,2);
+            // Cancel any stale opposite-direction HPL pending first
+            if(g_HPLPendingTicket != 0) {
+               trade.OrderDelete(g_HPLPendingTicket);
+               g_HPLPendingTicket = 0; g_HPLPendingDir = 0;
+               g_HPLPendingBar = 0;    g_HPLPendingEntry = 0;
+            }
+            bool _pOK = trade.BuyStop(lot, pendEntry, _Symbol, pendSL, pendTP, ORDER_TIME_GTC, 0, pendTag);
+            if(_pOK) {
+               g_HPLPendingTicket = (int)trade.ResultOrder();
+               g_HPLPendingDir    = 1;
+               g_HPLPendingBar    = iTime(_Symbol, PERIOD_M15, 0);
+               g_HPLPendingEntry  = pendEntry;
+               g_LastBlockReason  = "";
+               Print("[HPL PENDING] BuyStop @", DoubleToString(pendEntry,5),
+                     " SL=", DoubleToString(pendSL,5), " TP=", DoubleToString(pendTP,5),
+                     " | RESIST HPL zone ", DoubleToString(g_HPLResistLow,5),
+                     "-", DoubleToString(g_HPLResistHigh,5),
+                     " +buf=", DoubleToString(HPLBreakPips,1), "pip — awaiting breakout");
+            } else {
+               Print("[HPL PENDING] BuyStop placement failed: ", trade.ResultComment());
+            }
+            return;
+         } else {
+            // HPLBreakoutPending off, BotTradingEnabled off, or pending already active
+            string _hplMsg = "[HPL BLOCK] BUY blocked — RESIST HPL @" +
+                             DoubleToString(g_HPLResistLow * 1.0, _Digits) + "-" +
+                             DoubleToString(g_HPLResistHigh * 1.0, _Digits) +
+                             (g_HPLPendingTicket != 0 ? " (pending #" + IntegerToString(g_HPLPendingTicket) + " active)" : "")
+                             + " — wait for clean close above zone";
+            if(_hplMsg != g_LastBlockReason) { Print(_hplMsg); g_LastBlockReason = _hplMsg; }
+            return;
+         }
       }
       if(tradeDir == -1 && HPLBlockSellsAtSupport && g_HPLSupportBlock) {
-         string _hplMsg = "[HPL BLOCK] SELL blocked — SUPPORT HPL @" +
-                          DoubleToString(g_HPLSupportLow * 1.0, _Digits) + "-" +
-                          DoubleToString(g_HPLSupportHigh * 1.0, _Digits) +
-                          " — wait for clean close below zone";
-         if(_hplMsg != g_LastBlockReason) { Print(_hplMsg); g_LastBlockReason = _hplMsg; }
-         return;
+         // === HPL SELL BLOCK → SellStop breakout pending ===
+         if(HPLBreakoutPending && BotTradingEnabled && !g_TradeOpen
+            && (g_HPLPendingTicket == 0 || g_HPLPendingDir != -1)) {
+            // Entry: HPLBreakPips below the bottom of the support zone
+            double pipSize     = _Point * ((int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS) % 2 == 1 ? 10 : 1);
+            double bufDist     = HPLBreakPips * pipSize;
+            double pendEntry   = NormalizeDouble(g_HPLSupportLow - bufDist, _Digits);
+            // SL / TP — same values used by the market-order path
+            double _slUSD  = g_DynamicSL_USD * (lot / 0.01);
+            double _tpUSD  = g_DynamicTP_USD * (lot / 0.01);
+            double _slDist = USDtoPoints(_slUSD, lot);
+            double _tpDist = USDtoPoints(_tpUSD, lot);
+            double _minSp  = SymbolInfoInteger(_Symbol, SYMBOL_TRADE_STOPS_LEVEL) * _Point;
+            if(_slDist < _minSp + _Point * 5) _slDist = _minSp + _Point * 5;
+            if(_tpDist < _minSp + _Point * 5) _tpDist = _minSp + _Point * 5;
+            double pendSL  = NormalizeDouble(pendEntry + _slDist, _Digits);
+            double pendTP  = NormalizeDouble(pendEntry - _tpDist, _Digits);
+            string pendTag = "PEND_SS_HPL_SL" + DoubleToString(g_DynamicSL_USD,2)
+                             + "_TP" + DoubleToString(g_DynamicTP_USD,2);
+            // Cancel any stale opposite-direction HPL pending first
+            if(g_HPLPendingTicket != 0) {
+               trade.OrderDelete(g_HPLPendingTicket);
+               g_HPLPendingTicket = 0; g_HPLPendingDir = 0;
+               g_HPLPendingBar = 0;    g_HPLPendingEntry = 0;
+            }
+            bool _pOK = trade.SellStop(lot, pendEntry, _Symbol, pendSL, pendTP, ORDER_TIME_GTC, 0, pendTag);
+            if(_pOK) {
+               g_HPLPendingTicket = (int)trade.ResultOrder();
+               g_HPLPendingDir    = -1;
+               g_HPLPendingBar    = iTime(_Symbol, PERIOD_M15, 0);
+               g_HPLPendingEntry  = pendEntry;
+               g_LastBlockReason  = "";
+               Print("[HPL PENDING] SellStop @", DoubleToString(pendEntry,5),
+                     " SL=", DoubleToString(pendSL,5), " TP=", DoubleToString(pendTP,5),
+                     " | SUPPORT HPL zone ", DoubleToString(g_HPLSupportLow,5),
+                     "-", DoubleToString(g_HPLSupportHigh,5),
+                     " -buf=", DoubleToString(HPLBreakPips,1), "pip — awaiting breakdown");
+            } else {
+               Print("[HPL PENDING] SellStop placement failed: ", trade.ResultComment());
+            }
+            return;
+         } else {
+            // HPLBreakoutPending off, BotTradingEnabled off, or pending already active
+            string _hplMsg = "[HPL BLOCK] SELL blocked — SUPPORT HPL @" +
+                             DoubleToString(g_HPLSupportLow * 1.0, _Digits) + "-" +
+                             DoubleToString(g_HPLSupportHigh * 1.0, _Digits) +
+                             (g_HPLPendingTicket != 0 ? " (pending #" + IntegerToString(g_HPLPendingTicket) + " active)" : "")
+                             + " — wait for clean close below zone";
+            if(_hplMsg != g_LastBlockReason) { Print(_hplMsg); g_LastBlockReason = _hplMsg; }
+            return;
+         }
       }
    }
 

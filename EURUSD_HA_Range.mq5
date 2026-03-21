@@ -604,6 +604,8 @@ int    g_hMA20  = INVALID_HANDLE;
 // v6.36: Persistent indicator handles (avoid create/destroy per bar)
 int    g_hATR   = INVALID_HANDLE;   // H1 ATR handle
 int    g_hBands = INVALID_HANDLE;   // M15 Bollinger Bands handle
+int    g_hRSI   = INVALID_HANDLE;   // M15 RSI(14) handle
+double g_RSI    = 50;               // RSI value cached on each new bar (bar 1 closed)
 datetime g_LastH4BarTime = 0;        // v6.36: track H4 bar for frequency gating
 datetime g_M1M5BlockStart = 0;       // v6.36: when M1/M5 double-oppose started (soft timeout)
 double g_MA200 = 0, g_MA50 = 0, g_MA20 = 0;  // current MA levels (bar 0 live)
@@ -1409,8 +1411,10 @@ int OnInit()
    // v6.36: Create persistent ATR and Bollinger handles (avoid per-bar create/destroy overhead)
    g_hATR   = iATR  (_Symbol, PERIOD_H1,  ATRPeriod);
    g_hBands = iBands(_Symbol, PERIOD_M15, BollingerPeriod, 0, 2.0, PRICE_CLOSE);
-   if(g_hATR == INVALID_HANDLE)   Print("[INIT] WARNING: ATR handle creation failed");
+   g_hRSI   = iRSI  (_Symbol, PERIOD_M15, 14, PRICE_CLOSE);
+   if(g_hATR   == INVALID_HANDLE) Print("[INIT] WARNING: ATR handle creation failed");
    if(g_hBands == INVALID_HANDLE) Print("[INIT] WARNING: Bollinger handle creation failed");
+   if(g_hRSI   == INVALID_HANDLE) Print("[INIT] WARNING: RSI handle creation failed");
    // v6.33: Seed session bar counters so observe windows are correct when EA loads mid-session
    SeedSessionBarCounts();
    UpdateMAValues();  // v6.34: seed MA values at startup
@@ -1492,6 +1496,7 @@ void OnDeinit(const int reason)
    // v6.36: Release persistent ATR and Bollinger handles
    if(g_hATR   != INVALID_HANDLE) { IndicatorRelease(g_hATR);   g_hATR   = INVALID_HANDLE; }
    if(g_hBands != INVALID_HANDLE) { IndicatorRelease(g_hBands); g_hBands = INVALID_HANDLE; }
+   if(g_hRSI   != INVALID_HANDLE) { IndicatorRelease(g_hRSI);   g_hRSI   = INVALID_HANDLE; }
    // v6.43: Release NB Brain persistent MA handles
    if(g_hNB_MA10 != INVALID_HANDLE) { IndicatorRelease(g_hNB_MA10); g_hNB_MA10 = INVALID_HANDLE; }
    if(g_hNB_MA30 != INVALID_HANDLE) { IndicatorRelease(g_hNB_MA30); g_hNB_MA30 = INVALID_HANDLE; }
@@ -1638,6 +1643,7 @@ void OnTick()
       g_CurrentLot = CalcLot();
       ComputeATR();
       ComputeVWAP();
+      ComputeRSI();
       CalcBollinger();
       UpdateMAValues();  // v6.36: moved from per-tick to per-bar (values only change on bar close)
       SetActiveRange();
@@ -2380,6 +2386,18 @@ void ComputeVWAP()
    g_VWAPAsian  = (inA && g_VCumVol_A > 0) ? g_VCumTP_A / g_VCumVol_A : 0;
    g_VWAPLondon = (inL && g_VCumVol_L > 0) ? g_VCumTP_L / g_VCumVol_L : 0;
    g_VWAPNY     = (inN && g_VCumVol_N > 0) ? g_VCumTP_N / g_VCumVol_N : 0;
+}
+
+//+------------------------------------------------------------------+
+//| RSI — read M15 RSI(14) bar[1] (last confirmed close)            |
+//+------------------------------------------------------------------+
+void ComputeRSI()
+{
+   if(g_hRSI == INVALID_HANDLE) return;
+   double _buf[];
+   ArraySetAsSeries(_buf, true);
+   if(CopyBuffer(g_hRSI, 0, 1, 1, _buf) > 0)
+      g_RSI = _buf[0];
 }
 
 //+------------------------------------------------------------------+
@@ -10743,84 +10761,104 @@ void UpdateDashboard()
       bool   _hasBands = (g_VWAPU1 > 0 && g_VWAPDaily > 0);
 
       // ----------------------------------------------------------------
-      //  VWAP Zone: determine which sigma band price is in and derive
-      //  a professional decision signal.
+      //  VWAP Zone — Normal Distribution framework (68/95/99.7 rule)
       //
-      //  Normal distribution law (68/95/99.7 rule):
-      //    ±1σ  = 68% of distribution  → fair value zone
-      //    ±2σ  = 95%                  → extended / stretched
-      //    ±3σ  = 99.7%               → statistical extreme
+      //  ±1σ = VALUE AREA (68% of daily volume) — fair value zone
+      //      Above VWAP within ±1σ = BUY bias (above fair price anchor)
+      //      At VWAP (±neutral)      = WAIT  (equilibrium, no edge)
+      //      Below VWAP within ±1σ  = HOLD  (below fair price, bearish
+      //                                       tilt but still inside value
+      //                                       area — wait for -1σ break)
       //
-      //  Decision logic (VWAP is the institutional "fair price" anchor):
-      //    > +3σ      STRONG SELL  — extreme over-extension; ~0.3% probability above here; mean
-      //                             reversion is the high-probability trade; institutions fade hard
-      //    +2σ→+3σ   SELL         — price is in the 95-99.7th %ile; very expensive vs fair value;
-      //                             short-sellers step in; longs should trail stops tight
-      //    +1σ→+2σ   HOLD         — above fair value but not extreme; momentum traders hold longs;
-      //                             no clean new-entry edge; wait for pullback to VWAP or +1σ
-      //    VWAP→+1σ  BUY          — above fair value, institutions are accumulating above VWAP;
-      //                             the dominant trend-following long zone; risk/reward favours longs
-      //    ±0.15σ    WAIT         — at equilibrium; bulls and bears balanced; no edge; let the
-      //                             market show its hand before committing
-      //    -1σ→VWAP  SELL         — below fair value; sellers in control; institutions distributing;
-      //                             short bias valid; any rally to VWAP is resistance
-      //    -2σ→-1σ   HOLD         — extended below fair value but not extreme; shorts carry risk of
-      //                             snap-back; wait for failed bounce or fresh push lower
-      //    -3σ→-2σ   BUY          — price stretched below fair value; high-probability mean-reversion
-      //                             long; institutions begin buying the dip (overnight/real-money flow)
-      //    < -3σ      STRONG BUY  — statistical extreme; practically all selling is exhausted;
-      //                             mean-reversion long with very high mathematical expectation
+      //  Outside the value area (±1σ → ±2σ):
+      //      +1σ→+2σ  HOLD (longs extended; no new entries; trail stops)
+      //      -1σ→-2σ  SELL (confirmed breakdown below value area)
+      //
+      //  Stretched (±2σ → ±3σ):
+      //      +2σ→+3σ  SELL  (very expensive; institutions fading)
+      //      -2σ→-3σ  BUY   (deeply oversold; mean-reversion setup)
+      //
+      //  Statistical extreme (beyond ±3σ — 0.3% probability):
+      //      > +3σ   STRONG SELL (extreme; fade with high conviction)
+      //      < -3σ   STRONG BUY  (extreme; mean-reversion near-certain)
       // ----------------------------------------------------------------
       string _vDecision = "WAIT";
       color  _vDecClr   = clrSilver;
       color  _upperClr  = _hasBands ? clrDodgerBlue : clrDimGray;
       color  _lowerClr  = _hasBands ? clrDodgerBlue : clrDimGray;
 
-      if(_hasBands) {
-         double _sig1      = g_VWAPU1 - g_VWAPDaily;  // 1σ distance
-         double _neutral   = _sig1 * 0.15;             // ±15% of 1σ = "at VWAP" dead-zone
+      // Nearest sigma level (for display on decision line)
+      string _nearSig  = "";
+      double _nearPips = 0;  // positive = price is above that level; negative = below
 
+      if(_hasBands) {
+         double _sig1    = g_VWAPU1 - g_VWAPDaily;   // 1σ absolute distance
+         double _neutral = _sig1 * 0.15;              // ±15% of 1σ = equilibrium dead-zone
+
+         // ---- Decision zone ----
          if(_bid > g_VWAPU3) {
-            _vDecision = "STRONG SELL"; _vDecClr = clrRed;        _upperClr = clrRed;
+            _vDecision = "S.SELL"; _vDecClr = clrRed;        _upperClr = clrRed;
          } else if(_bid > g_VWAPU2) {
-            _vDecision = "SELL";        _vDecClr = clrOrangeRed;  _upperClr = clrOrangeRed;
+            _vDecision = "SELL";   _vDecClr = clrOrangeRed;  _upperClr = clrOrangeRed;
          } else if(_bid > g_VWAPU1) {
-            _vDecision = "HOLD";        _vDecClr = clrGold;       _upperClr = clrGold;
+            _vDecision = "HOLD";   _vDecClr = clrGold;       _upperClr = clrGold;
          } else if(_bid > g_VWAPDaily + _neutral) {
-            _vDecision = "BUY";         _vDecClr = clrLime;       _upperClr = clrLime;
+            _vDecision = "BUY";    _vDecClr = clrLime;       _upperClr = clrLime;
          } else if(_bid >= g_VWAPDaily - _neutral) {
-            _vDecision = "WAIT";        _vDecClr = clrSilver;
+            _vDecision = "WAIT";   _vDecClr = clrSilver;
          } else if(_bid > g_VWAPL1) {
-            _vDecision = "SELL";        _vDecClr = clrOrange;     _lowerClr = clrOrange;
+            // Inside value area but below VWAP: bearish tilt, not a confirmed sell
+            _vDecision = "HOLD";   _vDecClr = clrGold;       _lowerClr = clrGold;
          } else if(_bid > g_VWAPL2) {
-            _vDecision = "HOLD";        _vDecClr = clrGold;       _lowerClr = clrGold;
+            // Below value area (-1σ): confirmed bearish breakdown
+            _vDecision = "SELL";   _vDecClr = clrOrange;     _lowerClr = clrOrange;
          } else if(_bid > g_VWAPL3) {
-            _vDecision = "BUY";         _vDecClr = clrAqua;       _lowerClr = clrAqua;
+            _vDecision = "BUY";    _vDecClr = clrAqua;       _lowerClr = clrAqua;
          } else {
-            _vDecision = "STRONG BUY";  _vDecClr = clrSpringGreen; _lowerClr = clrSpringGreen;
+            _vDecision = "S.BUY";  _vDecClr = clrSpringGreen; _lowerClr = clrSpringGreen;
+         }
+
+         // ---- Nearest sigma level to current price ----
+         double _sigLvls[7]  = {g_VWAPL3, g_VWAPL2, g_VWAPL1, g_VWAPDaily, g_VWAPU1, g_VWAPU2, g_VWAPU3};
+         string _sigNames[7] = {"-s3",    "-s2",    "-s1",    "VWAP",      "+s1",    "+s2",    "+s3"   };
+         double _minDist = 1e10;
+         for(int _si = 0; _si < 7; _si++) {
+            double _d = MathAbs(_bid - _sigLvls[_si]);
+            if(_d < _minDist) {
+               _minDist  = _d;
+               _nearSig  = _sigNames[_si];
+               _nearPips = (_bid - _sigLvls[_si]) / _Point / 10.0;
+            }
          }
       }
 
       // Header
       DashLine("R_vwap_hdr", "--- VWAP ---", rx, cy, rowR, lh, corner, clrSilver, 8); rowR++;
 
-      // Daily VWAP + pip distance + decision signal (all on one row)
+      // Daily VWAP | pip delta | RSI | [Decision] | nearest-sigma distance
       string _vDailyStr;
       color  _vDailyClr;
       if(g_VWAPDaily > 0) {
          double _delta = (_bid - g_VWAPDaily) / _Point / 10.0;
-         string _sign  = (_delta >= 0) ? "+" : "";
-         _vDailyStr = "Daily:" + DoubleToString(g_VWAPDaily, _Digits)
-                    + " " + _sign + DoubleToString(_delta, 1) + "p"
-                    + "  [" + _vDecision + "]";
+         string _dSign = (_delta >= 0) ? "+" : "";
+         string _rsiStr = "RSI:" + DoubleToString(g_RSI, 0);
+         string _sigRef = "";
+         if(_nearSig != "") {
+            string _pSign = (_nearPips >= 0) ? "+" : "";
+            _sigRef = "  " + _nearSig + ":" + _pSign + DoubleToString(_nearPips, 1) + "p";
+         }
+         _vDailyStr = "D:" + DoubleToString(g_VWAPDaily, _Digits)
+                    + " " + _dSign + DoubleToString(_delta, 1) + "p"
+                    + "  " + _rsiStr
+                    + "  [" + _vDecision + "]" + _sigRef;
          _vDailyClr = _vDecClr;
       } else {
-         _vDailyStr = "Daily: ---  [--]";
+         _vDailyStr = "D:---  RSI:---  [--]";
          _vDailyClr = clrDimGray;
       }
       DashLine("R_vwap_daily", _vDailyStr, rx, cy, rowR, lh, corner, _vDailyClr, 9); rowR++;
 
-      // Upper bands row — colored to show active zone when price is above VWAP
+      // Upper sigma bands row — colored to show active zone when price is above VWAP
       string _vUstr = _hasBands
          ? "+s1:" + DoubleToString(g_VWAPU1, _Digits)
          + "  +s2:" + DoubleToString(g_VWAPU2, _Digits)
@@ -10828,7 +10866,7 @@ void UpdateDashboard()
          : "+s1:---  +s2:---  +s3:---";
       DashLine("R_vwap_upper", _vUstr, rx, cy, rowR, lh, corner, _upperClr, 8); rowR++;
 
-      // Lower bands row — colored to show active zone when price is below VWAP
+      // Lower sigma bands row — colored to show active zone when price is below VWAP
       string _vLstr = _hasBands
          ? "-s1:" + DoubleToString(g_VWAPL1, _Digits)
          + "  -s2:" + DoubleToString(g_VWAPL2, _Digits)

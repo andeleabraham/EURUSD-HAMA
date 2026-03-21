@@ -324,9 +324,8 @@ input group "=== VWAP SIGNAL THRESHOLDS ==="
 // confirmation and sufficient TP room (mean-reversion must have space to reach VWAP).
 input double VWAPRSIOversoldBuy    = 40.0;  // "Strong" BUY RSI thresh (35pts); ≤30=extreme(50pts); ≤(this+5=45)=moderate(20pts); >45=no signal
 input double VWAPRSIOverboughtSell = 60.0;  // "Strong" SELL RSI thresh (35pts); ≥70=extreme(50pts); ≥(this-5=55)=moderate(20pts); <55=no signal
-input double VWAPMinTPRoomUSD      = 3.00;  // Min USD/0.01lot from -σ2 (or +σ2) to VWAP — hard floor during NY overlap+
-input double VWAPMinTPRoomAsiaLon = 2.50;  // Relaxed TP room floor for Asia+London (pre-NY overlap) — fires W.BUY/W.SELL with -15pt confidence penalty
-input double VWAPBandMinSpreadUSD  = 5.00;  // Min total band spread (-s3 to +s1 in USD/0.01lot) — below = compressed/consolidating → HOLD
+input double VWAPMinTPRoomUSD      = 2.50;  // Min USD/0.01lot from signal price to VWAP midline — all sessions (EURUSD typical: σ2 to mid ≈ 2.5-4)
+input double VWAPBandMinSpreadUSD  = 3.50;  // Min -s3/+s1 (or -s1/+s3) span in USD/0.01lot — below = bands compressed/consolidating → HOLD
 
 input group "=== GEOPOLITICAL BIAS ==="
 input string GeoPoliticsNote  = "";
@@ -435,6 +434,24 @@ double g_VWAPL3     = 0;    // Daily −3σ band
 double g_VWAPU1_prev = 0;  double g_VWAPL1_prev = 0;
 double g_VWAPU2_prev = 0;  double g_VWAPL2_prev = 0;
 double g_VWAPU3_prev = 0;  double g_VWAPL3_prev = 0;
+
+// --- VWAP Bold Bets + Signal Log ----------------------------------------
+struct VWAPBet {
+   int      dir;           // 1=buy, -1=sell
+   double   entry;         // bid at signal time
+   double   tp;            // target (opposite σ1)
+   double   sl;            // stop loss
+   double   rrRatio;       // tp_dist / sl_dist
+   string   decLabel;      // decision string e.g. "S.SELL-87%"
+   string   betType;       // "BOLD" (approaching) or "EXACT" (crossed σ2/σ3)
+   datetime signalTime;
+   int      status;        // 0=running, 1=won, 2=lost
+};
+#define VWAP_BET_MAX 8
+VWAPBet  g_VWAPBets[VWAP_BET_MAX];
+int      g_VWAPBetCount = 0;
+string   g_LastVWAPSig  = "";   // category dedup: "BUY"/"SELL"/"BUYINC"/"SELLINC"/""
+
 double g_VWAPAsian  = 0;    // Asian session VWAP (0 when outside session)
 double g_VWAPLondon = 0;    // London session VWAP
 double g_VWAPNY     = 0;    // NY session VWAP
@@ -10255,6 +10272,49 @@ void DashLine(string suffix, string text,
    ObjectSetInteger(0, name, OBJPROP_ZORDER,    1);   // above background panel
 }
 
+// Add a new entry to the VWAP bet log (called when a new zone-entry signal fires)
+void AddVWAPBet(int dir, double entry, double tp, double sl,
+                string decLabel, string betType)
+{
+   if(tp <= 0 || sl <= 0 || entry <= 0) return;
+   double tpDist = MathAbs(tp - entry);
+   double slDist = MathAbs(entry - sl);
+   if(slDist < _Point) return;          // degenerate SL guard
+   double rr = tpDist / slDist;
+   // Internal dedup: skip if newest running bet is same direction and entry within 5 pips
+   if(g_VWAPBetCount > 0 && g_VWAPBets[0].status == 0 &&
+      g_VWAPBets[0].dir == dir &&
+      MathAbs(g_VWAPBets[0].entry - entry) < 5.0 * _Point * 10.0) return;
+   // Shift array down to insert at index 0 (newest first)
+   for(int _i = VWAP_BET_MAX - 1; _i > 0; _i--) g_VWAPBets[_i] = g_VWAPBets[_i-1];
+   g_VWAPBets[0].dir        = dir;
+   g_VWAPBets[0].entry      = entry;
+   g_VWAPBets[0].tp         = tp;
+   g_VWAPBets[0].sl         = sl;
+   g_VWAPBets[0].rrRatio    = rr;
+   g_VWAPBets[0].decLabel   = decLabel;
+   g_VWAPBets[0].betType    = betType;
+   g_VWAPBets[0].signalTime = TimeCurrent();
+   g_VWAPBets[0].status     = 0;
+   if(g_VWAPBetCount < VWAP_BET_MAX) g_VWAPBetCount++;
+}
+
+// Update running bet statuses (WON/LOST) based on current price — called each timer tick
+void UpdateVWAPBetStatuses()
+{
+   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   for(int _i = 0; _i < g_VWAPBetCount; _i++) {
+      if(g_VWAPBets[_i].status != 0) continue;  // already resolved
+      if(g_VWAPBets[_i].dir == 1) {    // BUY: TP above entry, SL below
+         if(bid >= g_VWAPBets[_i].tp)   g_VWAPBets[_i].status = 1;  // WON
+         else if(bid <= g_VWAPBets[_i].sl) g_VWAPBets[_i].status = 2;  // LOST
+      } else {                           // SELL: TP below entry, SL above
+         if(bid <= g_VWAPBets[_i].tp)   g_VWAPBets[_i].status = 1;
+         else if(bid >= g_VWAPBets[_i].sl) g_VWAPBets[_i].status = 2;
+      }
+   }
+}
+
 void UpdateDashboard()
 {
    string session = GetSession();
@@ -10953,10 +11013,14 @@ void UpdateDashboard()
                              ? MathAbs(_bid - g_VWAPDaily) / _pipVal * _usdPerPip
                              : 0;
 
-         // Session-aware TP room relaxation: Asia+London (pre-NY overlap) uses $2.5 soft floor
-         // NY overlap and later always require the full $3 hard floor.
-         MqlDateTime _vDt; TimeToStruct(TimeCurrent(), _vDt);
-         bool _preNYOverlap = (_vDt.hour < NewYorkStartHour);
+         // --- TP room gap bonus: additional confidence pts for generous mean-reversion space ---
+         // Stacks on top of RSI + band-penetration scores. More room = higher-quality signal.
+         //   < $2.50 (min)  → signal blocked (WAIT)
+         //   $2.50 - $2.99  → 0 pts   (meets floor, no bonus)
+         //   $3.00 - $3.99  → +10 pts (healthy room)
+         //   $4.00 - $4.99  → +20 pts (good room)
+         //   $5.00+         → +30 pts (super perfect — full mean-reversion potential)
+         int _roomBonusPts = (_tpRoomUSD >= 5.0 ? 30 : (_tpRoomUSD >= 4.0 ? 20 : (_tpRoomUSD >= 3.0 ? 10 : 0)));
 
          // --- Graduated RSI confidence: 3-tier point system (0-50 pts per direction) ---
          //   Tier 3 — Extreme  RSI ≤ 30 / ≥ 70                                  → 50 pts
@@ -11002,43 +11066,35 @@ void UpdateDashboard()
             // Above +3σ (prev-bar) — USD gap beyond σ3 drives gap confidence
             double _extraUSD = (_bid - _refU3) / _pipVal * _usdPerPip;
             int    _gapPts   = (_extraUSD < 1.0 ? 45 : (_extraUSD < 2.0 ? 48 : 50));
-            int    _conf     = _rsiScoreSell + _gapPts;
+            int    _conf     = _rsiScoreSell + _gapPts + _roomBonusPts;
             if     (_rsiScoreSell >= 50) { _vDecision = "S.SELL"; _vDecClr = clrRed;       _upperClr = clrRed;       }
             else if(_rsiScoreSell >= 35) { _vDecision = "S.SELL"; _vDecClr = clrOrangeRed; _upperClr = clrOrangeRed; }
             else if(_rsiScoreSell >= 20) { _vDecision = "SELL";   _vDecClr = clrOrange;    _upperClr = clrOrange;    }
             else                         { _conf /= 2;
                                            _vDecision = "SELL";   _vDecClr = clrGoldenrod; _upperClr = clrGoldenrod; }
             _vDecision = _vDecision + "-" + IntegerToString(_conf) + "%";
-            _vDecSub   = StringFormat("RSI:%d(+%dpts) | +$%.1f past +s3(+%dpts) [prev-s3:%.4f]",
-                                      (int)g_RSI, _rsiScoreSell, _extraUSD, _gapPts, _refU3);
+            _vDecSub   = StringFormat("RSI:%d(+%dpts) | +$%.1f past +s3(+%dpts) Rm:$%.1f(+%dpts)",
+                                      (int)g_RSI, _rsiScoreSell, _extraUSD, _gapPts, _tpRoomUSD, _roomBonusPts);
 
          } else if(_bid > _refU2) {
             // +σ2→+σ3 (prev-bar ref): SELL zone
-            bool   _fullRoom = (_tpRoomUSD >= VWAPMinTPRoomUSD);
-            bool   _weakRoom = (!_fullRoom && _preNYOverlap && _tpRoomUSD >= VWAPMinTPRoomAsiaLon);
+            bool   _roomOK = (_tpRoomUSD >= VWAPMinTPRoomUSD);
             double _bandW  = (_refU3 > _refU2) ? (_refU3 - _refU2) : 1e-10;
             double _gap    = _bid - _refU2;
             double _pen    = MathMin(_gap / _bandW, 1.0);
             int    _gapPts = (_pen < 0.25 ? 10 : (_pen < 0.50 ? 20 : (_pen < 0.75 ? 30 : 40)));
-            int    _conf   = _rsiScoreSell + _gapPts;
-            if(_rsiScoreSell > 0 && _fullRoom) {
+            int    _conf   = _rsiScoreSell + _gapPts + _roomBonusPts;
+            if(_rsiScoreSell > 0 && _roomOK) {
                if     (_rsiScoreSell >= 50) { _vDecision = "S.SELL"; _vDecClr = clrOrangeRed; _upperClr = clrOrangeRed; }
                else if(_rsiScoreSell >= 35) { _vDecision = "SELL";   _vDecClr = clrOrangeRed; _upperClr = clrOrangeRed; }
                else                         { _vDecision = "SELL";   _vDecClr = clrOrange;    _upperClr = clrOrange;    }
                _vDecision = _vDecision + "-" + IntegerToString(_conf) + "%";
-               _vDecSub   = StringFormat("RSI:%d(+%dpts) | %.0f%% into +s2-s3(+%dpts) Rm:$%.1f",
-                                         (int)g_RSI, _rsiScoreSell, _pen * 100.0, _gapPts, _tpRoomUSD);
-            } else if(_rsiScoreSell > 0 && _weakRoom) {
-               int _wConf = MathMax(_conf - 15, 0);
-               _vDecision = "W.SELL-" + IntegerToString(_wConf) + "%";
-               _vDecClr = clrGoldenrod;  _upperClr = clrGoldenrod;
-               _vDecSub = StringFormat("WEAK(Asia/Lon): Rm$%.1f vs $%.0f req | RSI:%d(+%dpts) pen-15",
-                                        _tpRoomUSD, VWAPMinTPRoomUSD, (int)g_RSI, _rsiScoreSell);
+               _vDecSub   = StringFormat("RSI:%d(+%dpts) | %.0f%% into +s2-s3(+%dpts) Rm:$%.1f(+%dpts)",
+                                         (int)g_RSI, _rsiScoreSell, _pen * 100.0, _gapPts, _tpRoomUSD, _roomBonusPts);
             } else if(_rsiScoreSell > 0) {
                _vDecision = "WAIT";   _vDecClr = clrGold;   _upperClr = clrGold;
-               double _minR = _preNYOverlap ? VWAPMinTPRoomAsiaLon : VWAPMinTPRoomUSD;
                _vDecSub   = StringFormat("RSI:%d OK but ROOM<$%.1f (got $%.1f)",
-                                         (int)g_RSI, _minR, _tpRoomUSD);
+                                         (int)g_RSI, VWAPMinTPRoomUSD, _tpRoomUSD);
             } else {
                _vDecision = "WAIT";   _vDecClr = clrGold;   _upperClr = clrGold;
                _vDecSub   = StringFormat("RSI:%.0f — await >=%.0f(mod) />=%.0f(strong) />=70(extreme)",
@@ -11096,31 +11152,23 @@ void UpdateDashboard()
 
          } else if(_bid > _refL3) {
             // Below -σ2 (above -σ3) (prev-bar ref): BUY zone
-            bool   _fullRoom = (_tpRoomUSD >= VWAPMinTPRoomUSD);
-            bool   _weakRoom = (!_fullRoom && _preNYOverlap && _tpRoomUSD >= VWAPMinTPRoomAsiaLon);
+            bool   _roomOK = (_tpRoomUSD >= VWAPMinTPRoomUSD);
             double _bandW  = (_refL2 > _refL3) ? (_refL2 - _refL3) : 1e-10;
             double _gap    = _refL2 - _bid;
             double _pen    = MathMin(_gap / _bandW, 1.0);
             int    _gapPts = (_pen < 0.25 ? 10 : (_pen < 0.50 ? 20 : (_pen < 0.75 ? 30 : 40)));
-            int    _conf   = _rsiScoreBuy + _gapPts;
-            if(_rsiScoreBuy > 0 && _fullRoom) {
+            int    _conf   = _rsiScoreBuy + _gapPts + _roomBonusPts;
+            if(_rsiScoreBuy > 0 && _roomOK) {
                if     (_rsiScoreBuy >= 50) { _vDecision = "S.BUY"; _vDecClr = clrAqua;    _lowerClr = clrAqua;    }
                else if(_rsiScoreBuy >= 35) { _vDecision = "BUY";   _vDecClr = clrAqua;    _lowerClr = clrAqua;    }
                else                        { _vDecision = "BUY";   _vDecClr = clrSkyBlue; _lowerClr = clrSkyBlue; }
                _vDecision = _vDecision + "-" + IntegerToString(_conf) + "%";
-               _vDecSub   = StringFormat("RSI:%d(+%dpts) | %.0f%% into -s2-s3(+%dpts) Rm:$%.1f",
-                                         (int)g_RSI, _rsiScoreBuy, _pen * 100.0, _gapPts, _tpRoomUSD);
-            } else if(_rsiScoreBuy > 0 && _weakRoom) {
-               int _wConf = MathMax(_conf - 15, 0);
-               _vDecision = "W.BUY-" + IntegerToString(_wConf) + "%";
-               _vDecClr = clrSteelBlue;  _lowerClr = clrSteelBlue;
-               _vDecSub = StringFormat("WEAK(Asia/Lon): Rm$%.1f vs $%.0f req | RSI:%d(+%dpts) pen-15",
-                                        _tpRoomUSD, VWAPMinTPRoomUSD, (int)g_RSI, _rsiScoreBuy);
+               _vDecSub   = StringFormat("RSI:%d(+%dpts) | %.0f%% into -s2-s3(+%dpts) Rm:$%.1f(+%dpts)",
+                                         (int)g_RSI, _rsiScoreBuy, _pen * 100.0, _gapPts, _tpRoomUSD, _roomBonusPts);
             } else if(_rsiScoreBuy > 0) {
                _vDecision = "WAIT";   _vDecClr = clrGold;   _lowerClr = clrGold;
-               double _minR = _preNYOverlap ? VWAPMinTPRoomAsiaLon : VWAPMinTPRoomUSD;
                _vDecSub   = StringFormat("RSI:%d OK but ROOM<$%.1f (got $%.1f)",
-                                         (int)g_RSI, _minR, _tpRoomUSD);
+                                         (int)g_RSI, VWAPMinTPRoomUSD, _tpRoomUSD);
             } else {
                _vDecision = "WAIT";   _vDecClr = clrGold;   _lowerClr = clrGold;
                _vDecSub   = StringFormat("RSI:%.0f — await <=%.0f(mod) /<=%.0f(strong) /<=30(extreme)",
@@ -11131,15 +11179,15 @@ void UpdateDashboard()
             // Below -σ3 (prev-bar reference) — USD gap beyond σ3 drives gap confidence
             double _extraUSD = (_refL3 - _bid) / _pipVal * _usdPerPip;
             int    _gapPts   = (_extraUSD < 1.0 ? 45 : (_extraUSD < 2.0 ? 48 : 50));
-            int    _conf     = _rsiScoreBuy + _gapPts;
+            int    _conf     = _rsiScoreBuy + _gapPts + _roomBonusPts;
             if     (_rsiScoreBuy >= 50) { _vDecision = "S.BUY"; _vDecClr = clrSpringGreen; _lowerClr = clrSpringGreen; }
             else if(_rsiScoreBuy >= 35) { _vDecision = "S.BUY"; _vDecClr = clrLime;        _lowerClr = clrLime;        }
             else if(_rsiScoreBuy >= 20) { _vDecision = "BUY";   _vDecClr = clrAqua;        _lowerClr = clrAqua;        }
             else                        { _conf /= 2;
                                           _vDecision = "BUY";   _vDecClr = clrSkyBlue;     _lowerClr = clrSkyBlue;     }
             _vDecision = _vDecision + "-" + IntegerToString(_conf) + "%";
-            _vDecSub   = StringFormat("RSI:%d(+%dpts) | -$%.1f past -s3(+%dpts) [prev-s3:%.4f]",
-                                      (int)g_RSI, _rsiScoreBuy, _extraUSD, _gapPts, _refL3);
+            _vDecSub   = StringFormat("RSI:%d(+%dpts) | -$%.1f past -s3(+%dpts) Rm:$%.1f(+%dpts)",
+                                      (int)g_RSI, _rsiScoreBuy, _extraUSD, _gapPts, _tpRoomUSD, _roomBonusPts);
          }
 
          // ---- Nearest sigma level to current price ----
@@ -11153,6 +11201,53 @@ void UpdateDashboard()
                _nearSig  = _sigNames[_si];
                _nearPips = (_bid - _sigLvls[_si]) / _Point / 10.0;
             }
+         }
+
+         // --- VWAP Bet Log: capture zone-entry events (Bold Bets + exact signals) ---
+         {
+            // Classify current decision into a category string (strips the %-conf suffix)
+            string _vCat = (StringFind(_vDecision,"INC") >= 0)
+                           ? (StringFind(_vDecision,"BUY") >= 0 ? "BUYINC" : "SELLINC")
+                           : (StringFind(_vDecision,"BUY")  >= 0 ? "BUY"  :
+                             (StringFind(_vDecision,"SELL") >= 0 ? "SELL" : ""));
+            // Only log when category changes (zone-entry event, not every tick)
+            if(_vCat != "" && _vCat != g_LastVWAPSig) {
+               bool   _bIsBold = (StringFind(_vDecision,"INC") >= 0);
+               bool   _bIsBuy  = (StringFind(_vDecision,"BUY") >= 0);
+               double _betTP   = 0, _betSL = 0;
+               if(_bIsBuy && g_VWAPU1 > 0) {
+                  // BUY TP = +σ1 (opposite side); must offer ≥ $2 per 0.01 lot of room
+                  double _bTPRm = (g_VWAPU1 - _bid) / _pipVal * _usdPerPip;
+                  if(_bTPRm >= 2.0) {
+                     _betTP = g_VWAPU1;
+                     // SL at zone boundary behind entry:
+                     //   approaching -σ2 (BOLD) → SL at prev-bar -σ2
+                     //   inside -σ2→-σ3         → SL at prev-bar -σ3
+                     //   beyond -σ3             → 1:1 SL below entry
+                     if(_bIsBold)             _betSL = (_refL2 > 0 ? _refL2 : g_VWAPL2);
+                     else if(_bid > _refL3)   _betSL = _refL3;
+                     else                     _betSL = _bid - (_betTP - _bid);
+                  }
+               } else if(!_bIsBuy && g_VWAPL1 > 0) {
+                  // SELL TP = -σ1 (opposite side); must offer ≥ $2 per 0.01 lot of room
+                  double _bTPRm = (_bid - g_VWAPL1) / _pipVal * _usdPerPip;
+                  if(_bTPRm >= 2.0) {
+                     _betTP = g_VWAPL1;
+                     // SL at zone boundary behind entry:
+                     //   approaching +σ2 (BOLD) → SL at prev-bar +σ2
+                     //   inside +σ2→+σ3         → SL at prev-bar +σ3
+                     //   beyond +σ3             → 1:1 SL above entry
+                     if(_bIsBold)             _betSL = (_refU2 > 0 ? _refU2 : g_VWAPU2);
+                     else if(_bid < _refU3)   _betSL = _refU3;
+                     else                     _betSL = _bid + (_bid - _betTP);
+                  }
+               }
+               if(_betTP > 0 && _betSL > 0)
+                  AddVWAPBet(_bIsBuy ? 1 : -1, _bid, _betTP, _betSL,
+                             _vDecision, _bIsBold ? "BOLD" : "EXACT");
+            }
+            // Always update category tracker; clear on WAIT/HOLD so next signal fires fresh
+            g_LastVWAPSig = _vCat;
          }
       }
 
@@ -11215,6 +11310,37 @@ void UpdateDashboard()
                _anySessActive ? clrCyan : clrDimGray, 8); rowR++;
 
       rowR++;  // blank spacer
+
+      // --- VWAP Bold Bets & Signal Log ---
+      UpdateVWAPBetStatuses();   // refresh WON/LOST status on every dashboard tick
+      DashLine("R_bb_hdr", "--- VWAP BETS & SIGNAL LOG ---", rx, cy, rowR, lh, corner, clrDodgerBlue, 8); rowR++;
+      {
+         int _bbN = MathMin(g_VWAPBetCount, VWAP_BET_MAX);
+         for(int _bi = 0; _bi < VWAP_BET_MAX; _bi++) {
+            string _bKey = "R_bb" + IntegerToString(_bi);
+            if(_bi < _bbN) {
+               VWAPBet b = g_VWAPBets[_bi];
+               string  _bPfx  = (b.betType == "BOLD") ? "B:" : "E:";
+               string  _bStat = (b.status == 1) ? "WON" : (b.status == 2) ? "LST" : "RUN";
+               MqlDateTime _bDt; TimeToStruct(b.signalTime, _bDt);
+               string  _bTime = StringFormat("%02d:%02d", _bDt.hour, _bDt.min);
+               // Format: <type>:<label(12)> @<entry5f> TP:<tp5f> SL:<sl5f> <RR>R <stat> <time>
+               string  _bLine = StringFormat("%-14s @%.5f TP:%.5f SL:%.5f %.1fR %s %s",
+                                             _bPfx + b.decLabel,
+                                             b.entry, b.tp, b.sl, b.rrRatio, _bStat, _bTime);
+               color   _bClr;
+               if     (b.status == 1)          _bClr = clrLime;       // WON
+               else if(b.status == 2)          _bClr = clrTomato;     // LOST
+               else if(b.betType == "BOLD")    _bClr = clrGold;       // running BOLD bet
+               else _bClr = (b.dir == 1) ? clrAqua : clrOrangeRed;   // running EXACT
+               DashLine(_bKey, _bLine, rx, cy, rowR, lh, corner, _bClr, 8);
+            } else {
+               DashLine(_bKey, "", rx, cy, rowR, lh, corner, clrDimGray, 8);
+            }
+            rowR++;
+         }
+      }
+      rowR++;  // blank spacer after bets
    }
 
    // --- Trade Status (ALL rows ALWAYS rendered — prevents label overlap) ---

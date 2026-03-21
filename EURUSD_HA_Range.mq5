@@ -326,6 +326,8 @@ input double VWAPRSIOversoldBuy    = 40.0;  // "Strong" BUY RSI thresh (35pts); 
 input double VWAPRSIOverboughtSell = 60.0;  // "Strong" SELL RSI thresh (35pts); ≥70=extreme(50pts); ≥(this-5=55)=moderate(20pts); <55=no signal
 input double VWAPMinTPRoomUSD      = 2.50;  // Min USD/0.01lot from signal price to VWAP midline — all sessions (EURUSD typical: σ2 to mid ≈ 2.5-4)
 input double VWAPBandMinSpreadUSD  = 3.50;  // Min -s3/+s1 (or -s1/+s3) span in USD/0.01lot — below = bands compressed/consolidating → HOLD
+input int    VWAPBetSLMode         = 0;     // Bet SL mode: 0=Default(clamped $0.8-$1.8), 1=S2/R2 sigma band, 2=EOD(no hard SL, close at day end)
+input int    VWAPBetIncMinConf     = 50;    // INC (BOLD approaching) bets: min confidence % to log (50 avoids low-quality desperate entries)
 
 input group "=== GEOPOLITICAL BIAS ==="
 input string GeoPoliticsNote  = "";
@@ -446,6 +448,8 @@ struct VWAPBet {
    string   betType;       // "BOLD" (approaching) or "EXACT" (crossed σ2/σ3)
    datetime signalTime;
    int      status;        // 0=running, 1=won, 2=lost
+   bool     trailLocked;  // true once $2/0.01lot profit milestone locked in
+   double   pnlUSD;       // realised P&L in $/0.01lot (set on resolution)
 };
 #define VWAP_BET_MAX 8
 VWAPBet  g_VWAPBets[VWAP_BET_MAX];
@@ -10273,18 +10277,52 @@ void DashLine(string suffix, string text,
 }
 
 // Add a new entry to the VWAP bet log (called when a new zone-entry signal fires)
-void AddVWAPBet(int dir, double entry, double tp, double sl,
+// slZoneRef = the σ2/σ3 level to use as SL when VWAPBetSLMode == 1 (S2/R2 band)
+void AddVWAPBet(int dir, double entry, double tp, double slDef, double slZoneRef,
                 string decLabel, string betType)
 {
-   if(tp <= 0 || sl <= 0 || entry <= 0) return;
+   if(tp <= 0 || entry <= 0) return;
+
+   // --- TP cap: $2.00/0.01lot for standard bets; $3.00 for extreme S.BUY/S.SELL ---
+   double _pv  = _Point * 10.0;
+   double _upp = 0.10;
+   bool   _isChase = (StringFind(decLabel, "S.") >= 0);
+   double _tpMaxUSD  = _isChase ? 3.00 : 2.00;
+   double _tpMaxDist = _tpMaxUSD / _upp * _pv;
+   if(dir == 1) tp = MathMin(tp, entry + _tpMaxDist);
+   else         tp = MathMax(tp, entry - _tpMaxDist);
+
+   // --- SL selection based on VWAPBetSLMode ---
+   double sl = 0;
+   if(VWAPBetSLMode == 2) {
+      // EOD mode: no hard SL — will be resolved at day boundary
+      sl = (dir == 1) ? entry - 500.0 * _pv : entry + 500.0 * _pv;  // sentinel far SL (never hit normally)
+   } else if(VWAPBetSLMode == 1 && slZoneRef > 0) {
+      // S2/R2 mode: SL at the σ2 band level (gives the $4 wiggle room the user observed)
+      sl = slZoneRef;
+   } else {
+      // Default: clamp calculated SL to [$0.80, $1.80] per 0.01lot
+      double _slMinDist = 0.80 / _upp * _pv;
+      double _slMaxDist = 1.80 / _upp * _pv;
+      double _slDist    = MathAbs(entry - slDef);
+      _slDist = MathMax(_slMinDist, MathMin(_slMaxDist, _slDist));
+      sl = (dir == 1) ? entry - _slDist : entry + _slDist;
+   }
+   if(sl <= 0) return;
+
    double tpDist = MathAbs(tp - entry);
    double slDist = MathAbs(entry - sl);
-   if(slDist < _Point) return;          // degenerate SL guard
-   double rr = tpDist / slDist;
-   // Internal dedup: skip if newest running bet is same direction and entry within 5 pips
-   if(g_VWAPBetCount > 0 && g_VWAPBets[0].status == 0 &&
-      g_VWAPBets[0].dir == dir &&
-      MathAbs(g_VWAPBets[0].entry - entry) < 5.0 * _Point * 10.0) return;
+   if(slDist < _Point) return;
+   double rr = (slDist > _Point) ? tpDist / slDist : 0;
+   // --- Zone-based dedup: within a $1 USD band, allow at most 1 BOLD + 1 EXACT per direction.
+   // Beyond $1 USD from any existing bet of that direction, it counts as a fresh zone.
+   // This stops repetitive back-and-forth re-fires within the same price area.
+   double _zoneDist = 1.0 / _upp * _pv;   // $1.00 in price units (~10 pips EURUSD)
+   for(int _di = 0; _di < g_VWAPBetCount; _di++) {
+      if(g_VWAPBets[_di].dir != dir) continue;
+      if(MathAbs(g_VWAPBets[_di].entry - entry) < _zoneDist &&
+         g_VWAPBets[_di].betType == betType) return;   // same type already in this $1 band
+   }
    // Shift array down to insert at index 0 (newest first)
    for(int _i = VWAP_BET_MAX - 1; _i > 0; _i--) g_VWAPBets[_i] = g_VWAPBets[_i-1];
    g_VWAPBets[0].dir        = dir;
@@ -10296,21 +10334,50 @@ void AddVWAPBet(int dir, double entry, double tp, double sl,
    g_VWAPBets[0].betType    = betType;
    g_VWAPBets[0].signalTime = TimeCurrent();
    g_VWAPBets[0].status     = 0;
+   g_VWAPBets[0].trailLocked = false;
+   g_VWAPBets[0].pnlUSD     = 0;
    if(g_VWAPBetCount < VWAP_BET_MAX) g_VWAPBetCount++;
 }
 
 // Update running bet statuses (WON/LOST) based on current price — called each timer tick
 void UpdateVWAPBetStatuses()
 {
-   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double bid  = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double _pv2 = _Point * 10.0;
+   double _upp2 = 0.10;
    for(int _i = 0; _i < g_VWAPBetCount; _i++) {
       if(g_VWAPBets[_i].status != 0) continue;  // already resolved
-      if(g_VWAPBets[_i].dir == 1) {    // BUY: TP above entry, SL below
-         if(bid >= g_VWAPBets[_i].tp)   g_VWAPBets[_i].status = 1;  // WON
-         else if(bid <= g_VWAPBets[_i].sl) g_VWAPBets[_i].status = 2;  // LOST
-      } else {                           // SELL: TP below entry, SL above
-         if(bid <= g_VWAPBets[_i].tp)   g_VWAPBets[_i].status = 1;
-         else if(bid >= g_VWAPBets[_i].sl) g_VWAPBets[_i].status = 2;
+      // --- $2 trail-lock milestone: satisfied WON, no need to chase further ---
+      double _profUSD = (g_VWAPBets[_i].dir == 1)
+                        ? (bid - g_VWAPBets[_i].entry) / _pv2 * _upp2
+                        : (g_VWAPBets[_i].entry - bid) / _pv2 * _upp2;
+      if(!g_VWAPBets[_i].trailLocked && _profUSD >= 2.0) {
+         g_VWAPBets[_i].trailLocked = true;
+         g_VWAPBets[_i].pnlUSD      = 2.0;
+         g_VWAPBets[_i].status      = 1;   // LK$2 — locked at trail milestone
+         continue;
+      }
+      // --- EOD resolution: if SLMode==2, close all running bets at end of trading day ---
+      if(VWAPBetSLMode == 2) {
+         MqlDateTime _eodDt; TimeToStruct(TimeCurrent(), _eodDt);
+         // Resolve at or after 21:00 server time (end of NY session)
+         if(_eodDt.hour >= 21) {
+            double _pv3 = _Point * 10.0, _up3 = 0.10;
+            double _bl3 = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+            g_VWAPBets[_i].pnlUSD = (g_VWAPBets[_i].dir == 1)
+                                    ? (_bl3 - g_VWAPBets[_i].entry) / _pv3 * _up3
+                                    : (g_VWAPBets[_i].entry - _bl3) / _pv3 * _up3;
+            g_VWAPBets[_i].status = (g_VWAPBets[_i].pnlUSD >= 0) ? 1 : 2;
+            continue;
+         }
+      }
+      // --- Standard TP / SL ---
+      if(g_VWAPBets[_i].dir == 1) {
+         if(bid >= g_VWAPBets[_i].tp)      { g_VWAPBets[_i].pnlUSD = MathAbs(g_VWAPBets[_i].tp - g_VWAPBets[_i].entry) / _pv2 * _upp2; g_VWAPBets[_i].status = 1; }  // WON
+         else if(bid <= g_VWAPBets[_i].sl) { g_VWAPBets[_i].pnlUSD = -MathAbs(g_VWAPBets[_i].entry - g_VWAPBets[_i].sl) / _pv2 * _upp2; g_VWAPBets[_i].status = 2; }  // LOST
+      } else {
+         if(bid <= g_VWAPBets[_i].tp)      { g_VWAPBets[_i].pnlUSD = MathAbs(g_VWAPBets[_i].tp - g_VWAPBets[_i].entry) / _pv2 * _upp2; g_VWAPBets[_i].status = 1; }
+         else if(bid >= g_VWAPBets[_i].sl) { g_VWAPBets[_i].pnlUSD = -MathAbs(g_VWAPBets[_i].entry - g_VWAPBets[_i].sl) / _pv2 * _upp2; g_VWAPBets[_i].status = 2; }
       }
    }
 }
@@ -11205,6 +11272,13 @@ void UpdateDashboard()
 
          // --- VWAP Bet Log: capture zone-entry events (Bold Bets + exact signals) ---
          {
+            // Extract conf value from decision label (e.g. "BUY INC-41%" → 41)
+            int _decConf = 0;
+            int _dashPos = StringFind(_vDecision, "-");
+            int _pctPos  = StringFind(_vDecision, "%");
+            if(_dashPos >= 0 && _pctPos > _dashPos)
+               _decConf = (int)StringToInteger(StringSubstr(_vDecision, _dashPos+1, _pctPos-_dashPos-1));
+
             // Classify current decision into a category string (strips the %-conf suffix)
             string _vCat = (StringFind(_vDecision,"INC") >= 0)
                            ? (StringFind(_vDecision,"BUY") >= 0 ? "BUYINC" : "SELLINC")
@@ -11212,39 +11286,33 @@ void UpdateDashboard()
                              (StringFind(_vDecision,"SELL") >= 0 ? "SELL" : ""));
             // Only log when category changes (zone-entry event, not every tick)
             if(_vCat != "" && _vCat != g_LastVWAPSig) {
-               bool   _bIsBold = (StringFind(_vDecision,"INC") >= 0);
-               bool   _bIsBuy  = (StringFind(_vDecision,"BUY") >= 0);
-               double _betTP   = 0, _betSL = 0;
-               if(_bIsBuy && g_VWAPU1 > 0) {
-                  // BUY TP = +σ1 (opposite side); must offer ≥ $2 per 0.01 lot of room
-                  double _bTPRm = (g_VWAPU1 - _bid) / _pipVal * _usdPerPip;
-                  if(_bTPRm >= 2.0) {
-                     _betTP = g_VWAPU1;
-                     // SL at zone boundary behind entry:
-                     //   approaching -σ2 (BOLD) → SL at prev-bar -σ2
-                     //   inside -σ2→-σ3         → SL at prev-bar -σ3
-                     //   beyond -σ3             → 1:1 SL below entry
-                     if(_bIsBold)             _betSL = (_refL2 > 0 ? _refL2 : g_VWAPL2);
-                     else if(_bid > _refL3)   _betSL = _refL3;
-                     else                     _betSL = _bid - (_betTP - _bid);
+               bool   _bIsBold  = (StringFind(_vDecision,"INC") >= 0);
+               // INC (BOLD approaching) bets: skip if confidence below threshold
+               bool   _confPass = (!_bIsBold || _decConf >= VWAPBetIncMinConf);
+               if(_confPass) {
+                  bool   _bIsBuy  = (StringFind(_vDecision,"BUY") >= 0);
+                  double _betTP   = 0, _betSLDef = 0, _betSLZone = 0;
+                  if(_bIsBuy && g_VWAPU1 > 0) {
+                     double _bTPRm = (g_VWAPU1 - _bid) / _pipVal * _usdPerPip;
+                     if(_bTPRm >= 2.0) {
+                        _betTP = g_VWAPU1;
+                        if(_bIsBold)           { _betSLDef = (_refL2 > 0 ? _refL2 : g_VWAPL2); _betSLZone = (_refL2 > 0 ? _refL2 : g_VWAPL2); }
+                        else if(_bid > _refL3) { _betSLDef = _refL3;                            _betSLZone = (_refL2 > 0 ? _refL2 : g_VWAPL2); }
+                        else                   { _betSLDef = _bid - (_betTP - _bid);             _betSLZone = (_refL3 > 0 ? _refL3 : g_VWAPL3); }
+                     }
+                  } else if(!_bIsBuy && g_VWAPL1 > 0) {
+                     double _bTPRm = (_bid - g_VWAPL1) / _pipVal * _usdPerPip;
+                     if(_bTPRm >= 2.0) {
+                        _betTP = g_VWAPL1;
+                        if(_bIsBold)           { _betSLDef = (_refU2 > 0 ? _refU2 : g_VWAPU2); _betSLZone = (_refU2 > 0 ? _refU2 : g_VWAPU2); }
+                        else if(_bid < _refU3) { _betSLDef = _refU3;                            _betSLZone = (_refU2 > 0 ? _refU2 : g_VWAPU2); }
+                        else                   { _betSLDef = _bid + (_bid - _betTP);             _betSLZone = (_refU3 > 0 ? _refU3 : g_VWAPU3); }
+                     }
                   }
-               } else if(!_bIsBuy && g_VWAPL1 > 0) {
-                  // SELL TP = -σ1 (opposite side); must offer ≥ $2 per 0.01 lot of room
-                  double _bTPRm = (_bid - g_VWAPL1) / _pipVal * _usdPerPip;
-                  if(_bTPRm >= 2.0) {
-                     _betTP = g_VWAPL1;
-                     // SL at zone boundary behind entry:
-                     //   approaching +σ2 (BOLD) → SL at prev-bar +σ2
-                     //   inside +σ2→+σ3         → SL at prev-bar +σ3
-                     //   beyond +σ3             → 1:1 SL above entry
-                     if(_bIsBold)             _betSL = (_refU2 > 0 ? _refU2 : g_VWAPU2);
-                     else if(_bid < _refU3)   _betSL = _refU3;
-                     else                     _betSL = _bid + (_bid - _betTP);
-                  }
+                  if(_betTP > 0)
+                     AddVWAPBet(_bIsBuy ? 1 : -1, _bid, _betTP, _betSLDef, _betSLZone,
+                                _vDecision, _bIsBold ? "BOLD" : "EXACT");
                }
-               if(_betTP > 0 && _betSL > 0)
-                  AddVWAPBet(_bIsBuy ? 1 : -1, _bid, _betTP, _betSL,
-                             _vDecision, _bIsBold ? "BOLD" : "EXACT");
             }
             // Always update category tracker; clear on WAIT/HOLD so next signal fires fresh
             g_LastVWAPSig = _vCat;
@@ -11312,8 +11380,32 @@ void UpdateDashboard()
       rowR++;  // blank spacer
 
       // --- VWAP Bold Bets & Signal Log ---
-      UpdateVWAPBetStatuses();   // refresh WON/LOST status on every dashboard tick
-      DashLine("R_bb_hdr", "--- VWAP BETS & SIGNAL LOG ---", rx, cy, rowR, lh, corner, clrDodgerBlue, 8); rowR++;
+      UpdateVWAPBetStatuses();   // refresh statuses on every dashboard tick
+      {
+         // Compute header stats over all logged bets
+         int    _bbW = 0, _bbL = 0, _bbR = 0;
+         double _bbWusd = 0, _bbLusd = 0, _bbNetUsd = 0;
+         double _pv4 = _Point * 10.0, _upp4 = 0.10;
+         double _curBid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+         for(int _si = 0; _si < g_VWAPBetCount; _si++) {
+            VWAPBet _bS = g_VWAPBets[_si];
+            if(_bS.status == 1) { _bbW++;   _bbWusd += _bS.pnlUSD; }
+            else if(_bS.status == 2) { _bbL++; _bbLusd += MathAbs(_bS.pnlUSD); }
+            else {
+               _bbR++;
+               double _rp = (_bS.dir == 1)
+                            ? (_curBid - _bS.entry) / _pv4 * _upp4
+                            : (_bS.entry - _curBid) / _pv4 * _upp4;
+               _bbNetUsd += _rp;
+            }
+         }
+         _bbNetUsd += _bbWusd - _bbLusd;
+         string _bbNet = StringFormat("%s$%.2f", (_bbNetUsd >= 0 ? "+" : ""), _bbNetUsd);
+         string _bbHdr = StringFormat("VWAP BETS  W:%d($%.1f) L:%d($%.1f) R:%d  Net:%s",
+                                       _bbW, _bbWusd, _bbL, _bbLusd, _bbR, _bbNet);
+         color _bbHdrClr = (_bbNetUsd > 0) ? clrLime : (_bbNetUsd < 0) ? clrTomato : clrDodgerBlue;
+         DashLine("R_bb_hdr", _bbHdr, rx, cy, rowR, lh, corner, _bbHdrClr, 8); rowR++;
+      }
       {
          int _bbN = MathMin(g_VWAPBetCount, VWAP_BET_MAX);
          for(int _bi = 0; _bi < VWAP_BET_MAX; _bi++) {
@@ -11321,7 +11413,9 @@ void UpdateDashboard()
             if(_bi < _bbN) {
                VWAPBet b = g_VWAPBets[_bi];
                string  _bPfx  = (b.betType == "BOLD") ? "B:" : "E:";
-               string  _bStat = (b.status == 1) ? "WON" : (b.status == 2) ? "LST" : "RUN";
+               string  _bStat = (b.status == 1)
+                                 ? (b.trailLocked ? "LK$2" : "WON")
+                                 : (b.status == 2 ? "LST" : "RUN");
                MqlDateTime _bDt; TimeToStruct(b.signalTime, _bDt);
                string  _bTime = StringFormat("%02d:%02d", _bDt.hour, _bDt.min);
                // Format: <type>:<label(12)> @<entry5f> TP:<tp5f> SL:<sl5f> <RR>R <stat> <time>
